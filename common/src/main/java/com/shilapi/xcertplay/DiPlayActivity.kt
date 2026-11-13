@@ -97,6 +97,7 @@ import com.shilapi.xcertplay.update.UpdateAvailability
 import com.shilapi.xcertplay.update.UpdateCatalog
 import com.shilapi.xcertplay.update.UpdateChecksums
 import com.shilapi.xcertplay.update.UpdateClient
+import com.shilapi.xcertplay.update.UpdateDownloader
 import com.shilapi.xcertplay.update.UpdateRelease
 import com.shilapi.xcertplay.update.UpdateReleaseLookup
 import java.io.File
@@ -2691,7 +2692,13 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
     }
 
     private fun latestRelease(): UpdateRelease? {
-        return UpdateReleaseLookup.latest(version(), userAgent())
+        // The API is tried once, then the static manifest through each mirror; every attempt is
+        // logged so a report shows which source answered.
+        return UpdateReleaseLookup.latest(
+            installedVersion = version(),
+            userAgent = userAgent(),
+            onAttempt = { attempt -> Log.i("DiPlay-Update", "update source $attempt") },
+        )
     }
 
     private fun openAvailableUpdate(release: UpdateRelease) {
@@ -2724,24 +2731,20 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
             val outcome = runCatching {
                 // The cached release can be a day old. Download the newest one.
                 release = latestRelease() ?: throw IOException(getString(R.string.update_up_to_date))
-                val checksumsFile = File(directory, UpdateCatalog.CHECKSUMS_FILE)
-                UpdateClient.download(release.checksumsUrl, checksumsFile) { _, _ -> }
-                val apkFile = File(directory, release.apkName)
-                UpdateClient.download(release.apkUrl, apkFile) { written, total ->
-                    val percent = total?.takeIf { it > 0 }?.let { (written * 100 / it).toInt() } ?: return@download
-                    if (percent != updateProgress) {
-                        updateProgress = percent
-                        refreshUpdateUi(generation)
-                    }
-                }
-                updateStage = UpdateStage.VERIFYING
-                refreshUpdateUi(generation)
-                val expected = UpdateChecksums.parse(checksumsFile.readText())
-                val actual = UpdateChecksums.sha256Hex(apkFile)
-                if (!UpdateChecksums.matches(expected, release.apkName, actual)) {
-                    throw IOException("Checksum mismatch for ${release.apkName}")
-                }
-                apkFile
+                // Each mirror is tried in order and every rejection reason is logged; an APK whose
+                // SHA-256 does not match is deleted and the next source is used.
+                UpdateDownloader.download(
+                    release = release,
+                    directory = directory,
+                    onProgress = { written, total ->
+                        val percent = total?.takeIf { it > 0 }?.let { (written * 100 / it).toInt() }
+                        if (percent != null && percent != updateProgress) {
+                            updateProgress = percent
+                            refreshUpdateUi(generation)
+                        }
+                    },
+                    onAttempt = { attempt -> Log.i("DiPlay-Update", "update download $attempt") },
+                )
             }.onFailure { directory.deleteRecursively() }
             val saved = outcome.getOrNull()?.let { UpdateApkExport.copy(applicationContext, it) }
             runOnUiThread {

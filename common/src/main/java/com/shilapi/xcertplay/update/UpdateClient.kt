@@ -9,8 +9,6 @@ import java.net.URL
 import java.net.URLConnection
 
 internal object UpdateClient {
-    internal const val RELEASES_URL =
-        "https://api.github.com/repos/shihabal3amri/DiPlay/releases?per_page=3"
     private const val CONNECT_TIMEOUT_MILLIS = 10_000
     private const val READ_TIMEOUT_MILLIS = 30_000
     // Far above the release APKs (under 20 MB at v0.2.21). It stops a body that never ends.
@@ -43,9 +41,15 @@ internal object UpdateClient {
         }
     }
 
-    internal fun download(url: String, destination: File, onProgress: (Long, Long?) -> Unit) {
+    internal fun download(
+        url: String,
+        destination: File,
+        openConnection: (URL) -> URLConnection = { it.openConnection() },
+        onProgress: (Long, Long?) -> Unit,
+    ) {
         destination.parentFile?.mkdirs()
-        val connection = URL(url).openConnection() as HttpURLConnection
+        val connection = openConnection(URL(url)) as? HttpURLConnection
+            ?: throw IOException("Request to $url did not open an HTTP connection")
         try {
             connection.connectTimeout = CONNECT_TIMEOUT_MILLIS
             connection.readTimeout = READ_TIMEOUT_MILLIS

@@ -9,6 +9,8 @@ internal data class UpdateRelease(
     val apkName: String,
     val apkUrl: String,
     val checksumsUrl: String,
+    /** Digest published by the static manifest; empty checksums fall back to this one. */
+    val sha256: String? = null,
 )
 
 internal object UpdateCatalog {

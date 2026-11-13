@@ -43,15 +43,24 @@ internal class BackgroundUpdateWorker(context: Context, parameters: WorkerParame
         // A dev build with no parsable version would otherwise show a permanent banner.
         if (installedVersion == null || UpdateVersion.parse(installedVersion) == null) return Result.success()
         return try {
+            val attempts = ArrayList<String>()
             val release = UpdateReleaseLookup.latest(
                 installedVersion = installedVersion,
                 userAgent = "DiPlay/$installedVersion",
                 openConnection = network::openConnection,
+                onAttempt = { attempt ->
+                    attempts.add(attempt.toString())
+                    Log.i(TAG, "update source $attempt")
+                },
             )
             if (release == null) UpdateAvailability.clear(applicationContext)
             else UpdateAvailability.save(applicationContext, release)
             UpdateAvailability.recordAttempt(applicationContext, now)
-            UpdateAvailability.recordResult(applicationContext, now, if (release == null) "up to date" else "found ${release.tagName}")
+            UpdateAvailability.recordResult(
+                applicationContext,
+                now,
+                if (release == null) "up to date (${attempts.lastOrNull() ?: "no source"})" else "found ${release.tagName}",
+            )
             Result.success()
         } catch (failure: Exception) {
             Log.i(TAG, "background update check failed", failure)
