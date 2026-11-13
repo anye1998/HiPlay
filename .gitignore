@@ -42,3 +42,6 @@ release-signing.properties
 
 # Written by scripts/download_count.py when the site is deployed
 site/assets/downloads.json
+
+# HiChain engine sources are fetched by scripts/fetch-hichain-sources.py, never committed.
+/hicar-auth/src/main/cpp/third_party/

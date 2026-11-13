@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Library module: the HiChain engine ships no components, only a native library. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" />

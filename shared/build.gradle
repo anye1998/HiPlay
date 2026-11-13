@@ -38,6 +38,7 @@ android {
     }
 }
 dependencies {
+    implementation project(':hicar-auth')
     implementation libs.androidx.app
     implementation libs.bouncycastle
     implementation libs.jmdns
