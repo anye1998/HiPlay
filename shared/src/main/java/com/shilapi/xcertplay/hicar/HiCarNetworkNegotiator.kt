@@ -110,100 +110,96 @@ internal class HiCarNetworkNegotiator(
     fun respond(frame: HiCarFrame): ByteArray? {
         if (!authenticated || frame.encrypted) return null
         val replies = ByteArrayOutputStream()
-        try {
-            for (field in HiCarTlv.fields(frame.payload)) {
-                val reader = HiCarReader(field.value)
-                val reply: ByteArray? = when {
-                    frame.kind == KIND_NETWORK && field.tag == 1 -> {
-                        val channel = reader.readVarint() ?: throw HiCarWireException("network negotiation")
-                        val details = HiCarTlv.fields(field.value.copyOfRange(reader.position, field.value.size))
-                        if (channel != HiCarCodes.NETWORK_CHANNEL || details.size != 1 || details[0].tag != 3) {
-                            throw HiCarWireException("network negotiation")
-                        }
-                        val capabilities = capabilities(details[0].value)
-                        val accepted = capabilities[2] == 1 &&
-                            capabilities[4] == 1 &&
-                            ((capabilities[5] ?: 0) and HiCarNetworkOffer.frequencyMask(offer.frequencyMhz)) != 0
-                        var result = join(
-                            HiCarVarint.encode(HiCarCodes.NETWORK_CHANNEL),
-                            HiCarVarint.encode(if (accepted) 1 else 255),
+        for (field in HiCarTlv.fields(frame.payload)) {
+            val reader = HiCarReader(field.value)
+            val reply: ByteArray? = when {
+                frame.kind == KIND_NETWORK && field.tag == 1 -> {
+                    val channel = reader.readVarint() ?: throw HiCarWireException("network negotiation")
+                    val details = HiCarTlv.fields(field.value.copyOfRange(reader.position, field.value.size))
+                    if (channel != HiCarCodes.NETWORK_CHANNEL || details.size != 1 || details[0].tag != 3) {
+                        throw HiCarWireException("network negotiation")
+                    }
+                    val capabilities = capabilities(details[0].value)
+                    val accepted = capabilities[2] == 1 &&
+                        capabilities[4] == 1 &&
+                        ((capabilities[5] ?: 0) and HiCarNetworkOffer.frequencyMask(offer.frequencyMhz)) != 0
+                    var result = join(
+                        HiCarVarint.encode(HiCarCodes.NETWORK_CHANNEL),
+                        HiCarVarint.encode(if (accepted) 1 else 255),
+                    )
+                    if (accepted) {
+                        result = join(
+                            result,
+                            HiCarTlv.encode(3, join(byteArrayOf(1), HiCarVarint.encode(offer.frequencyMhz))),
                         )
-                        if (accepted) {
-                            result = join(
-                                result,
-                                HiCarTlv.encode(3, join(byteArrayOf(1), HiCarVarint.encode(offer.frequencyMhz))),
-                            )
-                        }
-                        negotiated = accepted
-                        HiCarTlv.encode(2, result)
                     }
-
-                    frame.kind == KIND_NETWORK && field.tag == 3 -> {
-                        if (!negotiated) throw HiCarWireException("data endpoint not ready")
-                        val port = dataPort()
-                        if (port !in 1024..65535) throw HiCarWireException("data endpoint not ready")
-                        val channel = reader.readVarint() ?: throw HiCarWireException("data socket request")
-                        val business = reader.readVarint() ?: throw HiCarWireException("data socket request")
-                        val size = reader.readVarint() ?: throw HiCarWireException("data socket request")
-                        if (size > MAX_TAG_BYTES) throw HiCarWireException("data socket request")
-                        reader.readBytes(size) ?: throw HiCarWireException("data socket request")
-                        val protocol = reader.readVarint() ?: throw HiCarWireException("data socket request")
-                        if (channel != HiCarCodes.NETWORK_CHANNEL ||
-                            business != HiCarCodes.DATA_BUSINESS ||
-                            protocol != HiCarCodes.DATA_PROTOCOL_TCP ||
-                            reader.remaining != 0
-                        ) {
-                            throw HiCarWireException("data socket request")
-                        }
-                        HiCarTlv.encode(4, join(HiCarVarint.encode(0), HiCarVarint.encode(port), field.value))
-                    }
-
-                    frame.kind == KIND_NETWORK && field.tag == 7 -> {
-                        val channel = reader.readVarint() ?: throw HiCarWireException("network selection")
-                        val status = reader.readVarint() ?: throw HiCarWireException("network selection")
-                        val selected = HiCarTlv.fields(field.value.copyOfRange(reader.position, field.value.size))
-                        if (!negotiated ||
-                            channel != HiCarCodes.NETWORK_CHANNEL ||
-                            status != 1 ||
-                            selected.size != 1 ||
-                            selected[0].tag != 3
-                        ) {
-                            throw HiCarWireException("network selection")
-                        }
-                        val role = selected[0].value
-                        if (role.size < 2 || role[0].toInt() != ROLE_ACCESS_POINT) throw HiCarWireException("network role")
-                        val roleReader = HiCarReader(role, 1)
-                        if (roleReader.readVarint() != offer.frequencyMhz || roleReader.remaining != 0) {
-                            throw HiCarWireException("network frequency")
-                        }
-                        if (pending.size >= MAX_PENDING_COMMANDS) throw HiCarWireException("network command limit")
-                        pending.add(HiCarWire.encode(HiCarFrame(KIND_NETWORK_COMMAND, 0, HiCarTlv.encode(1, ByteArray(0)))))
-                        null
-                    }
-
-                    frame.kind == KIND_NETWORK_COMMAND && field.tag in 1..4 -> {
-                        if (!negotiated) throw HiCarWireException("network command order")
-                        when (field.tag) {
-                            // Tag 1 carries no client address yet: the phone is told to wait.
-                            1 -> HiCarTlv.encode(2, "busy".toByteArray(StandardCharsets.US_ASCII))
-                            // Tags 2 and 4 carry the station MAC that has to join this access point.
-                            else -> {
-                                val mac = String(field.value, StandardCharsets.US_ASCII)
-                                if (!CLIENT_MAC.matches(mac)) throw HiCarWireException("client address")
-                                credentialsSent = true
-                                HiCarTlv.encode(3, offer.credentials())
-                            }
-                        }
-                    }
-
-                    frame.kind == KIND_NETWORK_COMMAND && field.tag == 5 -> HiCarTlv.encode(6, ByteArray(0))
-
-                    else -> null
+                    negotiated = accepted
+                    HiCarTlv.encode(2, result)
                 }
-                if (reply != null) replies.write(reply, 0, reply.size)
+
+                frame.kind == KIND_NETWORK && field.tag == 3 -> {
+                    if (!negotiated) throw HiCarWireException("data endpoint not ready")
+                    val port = dataPort()
+                    if (port !in 1024..65535) throw HiCarWireException("data endpoint not ready")
+                    val channel = reader.readVarint() ?: throw HiCarWireException("data socket request")
+                    val business = reader.readVarint() ?: throw HiCarWireException("data socket request")
+                    val size = reader.readVarint() ?: throw HiCarWireException("data socket request")
+                    if (size > MAX_TAG_BYTES) throw HiCarWireException("data socket request")
+                    reader.readBytes(size) ?: throw HiCarWireException("data socket request")
+                    val protocol = reader.readVarint() ?: throw HiCarWireException("data socket request")
+                    if (channel != HiCarCodes.NETWORK_CHANNEL ||
+                        business != HiCarCodes.DATA_BUSINESS ||
+                        protocol != HiCarCodes.DATA_PROTOCOL_TCP ||
+                        reader.remaining != 0
+                    ) {
+                        throw HiCarWireException("data socket request")
+                    }
+                    HiCarTlv.encode(4, join(HiCarVarint.encode(0), HiCarVarint.encode(port), field.value))
+                }
+
+                frame.kind == KIND_NETWORK && field.tag == 7 -> {
+                    val channel = reader.readVarint() ?: throw HiCarWireException("network selection")
+                    val status = reader.readVarint() ?: throw HiCarWireException("network selection")
+                    val selected = HiCarTlv.fields(field.value.copyOfRange(reader.position, field.value.size))
+                    if (!negotiated ||
+                        channel != HiCarCodes.NETWORK_CHANNEL ||
+                        status != 1 ||
+                        selected.size != 1 ||
+                        selected[0].tag != 3
+                    ) {
+                        throw HiCarWireException("network selection")
+                    }
+                    val role = selected[0].value
+                    if (role.size < 2 || role[0].toInt() != ROLE_ACCESS_POINT) throw HiCarWireException("network role")
+                    val roleReader = HiCarReader(role, 1)
+                    if (roleReader.readVarint() != offer.frequencyMhz || roleReader.remaining != 0) {
+                        throw HiCarWireException("network frequency")
+                    }
+                    if (pending.size >= MAX_PENDING_COMMANDS) throw HiCarWireException("network command limit")
+                    pending.add(HiCarWire.encode(HiCarFrame(KIND_NETWORK_COMMAND, 0, HiCarTlv.encode(1, ByteArray(0)))))
+                    null
+                }
+
+                frame.kind == KIND_NETWORK_COMMAND && field.tag in 1..4 -> {
+                    if (!negotiated) throw HiCarWireException("network command order")
+                    when (field.tag) {
+                        // Tag 1 carries no client address yet: the phone is told to wait.
+                        1 -> HiCarTlv.encode(2, "busy".toByteArray(StandardCharsets.US_ASCII))
+                        // Tags 2 and 4 carry the station MAC that has to join this access point.
+                        else -> {
+                            val mac = String(field.value, StandardCharsets.US_ASCII)
+                            if (!CLIENT_MAC.matches(mac)) throw HiCarWireException("client address")
+                            credentialsSent = true
+                            HiCarTlv.encode(3, offer.credentials())
+                        }
+                    }
+                }
+
+                frame.kind == KIND_NETWORK_COMMAND && field.tag == 5 -> HiCarTlv.encode(6, ByteArray(0))
+
+                else -> null
             }
-        } catch (truncated: HiCarWireException) {
-            throw truncated
+            if (reply != null) replies.write(reply, 0, reply.size)
         }
         if (replies.size() == 0) return null
         return HiCarWire.encode(HiCarFrame(frame.kind, 0, replies.toByteArray()))

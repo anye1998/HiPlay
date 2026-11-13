@@ -126,6 +126,19 @@
             android:resizeableActivity="true"
             android:theme="@style/Theme.Xcertplay" />
 
+        <!-- HiCar bring-up surface. Deliberately not in the launcher: the receiver stops at HiChain,
+             so it is reachable from a shell (action or adb am start) while the chain is developed. -->
+        <activity
+            android:name="com.shilapi.xcertplay.HiCarHostActivity"
+            android:exported="true"
+            android:resizeableActivity="true"
+            android:theme="@style/Theme.Xcertplay">
+            <intent-filter>
+                <action android:name="com.shihab.diplay.action.HICAR_HOST" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
         <activity
             android:name="com.shilapi.xcertplay.ImageCropActivity"
             android:exported="false"

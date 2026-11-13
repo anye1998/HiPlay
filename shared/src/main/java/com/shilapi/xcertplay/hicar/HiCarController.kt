@@ -3,7 +3,6 @@ package com.shilapi.xcertplay.hicar
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
-import android.net.wifi.WifiManager
 import android.os.Build
 import com.shilapi.xcertplay.network.LocalOnlyHotspotManager
 import com.shilapi.xcertplay.network.WirelessHotspotInfo
@@ -76,7 +75,6 @@ class HiCarController(
     private var hotspot: LocalOnlyHotspotManager? = null
     private var services: HiCarRfcommServices? = null
     private var advertiser: HiCarBleAdvertiser? = null
-    private var offer: HiCarNetworkOffer? = null
 
     /** Created only after the access point is up, so it can never answer with a placeholder offer. */
     private var liveNetwork: HiCarNetworkNegotiator? = null
@@ -134,7 +132,6 @@ class HiCarController(
             return
         }
         val networkOffer = prepareNetwork() ?: return
-        offer = networkOffer
         liveNetwork = HiCarNetworkNegotiator(networkOffer).also { it.authenticated = false }
         val rfcomm = HiCarRfcommServices.open(adapter, onLog)
         if (rfcomm == null) {
@@ -336,15 +333,13 @@ class HiCarController(
     }
 }
 
-/** Wi-Fi helper retained for the media stage: the phone joins the access point we just created. */
-internal fun wifiManagerOf(context: Context): WifiManager? =
-    context.applicationContext.getSystemService(WifiManager::class.java)
-
-/** Address the phone dials for the data socket; bound listeners must use the same one. */
-internal fun controlEndpoint(offer: HiCarNetworkOffer): InetSocketAddress =
-    InetSocketAddress(offer.ownerAddress, offer.controlPort)
-
-/** A TCP listener on the car's access point address; used once authentication succeeds. */
+/**
+ * A TCP listener on the car's access point address.
+ *
+ * Reserved for the media stage: the phone dials `controlPort`, `+1` (data) and `+2`. Nothing calls
+ * this yet, because the chain cannot pass authentication in this build; it is kept next to the
+ * controller so the next step does not have to rediscover the binding rules.
+ */
 internal fun openListener(offer: HiCarNetworkOffer, port: Int): ServerSocket =
     ServerSocket().apply {
         reuseAddress = true

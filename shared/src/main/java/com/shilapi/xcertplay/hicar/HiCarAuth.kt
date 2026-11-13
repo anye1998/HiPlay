@@ -2,9 +2,7 @@ package com.shilapi.xcertplay.hicar
 
 import java.io.Closeable
 import java.io.IOException
-import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
-import java.util.Arrays
 import org.json.JSONException
 import org.json.JSONObject
 
@@ -204,9 +202,5 @@ internal class HiCarUnavailableAuthenticator(
 
     override fun step(chunk: ByteArray): List<ByteArray> = throw HiCarAuthException(blocker)
 
-    override fun close() {
-        Arrays.fill(chunkGuard, 0)
-    }
-
-    private val chunkGuard = ByteArray(0)
+    override fun close() = Unit
 }
