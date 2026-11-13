@@ -24,7 +24,20 @@ HiChain 鉴权已按公开实现集成：`:hicar-auth` 模块把 OpenHarmony 的
 | 控制通道 | `HiCarControlSession`：DMSDP 文本记录、`CryptoSwitch: 222` 切换 AES-128-CTR、心跳、时钟参数、`$` 二进制业务帧 | 9 个用例 |
 | 录制加密 | `HiCarRecordCipher`：16 字节随机 IV + AES-128-CTR，32 字节密钥裁到 AES-128 | 同上 |
 | 编排 | `HiCarController`：先起热点 → 注册两条 RFCOMM 记录 → 广播 → 双通道 accept → 协商/鉴权；状态经 `HiCarStatus` 上报 | 手工/真机待验 |
-| 界面 | `HiCarHostActivity`：启动/停止、状态、日志（200 行环形）、权限申请 | 编译通过 |
+| 界面 | `HiCarHostActivity`：启动/停止、状态、日志（屏幕 200 行环形、导出保留 5000 行）、权限申请、**导出日志 / 分享** | `HiCarLogReportTest` 7 个用例 + `HiCarExportUiTest` 端到端 |
+
+日志导出（真机带回问题的唯一入口）：
+
+- 点 **Export log** 把本次会话写成 `hicar-log-<yyyyMMdd-HHmmss>.txt`，走应用既有的
+  `DiagnosticExportStore`：Android 10+ 先写 `Downloads/DiPlay`（MediaStore，无需权限），失败再退到
+  公共 `Download/DiPlay`、`Android/data/<包名>/files/diagnostic-reports`、最后应用私有目录；
+  界面会把实际落盘路径显示出来，取不到时用 **Share** 走系统分享。
+- 报告头部含包名/版本、Android 版本与机型、广播用的 model、identity、六位连接码、当前状态；
+  **连接码是故意写进去的**（"码被拒"本身就是需要排查的失败），文件里因此带一行提醒按敏感文件处理。
+- 屏幕只留 200 行是为了车机上可读，导出保留最近 5000 行；真被截断时报告里会写"最早 N 行已丢弃"，
+  避免把一份短日志误读成一次短会话。
+- 每次 Start/Stop 都会往历史里写一条分隔行，所以连续重试的多次尝试在同一份导出里可分辨；
+  **Clear log** 会同时清掉历史（用户明确要求干净），`Reset pairing` 只清屏幕、保留历史。
 
 关键设计取舍（都写进了代码注释）：
 

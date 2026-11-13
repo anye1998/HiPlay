@@ -1,7 +1,10 @@
 package com.shilapi.xcertplay
 
 import android.Manifest
+import android.content.ClipData
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
@@ -30,17 +33,22 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.core.content.pm.PackageInfoCompat
 import com.shilapi.xcertplay.hicar.HiCarController
 import com.shilapi.xcertplay.hicar.HiCarRuntimeConfig
 import com.shilapi.xcertplay.hicar.HiCarStatus
 import java.security.MessageDigest
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 /**
  * Experimental HiCar receiver screen.
  *
- * It is deliberately a separate, non-launcher activity: the receiver stops at HiChain, so it is a
- * diagnostic surface for the connection chain rather than a feature the driver should reach from
- * the CarPlay home screen. Start it from a shell during bring-up:
+ * It is deliberately a separate, non-launcher activity: the chain has no media stage yet, so it is a
+ * diagnostic surface rather than a feature the driver should reach from the CarPlay home screen.
+ * The log can be written to a file from here, because the run that fails is usually over before
+ * anyone can read the screen. Start it from a shell during bring-up:
  *
  * ```
  * adb shell am start -n com.shihab.diplay/com.shilapi.xcertplay.HiCarHostActivity
@@ -57,6 +65,13 @@ class HiCarHostActivity : ComponentActivity() {
     private var running by mutableStateOf(false)
     private val log = mutableStateListOf<String>()
     private var controller: HiCarController? = null
+
+    /** Longer than [log]: the screen keeps a readable tail, the export keeps the whole attempt. */
+    private val history = ArrayList<String>()
+    private var droppedFromHistory = 0
+    private var exporting by mutableStateOf(false)
+    private var exportUri by mutableStateOf<Uri?>(null)
+    private var exportNotice by mutableStateOf("")
 
     private val permissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { granted ->
         if (granted.values.all { it }) startReceiver() else appendLog("Bluetooth permissions were not granted")
@@ -93,9 +108,9 @@ class HiCarHostActivity : ComponentActivity() {
             Text("HiCar receiver (experimental)", style = MaterialTheme.typography.headlineSmall)
             Text(
                 "Connection chain: access point, insecure RFCOMM records, 0xFDEE advertisement, " +
-                    "channel negotiation, DMSDP control channel. Authentication stops at HiChain, " +
-                    "which needs Huawei's native engine and a provisioned accessory credential. " +
-                    "No video, audio, steering-wheel or HUD capability is available in this build.",
+                    "channel negotiation, HiChain authentication, DMSDP control channel. " +
+                    "Video, audio, steering-wheel and HUD are not implemented, and no HiChain exchange " +
+                    "has been verified against a real phone yet.",
                 style = MaterialTheme.typography.bodyMedium,
             )
             OutlinedTextField(
@@ -114,8 +129,19 @@ class HiCarHostActivity : ComponentActivity() {
                 Button(onClick = ::toggle, enabled = model.length == 8) {
                     Text(if (running) "Stop" else "Start")
                 }
-                Button(onClick = { log.clear() }) { Text("Clear log") }
+                Button(onClick = ::clearLog) { Text("Clear log") }
                 Button(onClick = ::resetPairing) { Text("Reset pairing") }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                // The export survives the session: a failed attempt is usually over by the time the
+                // driver decides to report it, and a screenshot loses the part above the fold.
+                Button(onClick = ::exportLog, enabled = !exporting) {
+                    Text(if (exporting) "Exporting…" else "Export log")
+                }
+                Button(onClick = ::shareLog, enabled = exportUri != null) { Text("Share") }
+            }
+            if (exportNotice.isNotEmpty()) {
+                Text(exportNotice, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
             }
             Text("Status: ${describe(status)}", style = MaterialTheme.typography.titleSmall)
             Text("Identity: ${identity()}", style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
@@ -142,7 +168,10 @@ class HiCarHostActivity : ComponentActivity() {
     private fun startReceiver() {
         if (running) return
         running = true
+        // The screen starts empty for a new attempt, but the export keeps earlier attempts: a retry
+        // usually follows a failure, and the failure is the part worth reporting.
         log.clear()
+        appendLog("--- receiver started ${SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())} ---")
         val config = HiCarRuntimeConfig(
             model = model,
             localIdentity = identity(),
@@ -164,12 +193,110 @@ class HiCarHostActivity : ComponentActivity() {
         controller?.close()
         controller = null
         status = HiCarStatus.Stopped
+        appendLog("--- receiver stopped ${SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())} ---")
     }
 
     private fun appendLog(line: String) {
         // The list is capped: a reconnect loop must not grow without bound on a head unit.
         if (log.size >= MAX_LOG_LINES) log.removeAt(0)
         log.add(line)
+        // The exported history is capped separately and much higher, because the line that explains
+        // a failure is often far above the last two hundred.
+        if (history.size >= MAX_HISTORY_LINES) {
+            history.removeAt(0)
+            droppedFromHistory++
+        }
+        history.add(line)
+    }
+
+    private fun clearLog() {
+        log.clear()
+        // An explicit clear is a request for a clean export as well; the pairing reset below only
+        // clears the screen, because the earlier lines still explain the new code.
+        history.clear()
+        droppedFromHistory = 0
+    }
+
+    /**
+     * Writes the session log to a file the driver can retrieve.
+     *
+     * Storage order is the app's existing diagnostic one (Downloads/DiPlay through MediaStore, then
+     * the public folder, then app-specific external storage, then internal), so this screen gains no
+     * new permission and no document-picker dependency.
+     */
+    private fun exportLog() {
+        if (exporting) return
+        exporting = true
+        exportUri = null
+        exportNotice = "saving…"
+        val report = buildReportText()
+        val fileName = logFileName()
+        val context = applicationContext
+        Thread({
+            val outcome = runCatching { DiagnosticExportStore.saveWithoutPicker(context, fileName, report) }
+            runOnUiThread {
+                exporting = false
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                outcome.fold(
+                    onSuccess = { saved ->
+                        exportUri = saved.uri
+                        exportNotice = when {
+                            saved.savedInApp -> "saved in app storage; use Share to retrieve it"
+                            saved.savedPath != null -> "saved to ${saved.savedPath}"
+                            else -> "saved to Downloads/DiPlay/$fileName"
+                        }
+                        appendLog("Log exported: $exportNotice")
+                    },
+                    onFailure = { failure ->
+                        exportNotice = "export failed: ${failure.javaClass.simpleName}"
+                        appendLog("Log export failed: ${failure.message ?: failure.javaClass.simpleName}")
+                    },
+                )
+            }
+        }, "hicar-log-export").start()
+    }
+
+    private fun shareLog() {
+        val uri = exportUri ?: return
+        val intent = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_STREAM, uri)
+            clipData = ClipData.newRawUri("HiCar log", uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        runCatching { startActivity(Intent.createChooser(intent, "Share HiCar log")) }
+            .onFailure {
+                // Head units often have no share target; the file is already saved either way.
+                exportNotice = "no app accepted the share; the file stays where it was saved"
+            }
+    }
+
+    private fun logFileName(): String =
+        "hicar-log-${SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())}.txt"
+
+    /** Collects the device facts the exported report needs; the text itself lives in HiCarLogReport.kt. */
+    private fun buildReportText(): String {
+        val packageInfo = runCatching { packageManager.getPackageInfo(packageName, 0) }.getOrNull()
+        return hicarLogReport(
+            environment = HiCarLogEnvironment(
+                generated = SimpleDateFormat("yyyy-MM-dd HH:mm:ss Z", Locale.US).format(Date()),
+                applicationId = packageName,
+                versionName = packageInfo?.versionName ?: "?",
+                // longVersionCode needs API 28 and minSdk here is 24.
+                versionCode = packageInfo?.let { PackageInfoCompat.getLongVersionCode(it) } ?: 0L,
+                androidRelease = Build.VERSION.RELEASE,
+                sdkInt = Build.VERSION.SDK_INT,
+                manufacturer = Build.MANUFACTURER,
+                deviceModel = Build.MODEL,
+                advertisedModel = model,
+                identity = identity(),
+                connectionCode = pin,
+                running = running,
+                status = describe(status),
+            ),
+            lines = history.toList(),
+            droppedLines = droppedFromHistory,
+        )
     }
 
     private fun hasBluetoothPermissions(): Boolean =
@@ -228,6 +355,7 @@ class HiCarHostActivity : ComponentActivity() {
 
     private companion object {
         const val MAX_LOG_LINES = 200
+        const val MAX_HISTORY_LINES = 5_000
         const val PREFERENCES = "hicar-receiver"
         const val KEY_PIN = "connection_code"
         val PIN_PATTERN = Regex("[0-9]{6}")
