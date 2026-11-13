@@ -25,6 +25,14 @@ internal class BackgroundUpdateWorker(context: Context, parameters: WorkerParame
     Worker(context, parameters) {
     override fun doWork(): Result {
         if (!UpdateAvailability.backgroundChecksEnabled(applicationContext)) return Result.success()
+        // A test build could only be offered an APK it cannot install over itself; drop the cached
+        // offer as well, so a banner from a previous run disappears instead of lingering.
+        UpdatePolicy.disabledReason(applicationContext)?.let { reason ->
+            UpdateAvailability.clear(applicationContext)
+            UpdateAvailability.recordAttempt(applicationContext, System.currentTimeMillis())
+            UpdateAvailability.recordResult(applicationContext, System.currentTimeMillis(), "skipped: $reason")
+            return Result.success()
+        }
         if (BackgroundUpdatePolicy.connectionBusy(
                 CarPlayBackgroundSession.hasSession(),
                 CarPlayBackgroundSession.active,

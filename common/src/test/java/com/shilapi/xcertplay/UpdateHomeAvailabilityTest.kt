@@ -1,6 +1,7 @@
 package com.shilapi.xcertplay
 
 import android.app.Application
+import android.content.pm.ApplicationInfo
 import android.view.View
 import android.view.ViewGroup
 import android.widget.TextView
@@ -8,6 +9,7 @@ import com.shilapi.xcertplay.host.R
 import com.shilapi.xcertplay.update.UpdateAvailability
 import com.shilapi.xcertplay.update.UpdateRelease
 import org.junit.After
+import org.junit.Before
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -23,6 +25,16 @@ import org.robolectric.util.ReflectionHelpers
 @Config(sdk = [29], qualifiers = "en-w900dp-h600dp-land")
 class UpdateHomeAvailabilityTest {
     private val application: Application = RuntimeEnvironment.getApplication()
+
+    /**
+     * Only a release build is offered updates (see UpdatePolicy), and every test here is about that
+     * offer. Robolectric starts from the debug variant's manifest, so the debuggable flag is cleared
+     * to reproduce the released state the code is written for.
+     */
+    @Before fun runAsAReleaseBuild() {
+        application.applicationInfo.flags =
+            application.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE.inv()
+    }
 
     @After fun clear() = UpdateAvailability.clearAllForTest(application)
 

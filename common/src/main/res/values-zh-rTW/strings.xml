@@ -788,6 +788,7 @@
     <string name="update_verifying">正在驗證…</string>
     <string name="update_install">安裝 %1$s</string>
     <string name="update_failed">更新失敗</string>
+    <string name="update_disabled_test_build">測試版不檢查更新：正式版 APK 無法覆寫安裝到測試版上。</string>
     <string name="update_available_home">有可用更新</string>
     <string name="update_saved_to">已儲存至 %1$s</string>
     <string name="backup_title">備份設定</string>

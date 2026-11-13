@@ -95,6 +95,8 @@ HiChain 鉴权已按公开实现集成：`:hicar-auth` 模块把 OpenHarmony 的
 | 下载 | 直连 GitHub → `ghfast.top` → `gh-proxy.com` → `v4.gh-proxy.org` | 每个源失败后自动切换，原因写进日志与 `UpdateAvailability` |
 | 校验 | 每个源独立校验 SHA-256（Release 的 `SHA256SUMS.txt` 或清单内联 `sha256`） | 不匹配即删除该文件并切下一个源；**没有任何摘要的 Release 直接拒绝** |
 | 版本比较 | SemVer 2.0（含预发布排序），从字符串中提取版本号 | 不依赖 Release 名称格式，`v0.2.15`、`DiPlay 0.2.15` 等价 |
+| 更新源仓库 | `anye1998/HiPlay`（本 fork） | 原为上游 `shihabal3amri/DiPlay`：上游 Release 不含 HiCar 代码，且签名与本项目不同，装不上 |
+| 测试构建 | **不检查更新**（`UpdatePolicy`，按 `FLAG_DEBUGGABLE` 判定） | debug 版签名与 Release 不同，覆盖安装必然 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`；且 `0.2.22-hud-test` 按 SemVer 低于 `0.2.22`，提示"有新版本"在形式上正确、实际是死路 |
 
 `version.json` 格式（由 tag 工作流生成，签名成功时才发布）：
 
@@ -145,8 +147,15 @@ HiChain 鉴权已按公开实现集成：`:hicar-auth` 模块把 OpenHarmony 的
 - `:mobile:assembleRelease` 成功，未配置签名时产出 `mobile-release-unsigned.apk`。
 - `:shared:testDebugUnitTest --tests "com.shilapi.xcertplay.hicar.*"`：36 个用例通过。
 - `:common:testDebugUnitTest --tests "com.shilapi.xcertplay.update.*"`：73 个用例通过。
-- 已知本地环境问题：首次切到 release 变体时 `configureNdkBuild*` 偶发
+- 已知本地环境问题 1：首次切到 release 变体时 `configureNdkBuild*` 偶发
   `hash_key.txt 拒绝访问`（Windows 文件占用），重试即通过；CI 在 Linux 上未观察到。
+- 已知本地环境问题 2：**`:mobile:lintDebug` 与 assemble 任务放在同一次 `./gradlew` 调用里，
+  在本机会在 lint 写完 SARIF 后假死**（无输出、无文件写入、客户端空等，日志停在
+  `Wrote SARIF report` 之后）。已复现两次，根因未定位到 AGP/lint 内部，但形态稳定。
+  因此本地验证改用 `scripts/verify.sh`：**每个阶段一次 Gradle 调用 + 单阶段超时 + 分阶段日志**
+  （`build/verify/<stage>.log`），超时会被明确报成 `STALLED` 并自动 `./gradlew --stop`，
+  不再需要人肉判断"是慢还是死了"。`--quick` 只跑单测与 debug APK。
+  CI 不受影响：workflow 里 lint 不与 assemble 同调用，且 job 已设 `timeout-minutes`。
 
 ---
 
@@ -240,3 +249,29 @@ HiChain 鉴权已按公开实现集成：`:hicar-auth` 模块把 OpenHarmony 的
   不再是干巴巴一句 `authentication unavailable`。
 - HiCar 界面新增桌面图标 **HiCar (experimental)**（`activity-alias`，独立入口，不进 DiPlay 主界面），
   平板上不接 adb 也能直接打开。原来的 `am start` / 自定义 action 仍然可用。
+
+### 7.1 第二次实测：连接其实已经发起，卡在等 MFi 协处理器
+
+同一台平板、换了新 APK 后再导出报告（15:05），关键差异是 `CarPlay setup: ready`，日志里出现：
+
+```
+Host started; MFI target=USB/CH341; transport=wireless
+mfi discovery backend=CH341 devices=[UsbDeviceId(vendorId=6790, productId=21778)]
+mfi CH341 not listed by Android; USB devices=[]
+STEP mfi/wait: MFi coprocessor not present; polling
+```
+
+解读：
+
+1. `MFI target` 的默认值是 **LOCAL**（`AirPlayPersistence.loadMfiTarget`），持久化里却是 `USB/CH341`，
+   说明这个值在设置里被改过（`CarPlayHostActivity` 的 MFi 单选项会 `saveMfiTarget`）。
+2. 选 `USB/CH341` 时 `DiPlayBootstrap.ensure()` 直接返回，所以 `setupError` 变空、首页显示 "ready"，
+   `connect()` 也就不再被拦——**连接确实发起了**。
+3. 但 `0x1A86:0x5512`（CH341）只出现在 `/sys` 的扫描结果里，Android 的 USB Host 列表是空的，
+   于是控制器在 `WaitingForMfi` 无限轮询。这个"无限"是上游有意的：CH341 允许连接后再插。
+4. 结论：这台设备上两条路都是死路——`LOCAL` 缺 `assets/offline-mfi` 凭据，`USB/CH341` 缺 MFi 协处理器芯片。
+   CarPlay 不作为本项目的验证目标；要在平板上推进，只能走 "HiCar (experimental)" 那个入口。
+
+附带发现并修掉的问题：更新检查在**测试构建**上给出了一个做不到的提议。上游 Release `v0.2.22` 确实比
+`0.2.22-hud-test` 高（SemVer 把 `-hud-test` 当预发布），但 debug 包签名不同、装不上，且上游 Release 不含 HiCar 代码。
+现按 `FLAG_DEBUGGABLE` 直接跳过检查，并把更新源仓库改为本 fork。

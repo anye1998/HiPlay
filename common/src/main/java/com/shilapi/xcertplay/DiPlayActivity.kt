@@ -98,6 +98,7 @@ import com.shilapi.xcertplay.update.UpdateCatalog
 import com.shilapi.xcertplay.update.UpdateChecksums
 import com.shilapi.xcertplay.update.UpdateClient
 import com.shilapi.xcertplay.update.UpdateDownloader
+import com.shilapi.xcertplay.update.UpdatePolicy
 import com.shilapi.xcertplay.update.UpdateRelease
 import com.shilapi.xcertplay.update.UpdateReleaseLookup
 import java.io.File
@@ -383,7 +384,7 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
             openProjection(); finish(); return
         }
         scheduleBackgroundUpdateChecks()
-        availableUpdate = UpdateAvailability.available(this, version())
+        availableUpdate = cachedUpdate()
         enforceInterfaceSize()
         refreshAppearance()
         rememberLaunchAppearance()
@@ -543,7 +544,7 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
         }
         // The background check runs two minutes after opening, usually while CarPlay is in front: what it
         // found shows when DiPlay comes back, not only after the activity is created again.
-        availableUpdate = UpdateAvailability.available(this, version())
+        availableUpdate = cachedUpdate()
         // Back from the car settings: refresh the car hotspot reminder on the home page.
         if (!initialLaunch && !adbSwitchChangePending && !pausedForAdbSwitchChange &&
             (page == "home" || page == "settings" || page == "connection" || page == "setup")) render()
@@ -2660,7 +2661,30 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
         return container
     }
 
+    /**
+     * The cached release, or null when this build must not be offered one.
+     *
+     * A test build keeps preferences across apk installs, so a stale offer cached by an earlier
+     * build would otherwise keep the home banner up until the next background run.
+     */
+    private fun cachedUpdate(): UpdateRelease? {
+        if (UpdatePolicy.disabledReason(this) != null) {
+            UpdateAvailability.clear(this)
+            return null
+        }
+        return UpdateAvailability.available(this, version())
+    }
+
     private fun checkForUpdates() {
+        UpdatePolicy.disabledReason(this)?.let {
+            // No request and no dead-end prompt: see UpdatePolicy for why a test build cannot use
+            // a published release.
+            UpdateAvailability.clear(this)
+            updateMessage = getString(R.string.update_disabled_test_build)
+            updateStage = UpdateStage.IDLE
+            render()
+            return
+        }
         updateStage = UpdateStage.CHECKING
         updateMessage = null
         val generation = ++updateGeneration

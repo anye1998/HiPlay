@@ -847,6 +847,7 @@
     <string name="update_verifying">正在校验…</string>
     <string name="update_install">安装 %1$s</string>
     <string name="update_failed">更新失败</string>
+    <string name="update_disabled_test_build">测试版不检查更新：正式版 APK 无法覆盖安装到测试版上。</string>
     <string name="update_available_home">有可用更新</string>
     <string name="update_saved_to">已保存到 %1$s</string>
     <string name="backup_title">备份设置</string>

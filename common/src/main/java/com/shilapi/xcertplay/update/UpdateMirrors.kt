@@ -49,8 +49,10 @@ internal data class UpdateRepository(
 }
 
 internal object UpdateMirrors {
-    const val DEFAULT_OWNER = "shihabal3amri"
-    const val DEFAULT_REPOSITORY = "DiPlay"
+    // The fork that publishes the builds this app is cut from. Pointing at upstream DiPlay would
+    // offer releases that carry no HiCar code and are signed with a different key.
+    const val DEFAULT_OWNER = "anye1998"
+    const val DEFAULT_REPOSITORY = "HiPlay"
 
     /** The branch that holds the static manifest; it must be a branch, not a tag. */
     const val DEFAULT_BRANCH = "main"
