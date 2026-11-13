@@ -43,8 +43,12 @@ internal interface HiCarAuthenticator : Closeable {
     /** The peer identity the phone announced in `oper_type` 1. */
     fun begin(peerIdentity: String)
 
-    /** Feeds one transport chunk and returns the bytes to write back, in order. */
-    fun step(chunk: ByteArray): List<ByteArray>
+    /**
+     * Feeds one transport chunk and returns the bytes to write back, in order.
+     *
+     * [keyLength] is what the phone asked for (16 or 32); the engine must agree before it exports a key.
+     */
+    fun step(chunk: ByteArray, keyLength: Int = 32): List<ByteArray>
 
     /** Non-null only after a successful authentication; 16 or 32 bytes. */
     val sessionKey: ByteArray?
@@ -53,17 +57,18 @@ internal interface HiCarAuthenticator : Closeable {
 }
 
 /**
- * The identity half of HiCar authentication: the JSON envelope exchange the phone starts.
+ * The JSON envelope exchange that wraps HiChain messages on the business channel.
  *
- * This part is implemented and unit-tested because it is plain JSON on the business channel. It
- * deliberately stops at the first `oper_type` 3 message, which is where HiChain begins and where a
- * side-loaded app has no engine to answer with.
+ * `oper_type` 1 exchanges identities; `oper_type` 3 carries the HiChain packets themselves, which
+ * are forwarded to [authenticator] untouched. The envelope framing lives here so it can be tested
+ * without a phone, while the cryptography lives in the native engine.
  */
 internal class HiCarIdentityExchange(
     private val localIdentity: String,
     private val deviceName: String,
     private val model: String,
     private val pinConfigured: Boolean,
+    private val authenticator: HiCarAuthenticator? = null,
     private val onLog: (String) -> Unit = {},
 ) {
     var peerIdentity: String? = null
@@ -77,6 +82,7 @@ internal class HiCarIdentityExchange(
     private var escaped = false
     private var depth = 0
     private var failed = false
+    private var keyLength = 32
 
     /** Feeds business-channel bytes; returns the envelopes to send back. */
     fun feed(chunk: ByteArray, count: Int = chunk.size): List<ByteArray> {
@@ -111,7 +117,7 @@ internal class HiCarIdentityExchange(
                         if (depth == 0) {
                             val text = partial.toString()
                             partial = StringBuilder()
-                            handleMessage(text)?.let(replies::add)
+                            replies.addAll(handleMessage(text))
                         }
                     }
                 }
@@ -126,7 +132,7 @@ internal class HiCarIdentityExchange(
         }
     }
 
-    private fun handleMessage(text: String): ByteArray? {
+    private fun handleMessage(text: String): List<ByteArray> {
         val envelope = try {
             JSONObject(text)
         } catch (failure: JSONException) {
@@ -149,24 +155,40 @@ internal class HiCarIdentityExchange(
                 if (peer.toByteArray(StandardCharsets.UTF_8).size !in 1..64) throw HiCarWireException("identity length")
                 peerIdentity = peer
                 identityExchanged = true
+                authenticator?.begin(peer)
                 onLog("HiCar identity exchanged")
-                envelope(
-                    OPER_IDENTITY,
-                    JSONObject()
-                        .put("deviceId", localIdentity)
-                        .put("devicename", deviceName)
-                        .put("has_pin", pinConfigured)
-                        .put("usb_connection", false)
-                        .put("CONNECT_ABILITY_KEY", "1")
-                        .put("CAR_MODE_ID", model),
+                listOf(
+                    envelope(
+                        OPER_IDENTITY,
+                        JSONObject()
+                            .put("deviceId", localIdentity)
+                            .put("devicename", deviceName)
+                            .put("has_pin", pinConfigured)
+                            .put("usb_connection", false)
+                            .put("CONNECT_ABILITY_KEY", "1")
+                            .put("CAR_MODE_ID", model),
+                    ),
                 )
             }
 
             OPER_AUTH -> {
                 if (!identityExchanged) throw HiCarWireException("authentication order")
-                // Reaching here means the phone wants HiChain. Nothing on a side-loaded APK can
-                // answer it, so the session ends with an explicit blocker instead of a fake key.
-                throw HiCarAuthException(HiCarAuthBlocker.NATIVE_HICHAIN_LIBRARY_MISSING)
+                val engine = authenticator
+                    ?: throw HiCarAuthException(HiCarAuthBlocker.NATIVE_HICHAIN_LIBRARY_MISSING)
+                // Message 17 announces the key length the phone will accept; every other message
+                // keeps the current value, which starts at the engine's 32-byte default.
+                if (data.optInt("message", 0) == MESSAGE_STS_REQUEST) {
+                    val requested = data.optJSONObject("payload")?.optInt("keyLength", 0) ?: 0
+                    if (requested != 0) {
+                        if (requested != 16 && requested != 32) throw HiCarWireException("key length")
+                        keyLength = requested
+                    }
+                }
+                val packets = engine.step(dataText.toByteArray(StandardCharsets.UTF_8), keyLength)
+                onLog("HiChain step: ${packets.size} packet(s)")
+                packets.map { packet ->
+                    envelope(OPER_AUTH, JSONObject(String(packet, StandardCharsets.UTF_8)))
+                }
             }
 
             else -> throw HiCarWireException("operation type")
@@ -186,6 +208,9 @@ internal class HiCarIdentityExchange(
     private companion object {
         const val OPER_IDENTITY = 1
         const val OPER_AUTH = 3
+
+        /** STS start: the only message that announces the key length. */
+        const val MESSAGE_STS_REQUEST = 17
         const val MAX_MESSAGE_BYTES = 65_536
         const val MAX_DEPTH = 32
     }
@@ -207,7 +232,7 @@ internal class HiCarUnavailableAuthenticator(
 
     override fun begin(peerIdentity: String) = Unit
 
-    override fun step(chunk: ByteArray): List<ByteArray> = throw HiCarAuthException(blocker)
+    override fun step(chunk: ByteArray, keyLength: Int): List<ByteArray> = throw HiCarAuthException(blocker)
 
     override fun close() = Unit
 }

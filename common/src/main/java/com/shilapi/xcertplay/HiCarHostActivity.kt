@@ -53,6 +53,7 @@ import java.security.MessageDigest
 class HiCarHostActivity : ComponentActivity() {
     private var status by mutableStateOf<HiCarStatus>(HiCarStatus.Idle)
     private var model by mutableStateOf("")
+    private var pin by mutableStateOf("")
     private var running by mutableStateOf(false)
     private val log = mutableStateListOf<String>()
     private var controller: HiCarController? = null
@@ -64,6 +65,7 @@ class HiCarHostActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         model = experimentalModel()
+        pin = storedPin()
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
@@ -103,11 +105,17 @@ class HiCarHostActivity : ComponentActivity() {
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
+            Text(
+                "Connection code: $pin   (the phone asks for these six digits the first time)",
+                style = MaterialTheme.typography.titleMedium,
+                fontFamily = FontFamily.Monospace,
+            )
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Button(onClick = ::toggle, enabled = model.length == 8) {
                     Text(if (running) "Stop" else "Start")
                 }
                 Button(onClick = { log.clear() }) { Text("Clear log") }
+                Button(onClick = ::resetPairing) { Text("Reset pairing") }
             }
             Text("Status: ${describe(status)}", style = MaterialTheme.typography.titleSmall)
             Text("Identity: ${identity()}", style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
@@ -139,6 +147,7 @@ class HiCarHostActivity : ComponentActivity() {
             model = model,
             localIdentity = identity(),
             deviceName = "HiCar receiver",
+            pin = pin,
         )
         val next = HiCarController(
             context = this,
@@ -167,6 +176,30 @@ class HiCarHostActivity : ComponentActivity() {
         ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_ADVERTISE) == PackageManager.PERMISSION_GRANTED
 
+    /**
+     * Issues a new six-digit code and forgets the stored trust.
+     *
+     * The code is only meaningful together with the key material in `files/hicar-huks`: keeping the
+     * old store would leave the phone paired to a code this screen no longer shows.
+     */
+    private fun resetPairing() {
+        if (running) stopReceiver()
+        val store = getDir("hicar-huks", MODE_PRIVATE)
+        store.listFiles()?.forEach { file -> file.delete() }
+        pin = String.format("%06d", java.security.SecureRandom().nextInt(1_000_000))
+        getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit().putString(KEY_PIN, pin).apply()
+        log.clear()
+        appendLog("Pairing reset: new code $pin, stored trust removed")
+    }
+
+    private fun storedPin(): String {
+        val preferences = getSharedPreferences(PREFERENCES, MODE_PRIVATE)
+        preferences.getString(KEY_PIN, null)?.takeIf { PIN_PATTERN.matches(it) }?.let { return it }
+        val generated = String.format("%06d", java.security.SecureRandom().nextInt(1_000_000))
+        preferences.edit().putString(KEY_PIN, generated).apply()
+        return generated
+    }
+
     /** The identity the phone sees; derived from this installation, not a Huawei credential. */
     private fun identity(): String {
         val seed = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID).orEmpty()
@@ -186,6 +219,8 @@ class HiCarHostActivity : ComponentActivity() {
         is HiCarStatus.WaitingForPhone -> "waiting for the phone"
         is HiCarStatus.ChannelNegotiated -> "business channel announced, waiting for authentication"
         is HiCarStatus.Authenticating -> "authenticating"
+        is HiCarStatus.Authenticated -> "authenticated, opening the control channel"
+        is HiCarStatus.ControlChannelReady -> "control channel ready; the media stage is not implemented"
         is HiCarStatus.Blocked -> "blocked: ${status.blocker.message}"
         is HiCarStatus.Failed -> "failed: ${status.reason}"
         is HiCarStatus.Stopped -> "stopped"
@@ -193,5 +228,8 @@ class HiCarHostActivity : ComponentActivity() {
 
     private companion object {
         const val MAX_LOG_LINES = 200
+        const val PREFERENCES = "hicar-receiver"
+        const val KEY_PIN = "connection_code"
+        val PIN_PATTERN = Regex("[0-9]{6}")
     }
 }

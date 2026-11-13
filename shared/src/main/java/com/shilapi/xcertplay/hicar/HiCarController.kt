@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
+import com.shilapi.xcertplay.hicarauth.HiChainNative
 import com.shilapi.xcertplay.network.LocalOnlyHotspotManager
 import com.shilapi.xcertplay.network.WirelessHotspotInfo
 import java.io.Closeable
@@ -26,6 +27,12 @@ sealed class HiCarStatus {
     data object ChannelNegotiated : HiCarStatus()
     data object Authenticating : HiCarStatus()
 
+    /** HiChain finished and the engine produced a session key. */
+    data object Authenticated : HiCarStatus()
+
+    /** The DMSDP control channel answered the crypto switch on the same socket. */
+    data object ControlChannelReady : HiCarStatus()
+
     /** The phone asked for HiChain, which this build cannot answer; see [blocker]. */
     data class Blocked(val blocker: HiCarAuthBlocker) : HiCarStatus()
     data class Failed(val reason: String) : HiCarStatus()
@@ -44,7 +51,9 @@ data class HiCarRuntimeConfig(
     val localIdentity: String,
     val deviceName: String = "HiCar receiver",
     val controlPort: Int = HiCarCodes.DEFAULT_CONTROL_PORT,
-    val pinConfigured: Boolean = false,
+    /** The six digits shown on this screen; the phone asks the driver for the same code. */
+    val pin: String = "",
+    val pinConfigured: Boolean = pin.isNotEmpty(),
     val networkTimeoutMillis: Long = 30_000L,
 )
 
@@ -235,13 +244,27 @@ class HiCarController(
             summary = config.localIdentity.toByteArray(Charsets.US_ASCII),
             businessChannel = { services?.businessChannel ?: 0 },
         )
+        val authenticator: HiCarAuthenticator = if (HiChainNative.available && config.pin.length == 6) {
+            HiChainAuthenticator(
+                storeDirectory = appContext.getDir("hicar-huks", Context.MODE_PRIVATE),
+                seed = config.localIdentity,
+                localIdentity = config.localIdentity,
+                pin = config.pin,
+            )
+        } else {
+            // No engine or no code: the exchange still runs so the log shows how far the phone got,
+            // and the session then fails with an explicit blocker instead of a fabricated key.
+            HiCarUnavailableAuthenticator()
+        }
         val identity = HiCarIdentityExchange(
             localIdentity = config.localIdentity,
             deviceName = config.deviceName,
             model = config.model,
             pinConfigured = config.pinConfigured,
+            authenticator = authenticator,
             onLog = { message -> onLog(message) },
         )
+        var session: HiCarControlSession? = null
         val decoder = HiCarFrameDecoder()
         try {
             val input: InputStream = socket.inputStream
@@ -251,9 +274,24 @@ class HiCarController(
                 val read = input.read(buffer)
                 if (read < 0) break
                 if (!control) {
-                    for (reply in identity.feed(buffer, read)) {
-                        output.write(reply)
-                        output.flush()
+                    val active = session
+                    if (active == null) {
+                        for (reply in identity.feed(buffer, read)) {
+                            output.write(reply)
+                            output.flush()
+                        }
+                        val key = authenticator.sessionKey
+                        if (key != null) {
+                            report(HiCarStatus.Authenticated)
+                            onLog("HiChain finished: ${key.size}-byte session key; opening DMSDP")
+                            liveNetwork?.authenticated = true
+                            session = openControlSession(output, key)
+                        }
+                    } else {
+                        for (reply in active.feed(buffer, read)) {
+                            output.write(reply)
+                            output.flush()
+                        }
                     }
                     continue
                 }
@@ -279,9 +317,45 @@ class HiCarController(
         } catch (failure: IOException) {
             onLog("HiCar channel closed: ${failure.javaClass.simpleName}")
         } finally {
+            session?.close()
+            authenticator.close()
             closeQuietly(socket)
             sockets.remove(socket)
         }
+    }
+
+    /**
+     * Starts the DMSDP control channel on the socket the phone already authenticated on.
+     *
+     * Returns null when the engine key cannot be used (a wrong length is a bug, not a peer error),
+     * so the caller keeps reading and reports the failure through the normal channel.
+     */
+    private fun openControlSession(output: OutputStream, key: ByteArray): HiCarControlSession? {
+        if (key.size != 16 && key.size != 32) {
+            onLog("HiChain returned an unusable key length (${key.size})")
+            return null
+        }
+        val cipher = HiCarRecordCipher(key)
+        val events = object : HiCarControlSession.Events {
+            override fun onLog(message: String) {
+                this@HiCarController.onLog(message)
+            }
+
+            override fun onNegotiated() = report(HiCarStatus.ControlChannelReady)
+
+            override fun onClock(high: Long, low: Long) = onLog("HiCar clock sample accepted")
+
+            override fun onApplicationService(module: Long, type: Long, body: ByteArray): List<ByteArray> {
+                // The media stage (HiSight) is not implemented yet; a business frame arriving here
+                // means the phone got further than this build supports.
+                onLog("HiCar application frame module=$module type=$type; media stage not implemented")
+                return emptyList()
+            }
+        }
+        val session = HiCarControlSession(cipher, events)
+        output.write(session.initial())
+        output.flush()
+        return session
     }
 
     private fun thread(name: String, body: () -> Unit): Thread =
