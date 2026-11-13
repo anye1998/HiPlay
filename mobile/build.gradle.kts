@@ -25,15 +25,19 @@ android {
 
     localAuthenticationAssets?.let { sourceSets.getByName("main").assets.srcDir(it) }
 
+    // Release signing is optional. CI without the four secrets produces an unsigned release APK
+    // instead of failing the whole build, which keeps tag and pull-request builds useful.
+    val releaseKeystore = providers.environmentVariable("ANDROID_KEYSTORE_PATH").orNull?.let { file(it) }
+    val releaseSigning = releaseKeystore?.takeIf { it.isFile }
+
     signingConfigs {
-        create("release") {
-            storeFile = file(
-                providers.environmentVariable("ANDROID_KEYSTORE_PATH")
-                    .getOrElse("missing-release-keystore.jks"),
-            )
-            storePassword = providers.environmentVariable("ANDROID_KEYSTORE_PASSWORD").getOrElse("")
-            keyAlias = providers.environmentVariable("ANDROID_KEY_ALIAS").getOrElse("")
-            keyPassword = providers.environmentVariable("ANDROID_KEY_PASSWORD").getOrElse("")
+        if (releaseSigning != null) {
+            create("release") {
+                storeFile = releaseSigning
+                storePassword = providers.environmentVariable("ANDROID_KEYSTORE_PASSWORD").getOrElse("")
+                keyAlias = providers.environmentVariable("ANDROID_KEY_ALIAS").getOrElse("")
+                keyPassword = providers.environmentVariable("ANDROID_KEY_PASSWORD").getOrElse("")
+            }
         }
     }
 
@@ -46,7 +50,7 @@ android {
             optimization {
                 enable = false
             }
-            signingConfig = signingConfigs.getByName("release")
+            signingConfig = releaseSigning?.let { signingConfigs.getByName("release") }
         }
     }
     compileOptions {

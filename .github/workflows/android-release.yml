@@ -1,0 +1,151 @@
+name: Android APK
+
+# Main branch, tags and manual runs all produce APKs. Only tags publish a release, and only a
+# signed release writes version.json, so the in-app updater never offers an APK that cannot install.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # The release job commits version.json with [skip ci]; that commit must not rebuild.
+    if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reject credential files in public source
+        run: python3 scripts/check_public_tree.py
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools platforms;android-37.0 build-tools;36.0.0 ndk;28.2.13676358
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # Secrets are not available to `if:` directly, so they are copied into env and checked there.
+      - name: Prepare the optional release keystore
+        id: signing
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/release.jks"
+            {
+              echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/release.jks"
+              echo "ANDROID_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD"
+              echo "ANDROID_KEY_ALIAS=$KEY_ALIAS"
+              echo "ANDROID_KEY_PASSWORD=$KEY_PASSWORD"
+              echo "SIGNED=true"
+            } >> "$GITHUB_ENV"
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No signing secrets: the release APK stays unsigned and is not published as an update."
+            echo "SIGNED=false" >> "$GITHUB_ENV"
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build debug and release APKs
+        run: |
+          set -o pipefail
+          ./gradlew --stacktrace --no-configuration-cache \
+            :mobile:assembleDebug :mobile:assembleRelease 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      - name: Name the failing build stage
+        if: failure()
+        run: python3 scripts/build_stage_report.py "$RUNNER_TEMP/build.log"
+
+      - name: Upload debug APK
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-apk
+          path: mobile/build/outputs/apk/debug/*.apk
+          if-no-files-found: warn
+
+      - name: Upload release APK
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-apk
+          path: mobile/build/outputs/apk/release/*.apk
+          if-no-files-found: warn
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-apk
+          path: artifacts
+
+      - name: Checksums, release notes and the fallback manifest
+        id: package
+        run: |
+          set -euo pipefail
+          cd artifacts
+          APK=$(ls *.apk | head -1)
+          # A tag build always has a release APK; only a signed one may be offered as an update.
+          case "$APK" in
+            *unsigned*) SIGNED=false ;;
+            *) SIGNED=true ;;
+          esac
+          sha256sum "$APK" > SHA256SUMS.txt
+          DIGEST=$(cut -d' ' -f1 SHA256SUMS.txt)
+          URL="https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$APK"
+          echo "signed=$SIGNED" >> "$GITHUB_OUTPUT"
+          echo "apk=$APK" >> "$GITHUB_OUTPUT"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          python3 -c 'import json,sys; version,apk,url,digest=sys.argv[1:5]; print(json.dumps({"version": version, "apk": apk, "url": url, "sha256": digest, "notes": "Published from tag " + version}, indent=2))' \
+            "${GITHUB_REF_NAME}" "$APK" "$URL" "$DIGEST" > version.json
+          cat version.json
+
+      - name: Publish the GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.apk
+            artifacts/SHA256SUMS.txt
+            artifacts/version.json
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+
+      - name: Publish version.json to main for the mirror fallback
+        if: steps.package.outputs.signed == 'true'
+        run: |
+          set -euo pipefail
+          cp artifacts/version.json version.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add version.json
+          if git diff --cached --quiet; then
+            echo "version.json already current"
+            exit 0
+          fi
+          git commit -m "chore(release): publish version.json for ${GITHUB_REF_NAME} [skip ci]"
+          git push origin HEAD:main
