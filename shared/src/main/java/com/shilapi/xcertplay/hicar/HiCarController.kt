@@ -6,7 +6,10 @@ import android.content.pm.PackageManager
 import android.os.Build
 import com.shilapi.xcertplay.hicarauth.HiChainNative
 import com.shilapi.xcertplay.network.LocalOnlyHotspotManager
+import com.shilapi.xcertplay.network.WifiP2pChannels
+import com.shilapi.xcertplay.network.WifiP2pGroupManager
 import com.shilapi.xcertplay.network.WirelessHotspotInfo
+import com.shilapi.xcertplay.network.WirelessHotspotManager
 import java.io.Closeable
 import java.io.IOException
 import java.io.InputStream
@@ -81,7 +84,7 @@ class HiCarController(
     private val sockets = CopyOnWriteArrayList<Closeable>()
     private val workers = CopyOnWriteArrayList<Thread>()
 
-    private var hotspot: LocalOnlyHotspotManager? = null
+    private var hotspot: WirelessHotspotManager? = null
     private var services: HiCarRfcommServices? = null
     private var advertiser: HiCarBleAdvertiser? = null
 
@@ -161,28 +164,44 @@ class HiCarController(
         startAcceptLoops(rfcomm)
     }
 
+    /**
+     * Opens a 5 GHz access point, trying Wi-Fi Direct before LocalOnlyHotspot.
+     *
+     * HiCar only accepts the 5 GHz channels in its capability bitmap, and up to Android 12 the public
+     * `startLocalOnlyHotspot` gives the caller no way to ask for a band: a HUAWEI MRX-AL09 tablet
+     * reserved a 2.4 GHz group, which no HiCar phone will join. Wi-Fi Direct can name the frequency
+     * (`setGroupOperatingFrequency`), which is also how the reference receiver does it on API < 33.
+     * LocalOnlyHotspot stays as a fallback for systems that pick 5 GHz on their own, and every
+     * attempt records why it was not used.
+     */
+    private fun openAccessPoint(): WirelessHotspotInfo? {
+        val outcome = HiCarAccessPoints.open(
+            backends = listOf(
+                HiCarAccessPoints.Backend("Wi-Fi Direct") {
+                    WifiP2pGroupManager(appContext, onLog, WifiP2pChannels.AUTO_5_GHZ)
+                },
+                HiCarAccessPoints.Backend("local-only hotspot") {
+                    LocalOnlyHotspotManager(appContext, onLog)
+                },
+            ),
+            timeoutMillis = config.networkTimeoutMillis,
+            accepted = { frequency -> frequency != null && HiCarNetworkOffer.frequencyMask(frequency) != 0 },
+            log = onLog,
+        )
+        val choice = outcome.choice
+        if (choice == null) {
+            report(HiCarStatus.Failed(if (outcome.bandRefused) "hotspot band" else "hotspot"))
+            onLog("HiCar could not open a 5 GHz access point: " + outcome.reasons.joinToString("; "))
+            return null
+        }
+        hotspot = choice.manager
+        onLog("HiCar access point from ${choice.backend.name} at ${choice.info.frequencyMHz} MHz")
+        return choice.info
+    }
+
     private fun prepareNetwork(): HiCarNetworkOffer? {
-        val manager = runCatching { LocalOnlyHotspotManager(appContext, onLog) }.getOrNull()
-        if (manager == null) {
-            report(HiCarStatus.Failed("no hotspot manager"))
-            return null
-        }
-        hotspot = manager
-        val info: WirelessHotspotInfo = try {
-            manager.start(config.networkTimeoutMillis)
-        } catch (failure: Exception) {
-            report(HiCarStatus.Failed("hotspot"))
-            onLog("HiCar access point failed: ${failure.javaClass.simpleName}")
-            return null
-        }
-        val frequency = info.frequencyMHz
-        if (frequency == null || HiCarNetworkOffer.frequencyMask(frequency) == 0) {
-            // The phone only accepts the 5 GHz channels in its capability bitmap; a 2.4 GHz group
-            // would negotiate "not accepted" and look like a phone-side failure.
-            report(HiCarStatus.Failed("hotspot band"))
-            onLog("HiCar access point is not on an accepted 5 GHz channel (${frequency ?: "unknown"} MHz)")
-            return null
-        }
+        val info: WirelessHotspotInfo = openAccessPoint() ?: return null
+        val frequency = requireNotNull(info.frequencyMHz)
         val owner = info.hostAddress?.hostAddress
         if (owner == null || !owner.contains('.')) {
             report(HiCarStatus.Failed("hotspot address"))

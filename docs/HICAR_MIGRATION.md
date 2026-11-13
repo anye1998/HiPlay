@@ -275,3 +275,37 @@ STEP mfi/wait: MFi coprocessor not present; polling
 附带发现并修掉的问题：更新检查在**测试构建**上给出了一个做不到的提议。上游 Release `v0.2.22` 确实比
 `0.2.22-hud-test` 高（SemVer 把 `-hud-test` 当预发布），但 debug 包签名不同、装不上，且上游 Release 不含 HiCar 代码。
 现按 `FLAG_DEBUGGABLE` 直接跳过检查，并把更新源仓库改为本 fork。
+
+### 7.2 第三次实测（HiCar 侧首次真机日志）：卡在 2.4 GHz 热点
+
+首次拿到 HiCar 屏幕自己的导出日志（`hicar-log-20261113-153824.txt`，23 秒后导出）：
+
+```
+--- receiver started 15:38:01 ---
+LocalOnlyHotspot starting with Wi-Fi client enabled=true
+LocalOnlyHotspot reservation band=2.4 GHz channel=0
+```
+
+状态停在 `preparing the access point`。定位结论：
+
+1. 链路**确实在跑**：热点 → RFCOMM → 广播的顺序里，热点是第一环，卡在这里。
+2. 根因是**频段**：HiCar 只接受能力位里的 5 GHz 信道（`HiCarNetworkOffer.FREQUENCIES` 为 5180–5825，
+   与参考实现 `NetworkResource.frequencyMask` 完全一致），而 **Android 12 及更早的公开
+   `startLocalOnlyHotspot` 无法指定频段**，系统自己选了 2.4 GHz。这台平板上这条路没有解。
+3. 参考实现在 API < 33 时根本不走 LocalOnlyHotspot，而是用 **Wi-Fi Direct** 指定频率建组
+   （`P2pHotspot.java`：`setGroupOperatingFrequency(5745)`）；API ≥ 33 才改用新公开接口
+   `startLocalOnlyHotspot(SoftApConfiguration)` 指定 5 GHz。
+
+**修复**（本分支）：
+
+- `HiCarAccessPoints`：按顺序尝试 **Wi-Fi Direct（`WifiP2pChannels.AUTO_5_GHZ`）→ LocalOnlyHotspot**，
+  谁先落在 5 GHz 就用谁；被拒的后端**先 close 再试下一个**（否则残留的组占着射频，下一次失败原因会被污染）；
+  每次拒绝都带原因，失败日志形如
+  `HiCar could not open a 5 GHz access point: Wi-Fi Direct failed (...); local-only hotspot settled on 2412 MHz...`
+- `HiCarController.hotspot` 类型从 `LocalOnlyHotspotManager` 改为 `WirelessHotspotManager`（两个后端共用接口）。
+- 复用了仓库里已有的 `WifiP2pGroupManager`（CarPlay 的 P2P 后端，优先 5 GHz、返回 SSID/口令/BSSID/频率/本机地址），
+  没有新写一套建网代码，也不调用 `onCarPlayConfirmed()`（该回调只影响"记住配置"，不影响建组）。
+- 界面权限从"蓝牙两项"扩展为：API ≥ 33 加 `NEARBY_WIFI_DEVICES`，否则加 `ACCESS_FINE_LOCATION`
+  （Wi-Fi Direct 在 API 31 受位置权限约束）；被拒时会**列出具体哪几项**，不再只说一句"权限未授予"。
+- 单测 `HiCarAccessPointsTest` 6 个用例，直接覆盖这台设备踩中的形态：
+  `local-only hotspot settled on 2412 MHz → 关闭它 → 改用 Wi-Fi Direct 的 5745 MHz`。

@@ -74,7 +74,14 @@ class HiCarHostActivity : ComponentActivity() {
     private var exportNotice by mutableStateOf("")
 
     private val permissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { granted ->
-        if (granted.values.all { it }) startReceiver() else appendLog("Bluetooth permissions were not granted")
+        val refused = granted.filterValues { !it }.keys
+        if (refused.isEmpty()) {
+            startReceiver()
+        } else {
+            // Name them: the access point needs Wi-Fi Direct, which fails without these, and a bare
+            // "permissions were not granted" hides which step is about to fail.
+            appendLog("Permissions refused: ${refused.joinToString()}")
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -158,8 +165,8 @@ class HiCarHostActivity : ComponentActivity() {
     private fun toggle() {
         if (running) {
             stopReceiver()
-        } else if (Build.VERSION.SDK_INT >= 31 && !hasBluetoothPermissions()) {
-            permissions.launch(arrayOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_ADVERTISE))
+        } else if (missingPermissions().isNotEmpty()) {
+            permissions.launch(missingPermissions())
         } else {
             startReceiver()
         }
@@ -299,9 +306,30 @@ class HiCarHostActivity : ComponentActivity() {
         )
     }
 
-    private fun hasBluetoothPermissions(): Boolean =
-        ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED &&
-            ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_ADVERTISE) == PackageManager.PERMISSION_GRANTED
+    /**
+     * Everything the chain needs, not only Bluetooth.
+     *
+     * The access point is a Wi-Fi Direct group because HiCar wants 5 GHz (LocalOnlyHotspot cannot be
+     * asked for a band before Android 13). Wi-Fi Direct on API 31 is gated by location access, and on
+     * API 33+ by NEARBY_WIFI_DEVICES, so both cases are requested up front.
+     */
+    private fun requiredPermissions(): List<String> {
+        val needed = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= 31) {
+            needed += Manifest.permission.BLUETOOTH_CONNECT
+            needed += Manifest.permission.BLUETOOTH_ADVERTISE
+        }
+        if (Build.VERSION.SDK_INT >= 33) {
+            needed += Manifest.permission.NEARBY_WIFI_DEVICES
+        } else {
+            needed += Manifest.permission.ACCESS_FINE_LOCATION
+        }
+        return needed
+    }
+
+    private fun missingPermissions(): Array<String> = requiredPermissions()
+        .filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
+        .toTypedArray()
 
     /**
      * Issues a new six-digit code and forgets the stored trust.
