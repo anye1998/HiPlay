@@ -6,17 +6,24 @@ import java.nio.charset.StandardCharsets
 import org.json.JSONException
 import org.json.JSONObject
 
-/** Why the authentication step cannot complete on a side-loaded build. */
+/**
+ * Why the authentication step cannot complete in this build.
+ *
+ * HiChain is Huawei's pairing protocol, but it is not closed source only: OpenHarmony publishes an
+ * Apache-2.0 implementation (`security_deviceauth` with `deviceauth_lite`, plus `security_huks`
+ * with `huks_lite`) that third-party receivers compile into their APK, and both reference projects
+ * for this migration do exactly that. Nothing here needs a Huawei-issued accessory certificate:
+ * the first connection is authorised by the six-digit code shown on the car.
+ */
 enum class HiCarAuthBlocker(val message: String) {
     /**
-     * HiChain is Huawei's own pairing protocol. It needs the native `deviceauth_lite` engine plus a
-     * HUKS key store and a device credential provisioned for the product; neither is part of AOSP
-     * and neither can be obtained by installing an APK.
+     * The engine is missing from this APK, not unavailable in principle. Porting the OpenHarmony
+     * sources behind our own JNI adapter is the remaining work; see `docs/HICAR_MIGRATION.md`.
      */
-    NATIVE_HICHAIN_LIBRARY_MISSING("HiChain native engine is not bundled"),
+    NATIVE_HICHAIN_LIBRARY_MISSING("HiChain native engine (OpenHarmony deviceauth_lite) is not built into this APK"),
 
-    /** A HiCar accessory identity is issued to a product, not generated on the car. */
-    DEVICE_CREDENTIAL_MISSING("No HiCar accessory credential is provisioned"),
+    /** The car's six-digit code has not been trusted by this phone yet; the driver enters it once. */
+    PIN_NOT_TRUSTED("The phone has not yet trusted this car's six-digit code"),
 
     /** Signature/SELinux conditions some HiCar capabilities require from a pre-installed app. */
     VENDOR_SIGNATURE_REQUIRED("Capability requires a vendor-signed system app"),

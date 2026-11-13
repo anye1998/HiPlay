@@ -196,7 +196,7 @@ channel / frequencyMHz / bssid / interfaceName / hostAddress / bandLabel / backe
    RTP(96..98) → PES → `AES-128-CTR` 解密 → H.264 基本流；音频独立通道；输入走 `remotectl_port`。
 
 **结论**：HiCar 与 CarPlay 的差别不是"换个类名"，而是**完全不同的发现/鉴权/传输栈**：
-BLE 广播 + RFCOMM 双服务 + HiChain（华为私有，需 native 库） + DMSDP 文本控制 + HiSight RTSP 投屏。
+BLE 广播 + RFCOMM 双服务 + HiChain（华为协议；OpenHarmony 有 Apache-2.0 的 deviceauth_lite 实现） + DMSDP 文本控制 + HiSight RTSP 投屏。
 CarPlay 那套 iAP2 + AirPlay RTSP 一行都用不上，能复用的只有字节流底座、Wi-Fi/热点管理、媒体渲染接缝。
 
 ---
@@ -210,8 +210,8 @@ CarPlay 那套 iAP2 + AirPlay RTSP 一行都用不上，能复用的只有字节
 | DMSDP 控制通道（明文/加密、心跳、时钟） | 可实现，AES-CTR 是标准件 |
 | Wi-Fi 能力协商 + 凭据下发 | 可实现，可单测 |
 | HiSight RTSP 协商 | 可实现（会话层），媒体解密可单测 |
-| **HiChain 鉴权** | **不可完整实现**：需要华为 `deviceauth_lite` + HUKS 的 native 实现与设备证书/种子，
-  侧载 APK 无法凭空获得。只能定义接口 + 失败即拒绝（fail-closed），并显式标记 TODO |
+| **HiChain 鉴权** | **本分支未集成**（更正：不是不可行）。OpenHarmony 以 Apache-2.0 公开 `deviceauth_lite` + `huks_lite`，
+  两个参考项目都编进 APK 后跑通，首连靠六位连接码，无需配件证书。集成步骤见 HICAR_MIGRATION.md 第 6 节 |
 | 音频（AAC 上行/下行） | 依赖已认证会话的密钥，故同样受阻；标记 TODO 并给出降级方案 |
 | 方控 / HUD / 仪表 | 华为私有，无 SDK 不可得；如实列为不可用 |
 
