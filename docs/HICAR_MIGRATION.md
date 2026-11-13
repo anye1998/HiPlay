@@ -215,3 +215,28 @@ HiChain 鉴权已按公开实现集成：`:hicar-auth` 模块把 OpenHarmony 的
 - 32 位车机、Android 15 车机在参考项目中未实测；本项目要求 4 个 ABI + Android 15 的 16 KB page size；
 - HUKS lite 的接口与上游 commit 强绑定，升级上游要重新验证；
 - APK 体积与启动开销会增加（mbedtls/openssl/cJSON + 三个上游子集）。
+
+---
+
+## 7. 附：这台平板上 CarPlay 为什么起不来（与 HiCar 无关）
+
+在 HUAWEI MRX-AL09（MatePad，Android 12 / API 31）上首次实测，现象是：首页显示"认证不可用"，
+点连接没反应（弹一句同样的提示就返回）。已定位，与 HiCar 改动无关：
+
+1. `DiPlayActivity.connect()` 开头就有 `if (setupError != null) { toast(setupError); return }`，
+   所以"发起不了连接"是认证失败的**后果**，不是另一个 bug。
+2. `setupError` 来自 `DiPlayBootstrap.ensure()`：它要把 `assets/offline-mfi/identity.pk8` 与
+   `assets/offline-mfi/certificate.p7b` 拷进私有目录再 `LocalMfiAuthenticationClient.load()`。
+   这两个是 **MFi 凭据**，按上游 `docs/BUILD.md` 的要求是**构建时用 `DIPLAY_AUTH_ASSETS_DIR` 注入的外部资产**，
+   仓库里没有，普通 `:mobile:assembleDebug` / `assembleRelease` 也不会带上。
+   实测我们产出的 APK：`unzip -l` 里没有任何 `assets/offline-mfi/*` → 拷贝时抛 `FileNotFoundException`。
+3. 也就是说：**任何没有注入 MFi 凭据的构建，CarPlay 侧都不可能连上**，这与 HiCar 是两条独立链路
+   （HiCar 用 HiChain 的 PIN 派生密钥，不碰 MFi）。即使注入了凭据，iPhone 是否信任该证书仍是另一回事，
+   `LocalMfiAuthenticationClient` 的注释写明"签名只证明密钥自洽，不证明 iPhone 信任这个身份"。
+
+为此做的两处改动（不改变行为，只是让其可解释/可进入）：
+
+- 诊断报告里 `CarPlay setup:` 那一行现在会带上真实原因（`setupFailureDetail`），
+  不再是干巴巴一句 `authentication unavailable`。
+- HiCar 界面新增桌面图标 **HiCar (experimental)**（`activity-alias`，独立入口，不进 DiPlay 主界面），
+  平板上不接 adb 也能直接打开。原来的 `am start` / 自定义 action 仍然可用。

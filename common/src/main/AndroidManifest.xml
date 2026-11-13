@@ -126,8 +126,9 @@
             android:resizeableActivity="true"
             android:theme="@style/Theme.Xcertplay" />
 
-        <!-- HiCar bring-up surface. Deliberately not in the launcher: the receiver stops at HiChain,
-             so it is reachable from a shell (action or adb am start) while the chain is developed. -->
+        <!-- HiCar bring-up surface. It has its own launcher entry (the alias below) so it can be
+             opened on a device without a shell, but it is not part of DiPlay's own home screen: the
+             chain has no media stage yet. -->
         <activity
             android:name="com.shilapi.xcertplay.HiCarHostActivity"
             android:exported="true"
@@ -138,6 +139,20 @@
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </activity>
+
+        <!-- A second icon, not a route inside DiPlay: the experimental receiver must not look like
+             part of the CarPlay flow. The label stays a literal because the screen's own copy is
+             English and a translation would need all twelve locales the resource tests enforce. -->
+        <activity-alias
+            android:name="com.shilapi.xcertplay.HiCarLauncherAlias"
+            android:targetActivity="com.shilapi.xcertplay.HiCarHostActivity"
+            android:exported="true"
+            android:label="HiCar (experimental)">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
 
         <activity
             android:name="com.shilapi.xcertplay.ImageCropActivity"

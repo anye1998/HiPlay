@@ -194,6 +194,8 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
     private var pendingCarHotspotSetup = false
     private var hotspotJoinControls: HotspotJoinControls? = null
     private var setupError: String? = null
+    /** The reason behind [setupError]; the banner has one sentence, the report needs the cause. */
+    private var setupFailureDetail: String? = null
     private var status: TextView? = null
     private var homeCardTitle: TextView? = null
     private var homeConnectionHint: TextView? = null
@@ -398,9 +400,10 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
             }
         }
         applyWindowAppearance()
-        setupError = runCatching { DiPlayBootstrap.ensure(this, AirPlayPersistence.loadMfiTarget(this)) }.exceptionOrNull()?.let {
+        runCatching { DiPlayBootstrap.ensure(this, AirPlayPersistence.loadMfiTarget(this)) }.exceptionOrNull()?.let {
             android.util.Log.e("DiPlaySetup", "CarPlay authentication could not be loaded", it)
-            getString(R.string.setup_error_auth)
+            setupError = getString(R.string.setup_error_auth)
+            setupFailureDetail = describeSetupFailure(it)
         }
         pendingCarHotspotSetup = savedInstanceState?.getBoolean("pending_car_hotspot") ?: false
         bydVehicleAdvancedExpanded = savedInstanceState?.getBoolean("byd_vehicle_advanced") ?: false
@@ -1755,9 +1758,10 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
                 ), mfiTargets.indexOf(storedMfiTarget)) { index ->
                     val target = mfiTargets[index]
                     AirPlayPersistence.saveMfiTarget(this, target)
-                    setupError = runCatching { DiPlayBootstrap.ensure(this, target) }.exceptionOrNull()?.let {
+                    runCatching { DiPlayBootstrap.ensure(this, target) }.exceptionOrNull()?.let {
                         android.util.Log.e("DiPlaySetup", "CarPlay authentication could not be loaded", it)
-                        getString(R.string.setup_error_auth)
+                        setupError = getString(R.string.setup_error_auth)
+                        setupFailureDetail = describeSetupFailure(it)
                     }
                 }
                 card.addView(label(getString(R.string.settings_mfi_target_description), 14, MUTED))
@@ -5974,6 +5978,23 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
         }, "diplay-export").start()
     }
 
+    /**
+     * Explains why the CarPlay identity could not be installed, in terms a report reader can act on.
+     *
+     * The usual cause on a source build is a missing `assets/offline-mfi`: the MFi identity is a
+     * private key that is deliberately not in the repository, so a plain `assembleDebug` can never
+     * authenticate and the Connect button then refuses to start (see `connect`).
+     */
+    private fun describeSetupFailure(failure: Throwable): String {
+        val message = failure.message.orEmpty()
+        if (failure is java.io.FileNotFoundException || message.contains("offline-mfi")) {
+            return "assets/offline-mfi is missing, so this build carries no MFi identity and CarPlay " +
+                "cannot authenticate; rebuild with DIPLAY_AUTH_ASSETS_DIR pointing at the runtime assets"
+        }
+        val target = AirPlayPersistence.loadMfiTarget(this)
+        return "${failure.javaClass.simpleName}: ${message.ifEmpty { "no detail" }} (target $target)"
+    }
+
     /** The text of a diagnostic report. It reads the session logs, so call it off the main thread. */
     private fun diagnosticReportText(appContext: Context): String = buildString {
         appendLine("DiPlay ${version()} · private beta diagnostic report")
@@ -5985,7 +6006,8 @@ class DiPlayActivity : ComponentActivity(), AppAppearanceOwner {
             appendLine("USB charging offer: ${it.key} (${it.milliAmps} mA)")
         }
         appendLine("Authentication: local experimental beta identity; no remote fallback")
-        appendLine("CarPlay setup: ${if (setupError == null) "ready" else "authentication unavailable"}")
+        val setupLine = setupFailureDetail?.let { "authentication unavailable; $it" } ?: "authentication unavailable"
+        appendLine("CarPlay setup: ${if (setupError == null) "ready" else setupLine}")
         appendLine("Saved video preference (may differ from active session): ${if (AirPlayPersistence.loadHevcEnabled(appContext)) "HEVC" else "H.264"}; ${AirPlayPersistence.loadFps(appContext)} fps")
         appendLine("Media-key audio focus: ${if (AirPlayPersistence.loadDisableMediaKeyAudioFocus(appContext)) "disabled" else "enabled"}")
         appendLine("MTK decoder tuning preference: ${if (AirPlayPersistence.loadMtkDecoderTuning(appContext)) "enabled" else "disabled"}")
