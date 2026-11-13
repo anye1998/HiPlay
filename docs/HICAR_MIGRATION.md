@@ -1,13 +1,14 @@
 # HiCar 接收端迁移：实现状态、能力缺口与后续步骤
 
 本文件对应分支 `feat/hicar-migration`。侦察结论见 [HICAR_RECON.md](HICAR_RECON.md)。
-本文只写已经完成并经过验证的内容，以及**明确做不到**的部分。
+本文把"已验证"和"写完但未验证"分开写，并明确列出做不到的部分。
 
 结论先行：**这个分支交付的是"协议层真实、可编译、可单测的 HiCar 车机侧骨架"，不是能连上手机出画面的成品。**
-卡点是 HiChain 鉴权的**原生引擎没有集成进 APK**——不是"做不到"：OpenHarmony 以 Apache-2.0 公开了
-`deviceauth_lite`（HiChain Lite）与 `huks_lite`（软件密钥库），两个参考项目都是把这套 C 源码编进 APK 后跑通的，
-首连靠车机显示的六位连接码授权，**不需要华为签发的配件证书**。因此代码在 HiChain 处
-**直接失败并上报原因**，而不是伪造一个会话密钥；集成路径见第 6 节。
+HiChain 鉴权已按公开实现集成：`:hicar-auth` 模块把 OpenHarmony 的 `deviceauth_lite`（HiChain Lite）与
+`huks_lite`（软件密钥库，Apache-2.0）编成 `libhicarauth.so`（四个 ABI 全部编出并打进 APK），Kotlin 侧已接线，
+首连靠车机显示的六位连接码授权，**不需要华为签发的配件证书**。
+但**没有在真机上与手机完成过一次真实 HiChain 交换**——这条链路是本次唯一"写完了但没验证过"的部分，
+其余未完成项见第 2 节。
 
 ---
 
@@ -40,11 +41,11 @@
 
 ## 2. 未完成 / 做不到的部分（逐条如实记录）
 
-### 2.1 阻断性缺口
+### 2.1 仍未闭环的部分
 
 | 缺口 | 原因 | 后果 |
 | --- | --- | --- |
-| **HiChain 鉴权** | 本仓库未集成 `deviceauth_lite` 原生引擎（公开、Apache-2.0、参考项目已跑通，属**未做**而非**不可做**） | 手机在交换身份后要求 HiChain，会话在此终止，`HiCarStatus.Blocked` |
+| **HiChain 真机验证** | 引擎已编入 APK、Kotlin 已接线（见第 6 节），但没有真机与华为手机做过一次完整交换 | 无真机证据前只能算"代码完成"，会话可能停在 `Blocked` |
 | **HiSight 投屏会话** | 依赖已认证会话的密钥；且 RTSP 语义（ANNOUNCE/OPTIONS/SETUP/PLAY、RTP→PES→ES 解密）尚未实现 | 无画面 |
 | **音频** | 同上：AAC 上下行都走会话密钥加密的媒体通道 | 无声音 |
 
@@ -162,17 +163,37 @@
 - HUKS 在这里是**软件密钥库**：文件回调只允许 `info1.data` / `info2.data` / `hks_keystore` 三个名字，落在 app 私有目录（0700）；UDID 由调用方给的种子做 SHA-256 得到，参考实现传的是本机持久化的 `localId`；
 - 所以**不需要华为签发的配件证书**，也不需要 MFi 那种身份。此前本文件把"缺证书"当成阻断原因，是错的，已更正。
 
-### 落到本项目的步骤（未做，按顺序）
+### 已落地的实现（本分支已完成）
 
-1. **引上游源码而非参考项目代码**（原任务要求"不要直接复制参考项目代码"，且参考项目的 JNI/适配层与其上游许可混在一起）。
-   新建独立模块 `hicar-auth`（`com.android.library`），`externalNativeBuild.cmake`，源码放 `hicar-auth/src/main/cpp/third_party/`，
-   保留 `LICENSE`/`NOTICE`。**不要动 `shared` 现有的 ndkBuild（speexdsp）**，两个原生构建分开。
-2. 写**我们自己的** JNI：`init(path, seed)`、`create(self, peer, pin, role)`、`step(packet, keyLength)`、`sessionKey()`、`close()`。
-   HUKS 文件回调必须 `O_NOFOLLOW` + 名字白名单 + 私有目录，越界即失败。
-3. Kotlin 侧实现已有的 `HiCarAuthenticator` 接口：把 `HiCarIdentityExchange` 的 `oper_type = 3` 消息交给 native `step`，
-   密钥只从 `sessionKey()` 取；`HiCarUnavailableAuthenticator` 换成 `HiChainAuthenticator`。
-4. 界面：`HiCarHostActivity` 展示六位连接码并支持重新生成（重新生成必须清除 auth info，否则旧的信任关系对不上）。
-5. 验证顺序：先只验"身份交换 + HiChain 完成 + 拿到 32 字节密钥"，再谈 DMSDP、热点、HiSight。
+按"引上游源码、自己写适配层"的方向做完了，没有复制参考项目的适配代码：
+
+1. **独立模块 `hicar-auth`**（`com.android.library` + `externalNativeBuild.cmake`），与 `shared` 现有的
+   ndkBuild（speexdsp）互不干扰。
+2. **源码由脚本拉取、不入库**：`scripts/fetch-hichain-sources.py` 钉住三个上游 commit 与两个归档的 SHA-256，
+   支持 `--verify` / `--clean`；四个依赖：`security_deviceauth`、`security_huks`、`third_party_bounds_checking_function`、
+   `mbedtls v2.28.9`，外加 `cJSON v1.7.19`（deviceauth_lite 的 JSON 层要用）。
+   拉取后 7.6 MB、189 个 `.c`。
+3. **自写 JNI** `hicar-auth/src/main/cpp/hichain_jni.c`：`init/create/step/sessionKey/close`，
+   HUKS 存储用 `openat + O_NOFOLLOW + 三个文件名的白名单`，目录必须 `0700`；
+   `confirm_receive_request` **只放行 BIND(1) 与 AUTHENTICATE(2)**，`REMOVE_AUTHINFO/UNBIND/SEC_CLONE` 一律拒绝。
+4. **编掉了 OpenSSL**：`_CUT_AUTHENTICATE_` 是上游自带的裁剪开关，去掉的只是 x25519 辅助函数（huks_lite 里唯一
+   直接 include OpenSSL 内部头 `ec_local.h` 的地方）。成品 `.so` 的 `NEEDED` 只有 `libc/libm/libdl/liblog`。
+5. **Kotlin 接线**：`HiChainAuthenticator` 实现 `HiCarAuthenticator`；`HiCarIdentityExchange` 把 `oper_type=3`
+   的报文原样转给引擎（含 message 17 的 `keyLength`），密钥只从 `sessionKey()` 取；
+   拿到密钥后 `HiCarController` 在同一 socket 上开 DMSDP 控制通道（`HiCarStatus.Authenticated` → `ControlChannelReady`）。
+6. **界面**：`HiCarHostActivity` 展示/持久化六位连接码，`Reset pairing` 会清空 `files/hicar-huks` 并换码
+   （否则手机信任的还是旧码对应的密钥）。
+7. **CI 防回归**：workflow 先拉源码再构建，并在构建后断言 APK 里确实存在 `lib/arm64-v8a/libhicarauth.so`
+   与 `lib/armeabi-v7a/libhicarauth.so`——避免"绿了但引擎没进去"。
+
+### 仍然没做的（按重要性）
+
+1. **真机验证**：需要一台华为手机 + 车机，走"显示码 → 手机输码 → 绑定 → 再认证"。没有真机证据前，
+   不要把这条链路描述为可用。首次绑定后手机的信任记录保存在 HUKS 文件里，重启/清数据后的行为未验证。
+2. **HiSight 投屏**：RTSP/RTP→PES→AES-CTR 与渲染未实现，`HiCarControlSession` 的 `onApplicationService`
+   目前只记录日志。
+3. **音频**：同样依赖媒体阶段的密钥，未实现。
+4. 32 位/Android 15 车机、16 KB page size 的真机验证。
 
 ### 已知风险（来自参考项目自己的记录，不是推测）
 

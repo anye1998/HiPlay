@@ -43,6 +43,19 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
+      # The HiChain engine is third-party C that is not committed. Without this step the APK still
+      # builds, but authentication can never finish, so the fetch is part of the release build.
+      - name: Cache the pinned HiChain engine sources
+        uses: actions/cache@v4
+        with:
+          path: hicar-auth/src/main/cpp/third_party
+          key: hichain-${{ hashFiles('scripts/fetch-hichain-sources.py') }}
+
+      - name: Fetch the pinned HiChain engine sources
+        run: |
+          python3 scripts/fetch-hichain-sources.py
+          python3 scripts/fetch-hichain-sources.py --verify
+
       # Secrets are not available to `if:` directly, so they are copied into env and checked there.
       - name: Prepare the optional release keystore
         id: signing
@@ -68,6 +81,13 @@ jobs:
           set -o pipefail
           ./gradlew --stacktrace --no-configuration-cache \
             :mobile:assembleDebug :mobile:assembleRelease 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      # A green build whose APK silently lacks the engine would look like a working receiver.
+      - name: Assert the HiChain engine is inside the APK
+        run: |
+          unzip -l mobile/build/outputs/apk/debug/*.apk | grep -q "lib/arm64-v8a/libhicarauth.so"
+          unzip -l mobile/build/outputs/apk/debug/*.apk | grep -q "lib/armeabi-v7a/libhicarauth.so"
+          echo "libhicarauth.so present in arm64-v8a and armeabi-v7a"
 
       - name: Name the failing build stage
         if: failure()
