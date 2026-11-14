@@ -396,8 +396,12 @@ Java_com_shilapi_xcertplay_hicarauth_HiChainNative_sessionKey(JNIEnv *env, jclas
 {
     (void)clazz;
     struct session *session = (struct session *)(intptr_t)handle;
-    /* Only a completed, successful exchange may surrender a key. */
-    if (session == NULL || session->error != 0 || session->result != 0 ||
+    /*
+     * The gate is "the exchange produced a usable key", not "result == 0": for a bind the engine
+     * reports the protocol phase (KEY_AGREEMENT_END) in `result`, so demanding 0 discarded every
+     * completed first-time pair. END_FAILED (1) is the only value that means the exchange failed.
+     */
+    if (session == NULL || session->error != 0 || session->result == 1 ||
         (session->key.length != MIN_KEY_BYTES && session->key.length != MAX_KEY_BYTES)) {
         return NULL;
     }

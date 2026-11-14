@@ -65,6 +65,13 @@ internal class HiChainAuthenticator(
         val step = HiChainNative.stepDecoded(handle, chunk, keyLength)
             ?: throw HiCarAuthException(HiCarAuthBlocker.NATIVE_HICHAIN_LIBRARY_MISSING)
         stepIndex++
+        // One line per step, with the engine's own numbers: the phase it reached and whether a key
+        // exists yet. Without this, a run that derived a key and then discarded it looked identical
+        // to one where the phone rejected the code.
+        onLog(
+            "HiChain step $stepIndex: engine=$step.code, phase=${step.describe()}, " +
+                "key=${step.keyLength}B, error=${step.error}, out=${step.packets.size}",
+        )
         if (step.error != 0) {
             // Every non-zero error used to be reported as "needs a vendor-signed app", which sent the
             // investigation to the wrong place: a wrong PIN, an unsupported key length and a broken
@@ -77,7 +84,15 @@ internal class HiChainAuthenticator(
         }
         if (step.finished) {
             val key = HiChainNative.sessionKey(handle)
-                ?: throw HiCarAuthException(HiCarAuthBlocker.NATIVE_HICHAIN_LIBRARY_MISSING)
+            if (key == null) {
+                // The engine says the exchange produced a key but will not hand it over; say which
+                // gate refused instead of throwing a library-missing blocker that means nothing here.
+                onLog(
+                    "HiChain: ${step.keyLength}-byte key reported but not exported " +
+                        "(phase=${step.describe()}, error=${step.error}); the export gate refused it",
+                )
+                throw HiCarAuthException(HiCarAuthBlocker.NATIVE_HICHAIN_LIBRARY_MISSING)
+            }
             sessionKey = key
             onLog("HiChain step $stepIndex finished: ${key.size}-byte session key")
         }
@@ -85,14 +100,15 @@ internal class HiChainAuthenticator(
     }
 
     override fun close() {
-        // A session that ran steps and then ended without a key is the phone rejecting the confirm:
-        // HiChain gives the driver no finer message than "wrong password", so the log has to say what
-        // actually happened, or the next run starts from a guess.
+        // An exchange that ran steps and ended without a key can mean two very different things: the
+        // phone rejected the code, or the engine finished a phase we did not recognise as the end.
+        // The earlier wording asserted the first, and the run at 21:43 showed the second, so this
+        // states only what is known and leaves the per-step lines above to say which one happened.
         if (started && stepIndex > 0 && sessionKey == null) {
             onLog(
-                "HiChain ended after $stepIndex step(s) with no session key: the phone's confirm did not " +
-                    "match ours, which for this protocol means the code on the phone differs from the " +
-                    "code on this screen (or the link dropped first)",
+                "HiChain ended after $stepIndex step(s) with no session key: either the phone rejected " +
+                    "the confirm, or it closed while the exchange was still mid-phase — the step lines " +
+                    "above carry the phase it reached",
             )
         }
         if (handle != 0L) {

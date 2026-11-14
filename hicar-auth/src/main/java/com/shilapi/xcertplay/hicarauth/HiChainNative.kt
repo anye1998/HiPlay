@@ -67,7 +67,29 @@ class HiChainNative private constructor() {
             val error: Int,
             val packets: List<ByteArray>,
         ) {
-            val finished: Boolean get() = result == 0 && keyLength in setOf(16, 32) && error == 0
+            /**
+             * True once the engine has handed over a session key.
+             *
+             * `result` cannot be the criterion. It is the engine's `hc_result`, which for a bind
+             * reports the protocol phase (`KEY_AGREEMENT_END` = 3) rather than success, and only an
+             * authenticate operation maps the phase onto `END_SUCCESS` = 0. Requiring 0 therefore
+             * rejected every completed first-time pair — the key was derived and then thrown away,
+             * which the phone reported as a failed connection. A key of a usable length, with no
+             * engine error and no `END_FAILED`, is the evidence that the exchange finished.
+             */
+            val finished: Boolean
+                get() = error == 0 && result != RESULT_END_FAILED && keyLength in setOf(16, 32)
+
+            /** The phase names above, so a log line says "KEY_AGREEMENT_END" and not "3". */
+            fun describe(): String = when (result) {
+                0 -> "END_SUCCESS"
+                1 -> "END_FAILED"
+                2 -> "KEY_AGREEMENT_PROCESSING"
+                3 -> "KEY_AGREEMENT_END"
+                4 -> "OPERATION_PROCESSING"
+                5 -> "OPERATION_END"
+                else -> "result=$result"
+            }
         }
 
         /**
@@ -89,6 +111,9 @@ class HiChainNative private constructor() {
         }
 
         private const val HEADER_BYTES = 16
+
+        /** `END_FAILED` from the engine's own `hc_result` enum; the only result that is a failure. */
+        private const val RESULT_END_FAILED = 1
 
         /** The store directory, created 0700 so the native check accepts it. */
         fun storeDirectory(file: File): File = file.apply {

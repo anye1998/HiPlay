@@ -943,3 +943,77 @@ this protocol means the code on the phone differs from the code on this screen (
 2. `Start` → 手机弹窗出现时**照屏幕逐位输入**；
 3. 导出日志，看两行：`HiChain begin: ... pin=XX…YY`（是否与屏幕一致）与
    `HiChain ended after N step(s) ...`（N 是否 6、有没有 session key）。
+
+### 7.19 密码通过、手机随后报"连接失败"：我们把自己的 session key 丢了
+
+`hicar-log-20261114-214313.txt`（21:42 起）+ 手机截图（21:45，"请重试连接／HUAWEI HiCar 连接失败，
+为确保下一次连接成功，设备配对信息已被清除"）。
+
+**码这次是对的**。车机屏幕 `216929`，日志里 `pin=21…29`，手机没有再报密码错误，PAKE 也跑完了：
+
+```
+HiCar control channel connected (peer F8:3B:7E:3E:DD:06)
+HiCar business channel connected (peer F8:3B:7E:3E:DD:06)
+HiChain begin: role=accessory peer=01CF…017E pin=21…29
+HiCar identity exchanged
+HiChain step: 1 packet(s)   ×4          <- 注意：错码那次是 6 步
+HiCar channel closed: IOException
+HiChain ended after 4 step(s) with no session key
+```
+
+**根因在我们这边，不在手机：引擎把 session key 派生出来了，我们用一条错误的判据把它丢掉了。**
+
+HiChain 的回调 `set_service_result` 传的不是"成功/失败"，而是 `hc_result` **阶段枚举**
+（`interfaces/innerkits/deviceauth_lite/hichain.h`）：
+
+```c
+enum hc_result { END_SUCCESS = 0, END_FAILED, KEY_AGREEMENT_PROCESSING,
+                 KEY_AGREEMENT_END, OPERATION_PROCESSING, OPERATION_END };
+```
+
+而 `frameworks/deviceauth_lite/source/hichain.c` 的 `set_result_by_map()` 只在一个条件下把阶段**改写成** `END_SUCCESS`：
+
+```c
+if (hichain->operation_code != AUTHENTICATE && hichain->operation_code != AUTH_KEY_AGREEMENT) {
+    goto out;          /* BIND 走这里：原样返回阶段，即 KEY_AGREEMENT_END = 3 */
+}
+...
+hichain->cb.set_service_result(&hichain->identity, END_SUCCESS);
+```
+
+**首次配对是 BIND**，所以阶段到 `KEY_AGREEMENT_END`（3）就停了，永远不会是 0。而我们的
+`HiChainNative.Step.finished` 写的是 `result == 0 && keyLength in {16,32} && error == 0`，
+JNI 的 `sessionKey()` 又要求 `session->result != 0` 才拒绝——两边合起来的效果是：
+**密钥已经算出来，但一次都不交给我们**。手机那边认为鉴权完成，等不到车机的后续（DMSDP），
+于是清掉配对信息并弹"连接失败"。
+
+这也解释了步数差异：错码那次 6 步（引擎走的是拒绝/提示路径），这次 4 步（PAKE 正常结束）。
+步数本身不是判据，**`key=N B` 才是**。
+
+**修复**（判据换成"有没有拿到可用的密钥"）：
+
+| 位置 | 旧 | 新 |
+| --- | --- | --- |
+| `HiChainNative.Step.finished` | `result == 0 && keyLength in {16,32} && error == 0` | `error == 0 && result != END_FAILED(1) && keyLength in {16,32}` |
+| `hichain_jni.c` `sessionKey()` | `session->result != 0` 就拒绝 | 只拒绝 `result == END_FAILED`，仍要求 16/32 字节 |
+
+`END_FAILED` 是唯一表示失败的取值，保留它；`KEY_AGREEMENT_END`、`OPERATION_END` 都是进度。
+单测 `HiChainStepTest` 四项锁住这条语义（含"有密钥但 END_FAILED 不许导出""没密钥不算完成"）。
+
+**同时补上每步一行原始数字**，下次不用再靠步数猜：
+
+```
+HiChain step 4: engine=0, phase=KEY_AGREEMENT_END, key=32B, error=0, out=1
+```
+
+`phase` 由枚举翻成名字（`END_SUCCESS` / `KEY_AGREEMENT_END` / …），`key` 是引擎报的密钥长度。
+
+**下一步预期**：若判据修对，日志应出现
+
+```
+HiChain step N finished: 32-byte session key
+HiChain finished: 32-byte session key; opening DMSDP
+```
+
+随后是网络协商（Wi-Fi 凭据）与业务通道。若仍未出现，`key=` 那一列会直接指出是"引擎没派生"还是
+"派生了但被拒"，不再有第三种模糊状态。
