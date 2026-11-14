@@ -673,3 +673,33 @@ HiCar advertisement started (11 bytes of 0xFDEE service data, device name in the
 
 结论不变：**这台平板在未改 ROM 的前提下，HiCar 的发现阶段走不通**，且现在有三次独立实测支持这个判断
 （地址为 RPA、地址会轮换、隐藏入口不可达）。
+
+### 7.12 嗅探模式：把真车机当对照，而不是在我们的设备上继续猜
+
+新增界面按钮 **Sniff 0xFDEE (60s)**：只扫描、不广播、不开热点、不听 RFCOMM。用途是把**真实车机**的
+0xFDEE 广播原样读回来，包括我们改不了的那一项——广播地址。
+
+判读方式（日志一次给全）：
+
+```
+HiCar sniff: 3 0xFDEE advertisement(s) captured; payloads below
+  4C:xx:xx:xx:xx:xx x37 rssi=-48 name='...' data=.. .. .. .. 
+  ...
+```
+
+1. **地址列**：真车机的广播地址等于它的 BR 地址，首字节最高两位不会是 `01`（私有）或 `11`（静态随机）。
+   我们平板发出去的是 `01`——这一列就是 7.10 那个根因的直接对照。
+2. **payload 列**：拿到真车机的完整字节，就能替换我们从参考项目抄来的 11 字节测试向量。
+   在地址问题解决前，这是我们唯一能取得真值（ground truth）的办法。
+3. **name 列**：真车机是否把车名放进扫描响应，决定手机弹框里显示什么。
+
+如果车机有可用的 adb（USB 调试口、工程模式），还能拿到比广播更硬的证据：
+
+- 开发者选项里开"启用蓝牙 HCI 信息收集日志"，跑一次连接，再 `adb bugreport` 取 `btsnoop_hci.log`，
+  用 Wireshark 看 `LE Set Advertising Parameters` 里的 **own_address_type**——这是"公开地址还是私有地址"的
+  最终判据，比从广播地址反推更直接。
+- `adb shell dumpsys bluetooth_manager` 能看到车机侧 HiCar 服务的广播注册与状态。
+
+**注意**：不要往车机上安装本 APK 去"试"。前装车机自带的 HiCar 服务已经在用 0xFDEE 广播、5 GHz 热点和
+RFCOMM 记录，我们的接收端会和它抢同一个射频与广播位；而且车机的 HiCar 栈是系统签名的，侧载 APK 既装不上，
+也代表不了我们的实现。车机的价值是**对照样本**，不是运行环境。

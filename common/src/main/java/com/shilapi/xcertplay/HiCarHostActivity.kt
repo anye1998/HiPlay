@@ -37,6 +37,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.core.content.pm.PackageInfoCompat
+import com.shilapi.xcertplay.hicar.HiCarAdvertisementProbe
 import com.shilapi.xcertplay.hicar.HiCarController
 import com.shilapi.xcertplay.hicar.HiCarRuntimeConfig
 import com.shilapi.xcertplay.hicar.HiCarStatus
@@ -69,6 +70,9 @@ class HiCarHostActivity : ComponentActivity() {
     private val log = mutableStateListOf<String>()
     private var controller: HiCarController? = null
 
+    /** A scan that only listens, used to read a real head unit's beacon. See [sniff]. */
+    private var sniffer: HiCarAdvertisementProbe? = null
+
     /** Longer than [log]: the screen keeps a readable tail, the export keeps the whole attempt. */
     private val history = ArrayList<String>()
     private var droppedFromHistory = 0
@@ -90,14 +94,11 @@ class HiCarHostActivity : ComponentActivity() {
     /**
      * The system's "allow other devices to find this device" prompt.
      *
-     * Both reference receivers publish the 0xFDEE advertisement only while the device is discoverable
-     * over BR/EDR: the payload carries the model and a sequence number, not the car's BR address, so
-     * the phone has to find the address by inquiry.
-     *
-     * It is deliberately *not* part of Start. A system activity that is missing or refuses the request
-     * used to take the whole receiver down with it, and the access point, RFCOMM records and
-     * advertisement are all worth testing without inquiry. Pressing Start keeps working exactly as
-     * before; this is an extra step the driver chooses.
+     * Kept as a manual step, deliberately not part of Start. HiCar itself does not need it: the phone
+     * dials the address it reads out of the advertisement, and never runs an inquiry (see 7.10 in
+     * `docs/HICAR_MIGRATION.md`). It stays because a phone that already knows this device, and anyone
+     * checking with a classic scanner, do work through inquiry — and because a system activity that
+     * is missing or refuses the request used to take the whole receiver down with it.
      */
     private val discoverable = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         val verdict = if (result.resultCode > 0) "granted for ${result.resultCode}s" else "declined"
@@ -125,6 +126,8 @@ class HiCarHostActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        sniffer?.close()
+        sniffer = null
         controller?.close()
         controller = null
         super.onDestroy()
@@ -174,6 +177,9 @@ class HiCarHostActivity : ComponentActivity() {
                     Text(if (exporting) "Exporting…" else "Export log")
                 }
                 Button(onClick = ::shareLog, enabled = exportUri != null) { Text("Share") }
+                // One press, sixty seconds, no advertisement of our own: the only way to read what a
+                // real head unit actually puts on the air.
+                Button(onClick = ::sniff) { Text("Sniff 0xFDEE (60s)") }
             }
             if (exportNotice.isNotEmpty()) {
                 Text(exportNotice, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
@@ -188,6 +194,44 @@ class HiCarHostActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    /**
+     * Listens for 0xFDEE advertisements without transmitting anything, so a real car can be read.
+     *
+     * Our own beacon cannot be checked against a phone that never reacts to it, but a car's can be
+     * captured byte for byte — including the one field this app cannot set, its advertising address,
+     * which a head unit keeps equal to its BR address. Nothing here advertises, opens an access point
+     * or listens on RFCOMM, so it is harmless to run next to a working head unit.
+     *
+     * The permission prompt is not raised from here: its callback starts the receiver, which is not
+     * what this button is for. Missing permissions are named instead, and Start grants them once.
+     */
+    private fun sniff() {
+        val active = sniffer
+        if (active != null && active.running) {
+            active.close()
+            sniffer = null
+            appendLog("HiCar sniff stopped")
+            return
+        }
+        if (running) {
+            appendLog(
+                "HiCar sniff: stop the receiver first — its advertisement and self-scan already hold " +
+                    "the radio, and our own beacon is not what you are looking for",
+            )
+            return
+        }
+        val missing = missingPermissions()
+        if (missing.isNotEmpty()) {
+            appendLog("HiCar sniff needs: ${missing.joinToString()}; press Start once to grant them")
+            return
+        }
+        appendLog("HiCar sniff: listening only; export the log when the 60 s are up")
+        val probe = HiCarAdvertisementProbe(this) { appendLog(it) }
+        sniffer = probe
+        // 60 s: long enough to walk around the car while the head unit advertises.
+        probe.start(null, 60_000L)
     }
 
     private fun toggle() {

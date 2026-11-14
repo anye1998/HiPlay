@@ -61,13 +61,21 @@ class HiCarAdvertisementProbe(
 
     private var scanner: android.bluetooth.le.BluetoothLeScanner? = null
     private var callback: ScanCallback? = null
-    private var expected: ByteArray = ByteArray(0)
+
+    /**
+     * The payload we expect to hear, or null when this scan is pure evidence gathering.
+     *
+     * Sniffing is the one thing that can settle what a real car actually advertises: the beacon we
+     * build cannot be checked against a phone that never reacts to it, but a car beacon can be read
+     * byte for byte. Null means "there is no expected payload", not "expect nothing".
+     */
+    private var expected: ByteArray? = null
 
     /** True once [start] has been called and not yet stopped; the log only needs a summary. */
     val running: Boolean get() = callback != null
 
     @SuppressLint("MissingPermission")
-    fun start(serviceData: ByteArray, durationMillis: Long = DEFAULT_DURATION_MILLIS) {
+    fun start(serviceData: ByteArray?, durationMillis: Long = DEFAULT_DURATION_MILLIS) {
         if (running) return
         expected = serviceData
         val local = adapter
@@ -108,7 +116,14 @@ class HiCarAdvertisementProbe(
         }
         scanner = leScanner
         callback = listener
-        onLog("HiCar self-scan started for ${durationMillis / 1000}s; listening for any 0xFDEE payload")
+        onLog(
+            if (expected == null) {
+                "HiCar sniff started for ${durationMillis / 1000}s; every 0xFDEE payload gets " +
+                    "listed with its address, name and bytes"
+            } else {
+                "HiCar self-scan started for ${durationMillis / 1000}s; listening for any 0xFDEE payload"
+            },
+        )
         handler.postDelayed({ finish() }, durationMillis)
     }
 
@@ -119,7 +134,8 @@ class HiCarAdvertisementProbe(
         val record = result.scanRecord ?: return
         val data = record.getServiceData(ParcelUuid(HiCarCodes.SERVICE_DISCOVERY)) ?: return
         fdee.incrementAndGet()
-        val isOurs = data.contentEquals(expected)
+        val wanted = expected
+        val isOurs = wanted != null && data.contentEquals(wanted)
         if (isOurs) matching.incrementAndGet()
         // The name travels in the scan response, so a scanner that only reads the advertisement
         // packet sees none — that is a limit of the report, not evidence about our own payload.
@@ -146,6 +162,7 @@ class HiCarAdvertisementProbe(
         val total = heard.get()
         val fdeeTotal = fdee.get()
         val ours = matching.get()
+        val looking = expected
         val seen = synchronized(sightings) { sightings.values.toList() }
         when {
             total == 0 ->
@@ -161,6 +178,15 @@ class HiCarAdvertisementProbe(
                         "); a phone that ignores it is filtering on content, not missing it",
                 )
             }
+            fdeeTotal > 0 && looking == null -> {
+                // Sniffing: there is no payload of ours to compare against, only evidence to keep.
+                onLog("HiCar sniff: ${fdeeTotal} 0xFDEE advertisement(s) captured; payloads below")
+                dump(seen)
+                onLog(
+                    "  read the address column first: a real head unit's advertising address is its " +
+                        "BR address, so its top two bits are not 01 (private) or 11 (static random)",
+                )
+            }
             fdeeTotal > 0 -> {
                 val others = seen.filterNot { it.ours }.distinctBy { it.address }
                 onLog(
@@ -168,14 +194,8 @@ class HiCarAdvertisementProbe(
                         "our payload. Compare these lines with the phone's scanner before concluding " +
                         "anything: the tablet may simply not hear itself",
                 )
-                seen.sortedByDescending { it.count.get() }.take(MAX_SAMPLES).forEach { sighting ->
-                    onLog(
-                        "  ${sighting.address} x${sighting.count.get()} rssi=${sighting.rssi} " +
-                            "name=${sighting.name?.let { "'$it'" } ?: "none"} " +
-                            "data=${hex(sighting.payload)}",
-                    )
-                }
-                onLog("  ours, never heard: ${hex(expected)}")
+                dump(seen)
+                onLog("  ours, never heard: ${looking?.let { hex(it) } ?: "none"}")
             }
             else ->
                 onLog(
@@ -185,6 +205,17 @@ class HiCarAdvertisementProbe(
                 )
         }
         stop()
+    }
+
+    /** One line per payload, most often heard first — the format a phone-side scanner would show. */
+    private fun dump(seen: List<Sighting>) {
+        seen.sortedByDescending { it.count.get() }.take(MAX_SAMPLES).forEach { sighting ->
+            onLog(
+                "  ${sighting.address} x${sighting.count.get()} rssi=${sighting.rssi} " +
+                    "name=${sighting.name?.let { "'$it'" } ?: "none"} " +
+                    "data=${hex(sighting.payload)}",
+            )
+        }
     }
 
     private fun hex(bytes: ByteArray): String =
@@ -205,6 +236,8 @@ class HiCarAdvertisementProbe(
     companion object {
         /** Long enough to catch a few advertising intervals, short enough not to hold the radio. */
         const val DEFAULT_DURATION_MILLIS = 20_000L
-        private const val MAX_SAMPLES = 5
+
+        /** Eight lines still fit on one exported log screen, and a car park rarely has more. */
+        private const val MAX_SAMPLES = 8
     }
 }
