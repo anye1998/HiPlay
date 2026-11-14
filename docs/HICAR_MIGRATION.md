@@ -514,3 +514,50 @@ HiCar waiting for the phone: 30s, connections=0, advertising=on, listeners=open,
 **这一步的意义**：在此之前，每一轮都在"手机为什么不理我"上打转；有了自扫描，下一份日志会直接落在
 "广播没出去"或"广播出去了但手机按内容过滤"其中一支，而这两支的后续动作完全不同
 （前者查广播参数/射频，后者查载荷与型号字节）。
+
+### 7.8 第九次实测：终于拿到广播器的真实状态，而我的上一条判定是错的
+
+`hicar-log-20261114-133444.txt` 补上了 7.7 里缺失的那一行，并暴露顺序问题：
+
+```
+HiCar advertisement: address=02:00:00:00:00:00, mode=connectable, not discoverable,
+                     name='HUAWEI MatePad Pro', payload=01 01 01 03 61 46 0b 04 ec 10 06
+HiCar advertisement started (11 bytes of 0xFDEE service data)
+HiCar self-scan started for 20s; looking for our own 0xFDEE data
+Discoverable request granted for 120s; press Start to advertise      ← 在广播之后
+HiCar self-scan: no 0xFDEE advertisement heard in this window ...
+HiCar waiting for the phone: 30s ... discoverable=yes
+HiCar waiting for the phone: 150s ... discoverable=no (connectable only)   ← 120s 窗口过期
+```
+
+三点，其中第一点是对我自己上一轮措辞的更正：
+
+1. **"自扫描没听到"不等于"广播没发出去"**。射频收发互斥，很多控制器也不把本机发出的 ADV 回报给主机。
+   7.7 那句 `so discovery is not reaching the air` 是**过度断言**。探针已改为**不带过滤器**扫描，并把结论分成
+   四种：完全没听到任何广播（扫描器自身没工作）、听到其它设备但没有 0xFDEE（无法区分"没发"与"自己听不到"，
+   需第二台设备判定）、听到与我们相同的载荷（确定在空口）、听到别的 0xFDEE（附样本）。
+2. **顺序错了**：这次是 `Start`（广播）之后才 `Make discoverable`，也就是广播的头 120 秒是在**不可发现**状态下发的。
+   手机即便收到广播也无法用 inquiry 拿到 BR 地址。界面现在会在 Start 时检查并提示
+   `Not discoverable yet ... Press 'Make discoverable' first`。
+3. **`address=02:00:00:00:00:00`** 说明框架对本机 BR 地址同样屏蔽——而 11 字节载荷里不含地址，
+   所以手机只能通过 inquiry 找车机。这条路径成立的前提就是"可被发现"。
+
+**另一个需要记录的硬限制**：`BluetoothAdapter.getBluetoothClass()` 不在公开 SDK 中，应用**连本机 CoD 都读不到**，
+更不可能把它改成"车载音响"。平板的 CoD 属于"计算机"类，如果手机的 HiCar 只接受车载类设备，这就是侧载无法绕过的
+限制。**目前没有证据表明它确实在按 CoD 过滤**，所以只作为风险记录，不作为结论。
+
+### 7.9 一个与 HiCar 无关的既有 flaky 用例（如实记录）
+
+本地 `:common:testDebugUnitTest`（1754 用例）多次全量运行中，`CarPlayHostClusterStartupTest >
+aReplacementSessionDetachesTheOldClusterSurfaceUntilItsOwnMainFrame` 失败过 **2 次**，报
+`TooFewActualInvocations`（`setSurface(111, surface)` 期望 2 次、实际 1 次，`CarPlayHostClusterStartupTest.kt:178`）。
+
+- 单独运行该类 **2 次均通过**，整包重跑也通过；失败只出现在全量并发时。
+- 该用例测的是 CarPlay 集群投屏的挂载/卸载，与本次 HiCar 改动无交集（本次未修改 `CarPlayHostActivity`、
+  `AndroidMediaSink`、`CarPlayController`）。
+- 已定位到可疑的时序点，但**没有据此改上游测试**：`dismissClusterPresentation()` 会把 `clusterSurface` 置空，
+  而 `ensureClusterPresentation()` 只有在 `clusterSurface != null` 时才调用 `setSurface`；测试直接注入
+  `clusterSurface` 字段，因此断言成立与否取决于这两条路径中哪一条在并发下被触发。
+  这是上游测试依赖内部字段的脆弱点，修复它需要改动 CarPlay 侧行为，不属于本次任务范围。
+
+处理方式：记录在此，不通过重跑或跳过掩盖；CI 若因此偶发变红，应按"重跑该 job"处理，而不是改断言。

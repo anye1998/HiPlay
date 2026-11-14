@@ -137,6 +137,10 @@ class HiCarBleAdvertiser(
         } catch (failure: Exception) {
             failure.javaClass.simpleName
         }
+        // The local class of device would be worth logging — a tablet advertises itself as a computer,
+        // and a receiver a phone only accepts as car audio would be ignored on that alone — but
+        // BluetoothAdapter.getBluetoothClass() is not in the public SDK, so an app cannot even read
+        // it, let alone set it. See the capability table in docs/HICAR_MIGRATION.md.
         return "HiCar advertisement: address=${read { local.address }}, mode=$mode, " +
             "name='${read { local.name }}', " +
             "payload=${serviceData.joinToString(" ") { String.format(Locale.ROOT, "%02x", it) }}"

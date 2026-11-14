@@ -3,7 +3,6 @@ package com.shilapi.xcertplay.hicar
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothManager
 import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
@@ -16,16 +15,20 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Scans for our own 0xFDEE advertisement, so "the phone ignored us" stops being a guess.
+ * Scans for 0xFDEE advertisements on the car side, mostly to learn what is actually on the air.
  *
- * Up to now every conclusion about discovery rested on the phone's silence, which is
- * indistinguishable from an advertisement that never went on air or went out with the wrong bytes.
- * This scanner runs on the car side for a short window after advertising starts and reports what is
- * actually visible on the air: how many 0xFDEE advertisements were seen, whether the payload matches
- * the one we sent, and a few samples.
+ * The scan is deliberately **unfiltered**. An earlier version filtered on the service UUID and, when
+ * it heard nothing, reported "discovery is not reaching the air" — an over-claim: a radio cannot
+ * receive while it transmits, and many controllers never report the device's own advertisements to
+ * the host, so silence is not proof of absence. Scanning everything separates the cases that matter:
  *
- * It needs `BLUETOOTH_SCAN`; without it the platform refuses the scan and that is reported instead of
- * being silently skipped.
+ * - nothing at all was heard → the scanner itself is not working (permission, radio, filter), and no
+ *   conclusion about our advertisement is possible;
+ * - other devices were heard but none carries 0xFDEE → either our advertisement is not on the air or
+ *   this device cannot hear itself; only a second device can tell those apart;
+ * - an 0xFDEE payload equal to ours was heard → proof it reached the air;
+ * - 0xFDEE payloads that differ → someone else's HiCar device is nearby, and the samples show how a
+ *   real payload looks.
  */
 class HiCarAdvertisementProbe(
     context: Context,
@@ -34,9 +37,12 @@ class HiCarAdvertisementProbe(
     private val adapter =
         context.applicationContext.getSystemService(BluetoothManager::class.java)?.adapter
     private val handler = Handler(Looper.getMainLooper())
-    private val seen = AtomicInteger(0)
-    private val ours = AtomicInteger(0)
+
+    private val heard = AtomicInteger(0)
+    private val fdee = AtomicInteger(0)
+    private val matching = AtomicInteger(0)
     private val samples = CopyOnWriteArrayList<String>()
+    private val devices = java.util.Collections.synchronizedSet(HashSet<String>())
 
     private var scanner: android.bluetooth.le.BluetoothLeScanner? = null
     private var callback: ScanCallback? = null
@@ -59,9 +65,6 @@ class HiCarAdvertisementProbe(
             onLog("HiCar self-scan: BLE scanning is unavailable")
             return
         }
-        val filter = ScanFilter.Builder()
-            .setServiceUuid(ParcelUuid(HiCarCodes.SERVICE_DISCOVERY))
-            .build()
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .setReportDelay(0)
@@ -76,55 +79,71 @@ class HiCarAdvertisementProbe(
             }
 
             override fun onScanFailed(errorCode: Int) {
-                onLog("HiCar self-scan refused: code $errorCode (SCAN_FAILED_*); the phone would see nothing")
+                onLog("HiCar self-scan refused: code $errorCode (SCAN_FAILED_*); the scanner itself is not running")
                 stop()
             }
         }
         try {
-            leScanner.startScan(listOf(filter), settings, listener)
+            // No filter: a filtered scan that hears nothing cannot distinguish "not transmitted"
+            // from "filter never matched".
+            leScanner.startScan(null, settings, listener)
         } catch (denied: SecurityException) {
             onLog("HiCar self-scan needs the nearby-devices permission (BLUETOOTH_SCAN)")
             return
         }
         scanner = leScanner
         callback = listener
-        onLog("HiCar self-scan started for ${durationMillis / 1000}s; looking for our own 0xFDEE data")
+        onLog("HiCar self-scan started for ${durationMillis / 1000}s; listening for any 0xFDEE payload")
         handler.postDelayed({ finish() }, durationMillis)
     }
 
     private fun record(result: ScanResult) {
-        val data = result.scanRecord?.getServiceData(ParcelUuid(HiCarCodes.SERVICE_DISCOVERY)) ?: return
-        seen.incrementAndGet()
-        if (data.contentEquals(expected)) ours.incrementAndGet()
+        heard.incrementAndGet()
+        val address = runCatching { result.device.address }.getOrNull() ?: "unknown"
+        devices.add(address)
+        val record = result.scanRecord ?: return
+        val data = record.getServiceData(ParcelUuid(HiCarCodes.SERVICE_DISCOVERY)) ?: return
+        fdee.incrementAndGet()
+        val isOurs = data.contentEquals(expected)
+        if (isOurs) matching.incrementAndGet()
         if (samples.size < MAX_SAMPLES) {
-            samples += "${result.device.address} rssi=${result.rssi} data=${hex(data)}"
+            val name = runCatching { record.deviceName }.getOrNull()
+            samples += "$address rssi=${result.rssi}" +
+                (name?.let { " name='$it'" } ?: "") +
+                " data=${hex(data)}" + if (isOurs) " (ours)" else ""
         }
     }
 
     /**
-     * Reports what the scan saw and stops.
+     * Reports what the scan saw, in terms of what can and cannot be concluded.
      *
-     * "no 0xFDEE advertisement was visible" and "ours was visible but the phone did nothing" lead to
-     * opposite next steps, so they must not read the same in the log.
+     * The wording matters more than the numbers: "not heard" is not the same claim as "not sent".
      */
     private fun finish() {
-        val total = seen.get()
-        val matching = ours.get()
+        val total = heard.get()
+        val fdeeTotal = fdee.get()
+        val ours = matching.get()
         when {
             total == 0 ->
                 onLog(
-                    "HiCar self-scan: no 0xFDEE advertisement heard in this window " +
-                        "(our own included), so discovery is not reaching the air",
+                    "HiCar self-scan: heard no BLE advertisement at all, so the scanner is not " +
+                        "working (permission or radio); nothing can be concluded about our payload",
                 )
-            matching > 0 ->
+            ours > 0 ->
                 onLog(
-                    "HiCar self-scan: our advertisement is on the air ($matching of $total match " +
-                        "the payload we sent); a phone that ignores it is filtering on content, not missing it",
+                    "HiCar self-scan: our payload is on the air ($ours of ${devices.size} devices); " +
+                        "a phone that ignores it is filtering on content, not missing it",
                 )
-            else -> {
-                onLog("HiCar self-scan: $total 0xFDEE advertisements heard, none matches our payload")
+            fdeeTotal > 0 -> {
+                onLog("HiCar self-scan: $fdeeTotal 0xFDEE payload(s) heard, none identical to ours")
                 samples.forEach { onLog("  sample: $it") }
             }
+            else ->
+                onLog(
+                    "HiCar self-scan: heard ${devices.size} other BLE device(s) but no 0xFDEE payload. " +
+                        "This device may simply not hear its own advertisement, so this is NOT proof " +
+                        "that nothing was transmitted; a second device must check",
+                )
         }
         stop()
     }

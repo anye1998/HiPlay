@@ -236,6 +236,16 @@ class HiCarHostActivity : ComponentActivity() {
         // usually follows a failure, and the failure is the part worth reporting.
         log.clear()
         appendLog("--- receiver started ${SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())} ---")
+        // This ROM grants discoverability for 120 s per request, so starting in a not-discoverable
+        // state wastes the whole window: the advertisement is on air but nothing can page the car.
+        if (runCatching { bluetoothAdapter?.scanMode }.getOrNull() !=
+            BluetoothAdapter.SCAN_MODE_CONNECTABLE_DISCOVERABLE
+        ) {
+            appendLog(
+                "Not discoverable yet: the advertisement will be visible but a phone cannot reach " +
+                    "this device over BR/EDR. Press 'Make discoverable' first (the grant lasts 120 s).",
+            )
+        }
         val config = HiCarRuntimeConfig(
             model = model,
             localIdentity = identity(),
