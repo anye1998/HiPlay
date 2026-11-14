@@ -11,7 +11,6 @@ import android.os.Looper
 import android.os.ParcelUuid
 import java.io.Closeable
 import java.util.Locale
-import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -41,8 +40,24 @@ class HiCarAdvertisementProbe(
     private val heard = AtomicInteger(0)
     private val fdee = AtomicInteger(0)
     private val matching = AtomicInteger(0)
-    private val samples = CopyOnWriteArrayList<String>()
     private val devices = java.util.Collections.synchronizedSet(HashSet<String>())
+
+    /**
+     * One entry per advertised payload, so the report can be compared with a phone-side scanner
+     * screen line by line. Grouping by address alone would hide a device that advertises more than
+     * one payload, and grouping by payload alone would hide how many radios are involved.
+     */
+    private class Sighting(
+        val address: String,
+        @Volatile var payload: ByteArray,
+        @Volatile var name: String?,
+        @Volatile var rssi: Int,
+        @Volatile var ours: Boolean,
+    ) {
+        val count = AtomicInteger(1)
+    }
+
+    private val sightings = java.util.Collections.synchronizedMap(LinkedHashMap<String, Sighting>())
 
     private var scanner: android.bluetooth.le.BluetoothLeScanner? = null
     private var callback: ScanCallback? = null
@@ -106,11 +121,19 @@ class HiCarAdvertisementProbe(
         fdee.incrementAndGet()
         val isOurs = data.contentEquals(expected)
         if (isOurs) matching.incrementAndGet()
-        if (samples.size < MAX_SAMPLES) {
-            val name = runCatching { record.deviceName }.getOrNull()
-            samples += "$address rssi=${result.rssi}" +
-                (name?.let { " name='$it'" } ?: "") +
-                " data=${hex(data)}" + if (isOurs) " (ours)" else ""
+        // The name travels in the scan response, so a scanner that only reads the advertisement
+        // packet sees none — that is a limit of the report, not evidence about our own payload.
+        val name = runCatching { record.deviceName ?: result.device.name }.getOrNull()
+        val key = "$address ${hex(data)}"
+        synchronized(sightings) {
+            val known = sightings[key]
+            if (known != null) {
+                known.count.incrementAndGet()
+                known.rssi = result.rssi
+                if (name != null) known.name = name
+            } else {
+                sightings[key] = Sighting(address, data, name, result.rssi, isOurs)
+            }
         }
     }
 
@@ -123,20 +146,36 @@ class HiCarAdvertisementProbe(
         val total = heard.get()
         val fdeeTotal = fdee.get()
         val ours = matching.get()
+        val seen = synchronized(sightings) { sightings.values.toList() }
         when {
             total == 0 ->
                 onLog(
                     "HiCar self-scan: heard no BLE advertisement at all, so the scanner is not " +
                         "working (permission or radio); nothing can be concluded about our payload",
                 )
-            ours > 0 ->
+            ours > 0 -> {
+                val who = seen.firstOrNull { it.ours }
                 onLog(
-                    "HiCar self-scan: our payload is on the air ($ours of ${devices.size} devices); " +
-                        "a phone that ignores it is filtering on content, not missing it",
+                    "HiCar self-scan: our payload is on the air ($ours time(s)" +
+                        (who?.let { ", from ${it.address}${it.name?.let { name -> " '$name'" } ?: ""}" } ?: "") +
+                        "); a phone that ignores it is filtering on content, not missing it",
                 )
+            }
             fdeeTotal > 0 -> {
-                onLog("HiCar self-scan: $fdeeTotal 0xFDEE payload(s) heard, none identical to ours")
-                samples.forEach { onLog("  sample: $it") }
+                val others = seen.filterNot { it.ours }.distinctBy { it.address }
+                onLog(
+                    "HiCar self-scan: ${others.size} other 0xFDEE advertiser(s) heard, none carrying " +
+                        "our payload. Compare these lines with the phone's scanner before concluding " +
+                        "anything: the tablet may simply not hear itself",
+                )
+                seen.sortedByDescending { it.count.get() }.take(MAX_SAMPLES).forEach { sighting ->
+                    onLog(
+                        "  ${sighting.address} x${sighting.count.get()} rssi=${sighting.rssi} " +
+                            "name=${sighting.name?.let { "'$it'" } ?: "none"} " +
+                            "data=${hex(sighting.payload)}",
+                    )
+                }
+                onLog("  ours, never heard: ${hex(expected)}")
             }
             else ->
                 onLog(

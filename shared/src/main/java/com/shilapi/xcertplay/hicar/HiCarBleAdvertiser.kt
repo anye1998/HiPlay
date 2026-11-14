@@ -66,7 +66,10 @@ class HiCarBleAdvertiser(
         val callback = object : AdvertiseCallback() {
             override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
                 outcome.set(true)
-                onLog("HiCar advertisement started (${serviceData.size} bytes of 0xFDEE service data)")
+                onLog(
+                    "HiCar advertisement started (${serviceData.size} bytes of 0xFDEE service data, " +
+                        "device name in the scan response)",
+                )
                 started.countDown()
             }
 
@@ -86,8 +89,23 @@ class HiCarBleAdvertiser(
             .addServiceData(ParcelUuid(HiCarCodes.SERVICE_DISCOVERY), serviceData)
             .setIncludeDeviceName(false)
             .build()
+        // The 0xFDEE service data plus the flags fill 18 of the 31 bytes a legacy advertisement
+        // allows, so the name cannot ride along in the same packet — it goes into the scan response.
+        // That is not cosmetic: without a name a phone-side scanner lists this device as "N/A", and
+        // an "N/A" row cannot be told apart from the other nameless advertisers in the room, which
+        // is exactly the check that decides whether the advertisement ever left the tablet.
+        val scanResponse = AdvertiseData.Builder()
+            .setIncludeDeviceName(true)
+            .build()
         return try {
-            leAdvertiser.startAdvertising(settings, data, callback)
+            try {
+                leAdvertiser.startAdvertising(settings, data, scanResponse, callback)
+            } catch (unsupported: IllegalArgumentException) {
+                // A stack that refuses a scan response still takes the advertisement; losing the
+                // name is better than losing the beacon.
+                onLog("HiCar advertisement: scan response refused (${unsupported.message}); advertising without the name")
+                leAdvertiser.startAdvertising(settings, data, callback)
+            }
             advertiser = leAdvertiser
             callbacks = callback
             // startAdvertising is asynchronous on most builds; a refusal arrives via the callback.
