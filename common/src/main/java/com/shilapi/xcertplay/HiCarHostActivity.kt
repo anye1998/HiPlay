@@ -40,6 +40,7 @@ import androidx.core.content.ContextCompat
 import androidx.core.content.pm.PackageInfoCompat
 import com.shilapi.xcertplay.hicar.HiCarAdvertisementProbe
 import com.shilapi.xcertplay.hicar.HiCarController
+import com.shilapi.xcertplay.hicar.HiCarPermissions
 import com.shilapi.xcertplay.hicar.HiCarRuntimeConfig
 import com.shilapi.xcertplay.hicar.HiCarStatus
 import java.security.MessageDigest
@@ -478,17 +479,11 @@ class HiCarHostActivity : ComponentActivity() {
      * API 33+ by NEARBY_WIFI_DEVICES, so both cases are requested up front.
      */
     private fun requiredPermissions(): List<String> {
-        val needed = mutableListOf<String>()
-        if (Build.VERSION.SDK_INT >= 31) {
-            needed += Manifest.permission.BLUETOOTH_CONNECT
-            needed += Manifest.permission.BLUETOOTH_ADVERTISE
-            // The self-scan that proves our own advertisement reached the air.
-            needed += Manifest.permission.BLUETOOTH_SCAN
-        }
+        // The Bluetooth half is version-dependent and lives in one place: on Android 11 and below
+        // the API-31 names do not exist, and asking for them only produces a permanent DENIED.
+        val needed = HiCarPermissions.runtimeRequests(Build.VERSION.SDK_INT).toMutableList()
         if (Build.VERSION.SDK_INT >= 33) {
             needed += Manifest.permission.NEARBY_WIFI_DEVICES
-        } else {
-            needed += Manifest.permission.ACCESS_FINE_LOCATION
         }
         return needed
     }

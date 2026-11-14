@@ -752,3 +752,56 @@ HiCar sniff: 3 0xFDEE advertisement(s) captured; payloads below
 
 其余情况（`00`/`01` 开头且 I/G 位为 0）**是歧义的**，只能由扫描器打印的地址类型来定
 （`LE_ADV_IND` 的 TxAdd 位）。`HiCarDeviceAudit.addressType()` 就按这三种情况输出，歧义时明确写"ambiguous"。
+
+### 7.15 第一次上车机：广播被"不存在的权限"挡住（已修）
+
+`hicar-log-20261114-203804.txt`，车机实测。环境一次看清：
+
+```
+build: Android 10 (SDK 29) / QUALCOMM qti trinket for arm64 / user/release-key
+bluetooth: enabled=true name='宋Plus' scanMode=discoverable
+adapter: multipleAdvertisement=true extendedAdvertising=true le2m=true leCoded=true offloadedFiltering=true
+bonds: 2 (00:BB:1C:44:3D:FE 'anye的HONOR V30 PRO', F8:3B:7E:3E:DD:06 'anye的Mate 80 Pro Max')
+features: bluetooth=true, bluetooth_le=true, wifi=true, direct=true, host=true
+```
+
+链路其实走得很远：
+
+```
+Wi-Fi P2P ready mode=BAND_5_GHZ band=5 GHz channel=48 frequencyMHz=5240 verified=true
+HiCar access point BSSID 9a:bb:1e:f0:95:2d from interface only; sysfs unavailable
+HiCar access point ready on 5 GHz, control port 4005
+HiCar records ready: business channel 3, control on 0xFE35
+HiCar advertisement needs the nearby-devices permission (BLUETOOTH_ADVERTISE)   <- 卡在这里
+```
+
+**根因是一个纯粹的版本判断错误**：`HiCarBleAdvertiser` 无条件检查 `BLUETOOTH_ADVERTISE`。这个权限
+**在 API 31 才存在**，Android 10 上它根本不存在，`checkSelfPermission` 对不存在的权限一律返回 DENIED，
+于是"权限齐全的车机"被判定为缺权限，广播一次都没发出去。而 `HiCarController.hasPermissions()` 里写了
+`SDK_INT < 31 return true`，所以热点、BSSID、RFCOMM 记录全都正常建立——日志看起来"只差一步"，其实是差在一个假的缺口上。
+
+顺带暴露的第二个问题：设备自检段把 API-31 的三个权限名列在 Android 10 上，`permissions missing:
+BLUETOOTH_CONNECT, BLUETOOTH_SCAN, BLUETOOTH_ADVERTISE` 这句话**技术上为真、实用上是误导**——它描述的是
+"平台没有这些权限"，不是"用户拒绝了"。
+
+**修复**：新增 `HiCarPermissions`（`shared/.../hicar/`），把两个时代的规则收在一处：
+
+| 能力 | API ≥ 31 | API ≤ 30 |
+| --- | --- | --- |
+| 连接 / RFCOMM | `BLUETOOTH_CONNECT`（运行时） | `BLUETOOTH`（安装时） |
+| 广播 | `BLUETOOTH_ADVERTISE`（运行时） | `BLUETOOTH_ADMIN`（安装时） |
+| LE 扫描 | `BLUETOOTH_SCAN`（运行时） | `ACCESS_FINE_LOCATION`（运行时） |
+
+`runtimeRequests(sdk)` 只返回该版本**真的能弹窗**的权限；广播器/探针/控制器/界面/设备自检全部改用它，
+日志里也按版本说明"这版 Android 需要哪个权限"。设备自检的权限段改成逐项列状态 +
+一行 `not applicable on SDK 29: BLUETOOTH_CONNECT, ...`，不再把"不存在"说成"被拒"。
+
+**同时修掉的诊断缺陷**：`interfaces: unreadable (/sys/class/net)` —— Android 10 上 SELinux 禁止列目录，
+但按名字直读仍然可行。现在列目录失败会退回到固定名字（wlan0/p2p0/bt-pan/eth0/rndis0/wlan1）直读，
+并注明"listing unreadable, direct reads: …"。
+
+**这台车机上仍然拿不到的**：BR 地址。`bluetooth address (api)` 被框架屏蔽成 `02:00:00:00:00:00`，
+`Settings.Secure.bluetooth_address` 为 `none`，`/data/misc/bluedroid` 也读不到——
+`Root probe` 明确报 `Cannot run program "su": error=13, Permission denied`（这台车机没有 su）。
+所以 7.10 的对照只能靠 **adb**（`adb shell "dumpsys bluetooth_manager | grep -i Address"`）
+或车机设置里的"蓝牙地址"项，App 这一侧到此为止，不再假装能读到。

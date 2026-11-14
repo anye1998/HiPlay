@@ -111,7 +111,9 @@ class HiCarAdvertisementProbe(
             // from "filter never matched".
             leScanner.startScan(null, settings, listener)
         } catch (denied: SecurityException) {
-            onLog("HiCar self-scan needs the nearby-devices permission (BLUETOOTH_SCAN)")
+            onLog(
+                "HiCar self-scan refused by the platform (${HiCarPermissions.explain(android.os.Build.VERSION.SDK_INT)})",
+            )
             return
         }
         scanner = leScanner

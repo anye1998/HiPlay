@@ -149,7 +149,11 @@ class HiCarController(
     private fun startChain() {
         if (!hasPermissions()) {
             report(HiCarStatus.Failed("permission"))
-            onLog("HiCar needs BLUETOOTH_CONNECT and BLUETOOTH_ADVERTISE on this Android version")
+            val missing = missingPermissions()
+            onLog(
+                "HiCar cannot use Bluetooth on this build: missing ${missing.joinToString().ifEmpty { "(nothing; the stack refused)" }} " +
+                    "— ${HiCarPermissions.explain(android.os.Build.VERSION.SDK_INT)}",
+            )
             return
         }
         val adapter = appContext.getSystemService(android.bluetooth.BluetoothManager::class.java)?.adapter
@@ -479,18 +483,10 @@ class HiCarController(
         }
 
     /** Which declared permission is not granted; empty means the refusal came from somewhere else. */
-    private fun missingPermissions(): List<String> {
-        if (Build.VERSION.SDK_INT < 31) return emptyList()
-        return listOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_ADVERTISE)
-            .filter { appContext.checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
-    }
+    private fun missingPermissions(): List<String> = HiCarPermissions.missing(appContext)
 
-    private fun hasPermissions(): Boolean {
-        if (Build.VERSION.SDK_INT < 31) return true
-        val connect = appContext.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT)
-        val advertise = appContext.checkSelfPermission(Manifest.permission.BLUETOOTH_ADVERTISE)
-        return connect == PackageManager.PERMISSION_GRANTED && advertise == PackageManager.PERMISSION_GRANTED
-    }
+    private fun hasPermissions(): Boolean =
+        HiCarPermissions.canConnect(appContext) && HiCarPermissions.canAdvertise(appContext)
 
     private fun nextSequence(): Int = HiCarBeacon.nextSequence(
         appContext.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE).getInt(KEY_SEQUENCE, 0),

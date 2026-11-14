@@ -8,6 +8,7 @@ import android.content.pm.PackageManager
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.provider.Settings
+import com.shilapi.xcertplay.hicar.HiCarPermissions
 import java.io.File
 import java.util.concurrent.TimeUnit
 
@@ -35,6 +36,9 @@ internal object HiCarDeviceAudit {
         "android.hardware.wifi.direct",
         "android.hardware.usb.host",
     )
+
+    /** Interfaces every Android head unit has; used when the sysfs listing is blocked. */
+    private val KNOWN_INTERFACES = listOf("wlan0", "p2p0", "bt-pan", "eth0", "rndis0", "wlan1")
 
     /** Keys worth keeping out of `bt_config.conf`; the rest is noise or secrets we do not need. */
     private val CONFIG_KEYS = listOf(
@@ -106,21 +110,25 @@ internal object HiCarDeviceAudit {
         )
     }
 
+    /**
+     * Bluetooth permissions as they exist on this build, plus whatever else the receiver asks for.
+     *
+     * Printing the API-31 names on an Android 10 device produced a line that was technically true
+     * and practically wrong: three "missing" permissions that the platform does not define, next to
+     * an advertisement that was in fact refused for a different reason.
+     */
     private fun permissionLines(context: Context): List<String> {
-        val wanted = buildList {
-            add(Manifest.permission.BLUETOOTH_CONNECT)
-            add(Manifest.permission.BLUETOOTH_SCAN)
-            add(Manifest.permission.BLUETOOTH_ADVERTISE)
+        val others = buildList {
             add(Manifest.permission.ACCESS_FINE_LOCATION)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 add("android.permission.NEARBY_WIFI_DEVICES")
             }
         }
-        val granted = wanted.filter {
+        val granted = others.filter {
             context.checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
         }
-        val missing = wanted - granted.toSet()
-        return listOf(
+        val missing = others - granted.toSet()
+        return HiCarPermissions.describe(context) + listOf(
             "permissions granted: ${granted.shortNames()}",
             "permissions missing: ${missing.shortNames()}",
         )
@@ -289,11 +297,20 @@ internal object HiCarDeviceAudit {
         return "${bonded.size} (" + bonded.joinToString { "${it.address} '${it.name}'" } + ")"
     }
 
-    /** Kernel view of every interface: the only address source that cannot be a placeholder. */
+    /**
+     * Kernel view of every interface: the only address source that cannot be a placeholder.
+     *
+     * Listing `/sys/class/net` is blocked on some builds while a direct read of a known name still
+     * works, so a failed listing falls back to the names a head unit actually has rather than
+     * reporting "unreadable" and giving up.
+     */
     private fun interfaces(): String {
-        val names = runCatching { File("/sys/class/net").list()?.toList() }.getOrNull()
-        if (names.isNullOrEmpty()) return "unreadable (/sys/class/net)"
-        return names.sorted().joinToString(", ") { "$it=${interfaceMac(it)}" }
+        val listed = runCatching { File("/sys/class/net").list()?.toList() }.getOrNull()
+        if (!listed.isNullOrEmpty()) {
+            return listed.sorted().joinToString(", ") { "$it=${interfaceMac(it)}" }
+        }
+        val direct = KNOWN_INTERFACES.joinToString(", ") { "$it=${interfaceMac(it)}" }
+        return "listing unreadable, direct reads: $direct"
     }
 
     private fun interfaceMac(name: String): String = runCatching {

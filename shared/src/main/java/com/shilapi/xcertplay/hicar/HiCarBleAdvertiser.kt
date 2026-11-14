@@ -51,10 +51,13 @@ class HiCarBleAdvertiser(
             return false
         }
         stop()
-        if (!hasAdvertisePermission()) {
+        if (!HiCarPermissions.canAdvertise(context)) {
             // startAdvertising would throw SecurityException here and lose the real reason; say it
             // first, because the rest of the chain (access point, RFCOMM) is already up by now.
-            onLog("HiCar advertisement needs the nearby-devices permission (BLUETOOTH_ADVERTISE)")
+            onLog(
+                "HiCar advertisement refused: the permission this Android version needs is missing " +
+                    "(${HiCarPermissions.explain(android.os.Build.VERSION.SDK_INT)})",
+            )
             return false
         }
         // Logging the adapter state makes "nobody reacted" explainable, but these getters are
@@ -207,10 +210,6 @@ class HiCarBleAdvertiser(
             "name='${read { local.name }}', bonds=$bonds, " +
             "payload=${serviceData.joinToString(" ") { String.format(Locale.ROOT, "%02x", it) }}"
     }
-
-    private fun hasAdvertisePermission(): Boolean =
-        context.checkSelfPermission(android.Manifest.permission.BLUETOOTH_ADVERTISE) ==
-            android.content.pm.PackageManager.PERMISSION_GRANTED
 
     /**
      * Asks the platform to advertise with the adapter's public address instead of a private one.
