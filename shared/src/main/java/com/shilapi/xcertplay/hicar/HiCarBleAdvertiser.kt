@@ -118,11 +118,29 @@ class HiCarBleAdvertiser(
         }
     }
 
+    /**
+     * Adapter state plus the payload, with each getter guarded separately.
+     *
+     * `isMultipleAdvertisementSupported` and the advertiser handle are readable here (they got us this
+     * far) while `getAddress`/`getScanMode`/`getName` are refused on some vendor builds. One refused
+     * getter used to swallow the whole line, which is why an earlier log had no address at all.
+     */
     @SuppressLint("MissingPermission")
-    private fun describeAdapter(local: BluetoothAdapter, serviceData: ByteArray): String =
-        "HiCar advertisement: address=${local.address ?: "none"}, " +
-            "mode=${describeScanMode(local.scanMode)}, name='${local.name ?: ""}', " +
+    private fun describeAdapter(local: BluetoothAdapter, serviceData: ByteArray): String {
+        fun <T> read(block: () -> T): String = try {
+            block()?.toString() ?: "none"
+        } catch (failure: Exception) {
+            "${failure.javaClass.simpleName}"
+        }
+        val mode = try {
+            describeScanMode(local.scanMode)
+        } catch (failure: Exception) {
+            failure.javaClass.simpleName
+        }
+        return "HiCar advertisement: address=${read { local.address }}, mode=$mode, " +
+            "name='${read { local.name }}', " +
             "payload=${serviceData.joinToString(" ") { String.format(Locale.ROOT, "%02x", it) }}"
+    }
 
     private fun hasAdvertisePermission(): Boolean =
         context.checkSelfPermission(android.Manifest.permission.BLUETOOTH_ADVERTISE) ==

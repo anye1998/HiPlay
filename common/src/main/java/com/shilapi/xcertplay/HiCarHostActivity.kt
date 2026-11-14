@@ -383,6 +383,8 @@ class HiCarHostActivity : ComponentActivity() {
         if (Build.VERSION.SDK_INT >= 31) {
             needed += Manifest.permission.BLUETOOTH_CONNECT
             needed += Manifest.permission.BLUETOOTH_ADVERTISE
+            // The self-scan that proves our own advertisement reached the air.
+            needed += Manifest.permission.BLUETOOTH_SCAN
         }
         if (Build.VERSION.SDK_INT >= 33) {
             needed += Manifest.permission.NEARBY_WIFI_DEVICES

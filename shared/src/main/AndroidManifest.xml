@@ -21,6 +21,11 @@
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <!-- Self-scan only: proves our own 0xFDEE advertisement is on the air. neverForLocation keeps the
+         prompt in the same "nearby devices" group as connect/advertise. -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
     <!-- HiCar publishes its 0xFDEE discovery advertisement over BLE; BluetoothLeAdvertiser needs this. -->
     <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
     <!-- Optional: a BLE advertisement is only published on head units that support peripheral mode. -->

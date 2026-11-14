@@ -472,3 +472,45 @@ Discoverable request granted for 120s; press Start to advertise   (点了两次)
 
 **下一步的唯一判据**：先让平板授予"附近的设备"权限（系统设置 → 应用 → 权限），
 确认 `HiCar advertisement started` 出现、心跳里 `advertising=on`；再在 120 秒窗口内用手机发起连接。
+
+### 7.7 第八次实测：广播起来了，但无法判断它是否真的在空口
+
+`hicar-log-20261114-131827.txt`：
+
+```
+HiCar records ready: business channel 7, control on 0xFE35
+HiCar advertisement started (11 bytes of 0xFDEE service data)
+HiCar listeners started: hicar-control, hicar-business
+HiCar waiting for the phone: 30s, connections=0, advertising=on, listeners=open, discoverable=unknown
+... 每 30 秒一条，直到 240s
+```
+
+**这次广播真的启动了**（`advertisement started`），可发现性也授予过（120s），但 4 分钟内
+`connections=0`，手机端始终没有弹窗。同时暴露两个诊断缺陷：
+
+1. **`HiCar advertisement: address=...` 整行缺失**。这一行在 7.6 版新增，理论上应打印在
+   `advertisement started` 之前。它没出现，说明 `describeAdapter` 里的某个 getter 抛了异常，
+   又被 `runCatching` 整体吞掉——**诊断代码自己吞掉了诊断信息**。
+2. **`discoverable=unknown`**。`getScanMode()` 要么抛异常，要么返回了未列举的值，而代码只回落到
+   字符串 `unknown`，没有带上原因或原始值。
+
+也就是说，此刻"广播到底有没有真的发到空口、内容是不是我们以为的 11 字节"这件事，**无法自证**。
+手机沉默既可能是它过滤掉了载荷，也可能是广播根本没出去——两者在日志里完全一样。
+
+**修复（本分支）**：
+
+- `HiCarAdvertisementProbe`：广告启动后用平板**自己扫自己**（20 秒，`ScanFilter` 只匹配 0xFDEE），
+  结束时给出三种明确结论之一：
+  - `no 0xFDEE advertisement heard ... so discovery is not reaching the air`（广播没出去）；
+  - `our advertisement is on the air (N of M match the payload we sent); a phone that ignores it is filtering on content`
+    （广播出去了，手机是按内容过滤）；
+  - `M 0xFDEE advertisements heard, none matches our payload` + 最多 5 条样本（地址/RSSI/原始字节）。
+  这把"猜"换成了一次可读的判定。其单测覆盖无蓝牙射频时不得抛异常、`running` 必须为 false。
+- `BLUETOOTH_SCAN` 权限（`neverForLocation`）已声明并加入运行时申请，缺失时探针明确报"需要权限"而不是静默跳过。
+- `describeAdapter` 改为**逐字段保护**：`address` / `mode` / `name` 各自 try/catch，失败的字段打印异常类名，
+  例如 `address=SecurityException`。一个被拒的 getter 不再让整行消失。
+- `discoverableState()` 带上原因或原始值：`unknown(SecurityException: ...)`、`unknown(scanMode=35)`、`unknown(no adapter)`。
+
+**这一步的意义**：在此之前，每一轮都在"手机为什么不理我"上打转；有了自扫描，下一份日志会直接落在
+"广播没出去"或"广播出去了但手机按内容过滤"其中一支，而这两支的后续动作完全不同
+（前者查广播参数/射频，后者查载荷与型号字节）。

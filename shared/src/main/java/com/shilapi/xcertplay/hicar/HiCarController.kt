@@ -91,6 +91,7 @@ class HiCarController(
     private var hotspot: WirelessHotspotManager? = null
     private var services: HiCarRfcommServices? = null
     private var advertiser: HiCarBleAdvertiser? = null
+    private var probe: HiCarAdvertisementProbe? = null
 
     /** Created only after the access point is up, so it can never answer with a placeholder offer. */
     private var liveNetwork: HiCarNetworkNegotiator? = null
@@ -129,6 +130,8 @@ class HiCarController(
         if (!running.compareAndSet(true, false)) return
         advertiser?.close()
         advertiser = null
+        probe?.close()
+        probe = null
         services?.close()
         services = null
         for (closeable in sockets) closeQuietly(closeable)
@@ -168,10 +171,14 @@ class HiCarController(
         val beacon = HiCarBleAdvertiser(appContext, onLog)
         advertiser = beacon
         report(HiCarStatus.Advertising)
-        if (!beacon.start(HiCarBeacon.serviceData(config.model, nextSequence()))) {
+        val serviceData = HiCarBeacon.serviceData(config.model, nextSequence())
+        if (!beacon.start(serviceData)) {
             report(HiCarStatus.Failed("advertising"))
             return
         }
+        // Listen to ourselves once: it is the only way to tell "on the air but ignored" from
+        // "never transmitted", which look identical from the phone's silence.
+        probe = HiCarAdvertisementProbe(appContext, onLog).also { it.start(serviceData) }
         report(HiCarStatus.WaitingForPhone)
         startAcceptLoops(rfcomm)
     }
@@ -308,16 +315,23 @@ class HiCarController(
      * reach the car over BR/EDR. Without this in the heartbeat, an expired window looks exactly like a
      * phone that ignored us.
      */
-    private fun discoverableState(): String = runCatching {
+    private fun discoverableState(): String {
         val adapter = appContext.getSystemService(android.bluetooth.BluetoothManager::class.java)?.adapter
-            ?: return "unknown"
-        when (adapter.scanMode) {
+            ?: return "unknown(no adapter)"
+        val mode = try {
+            adapter.scanMode
+        } catch (failure: Exception) {
+            // Saying only "unknown" hid which call failed and why; this is a diagnostic line, it has
+            // to carry the reason even when the reason is a refused getter.
+            return "unknown(${failure.javaClass.simpleName}: ${failure.message ?: "no detail"})"
+        }
+        return when (mode) {
             android.bluetooth.BluetoothAdapter.SCAN_MODE_CONNECTABLE_DISCOVERABLE -> "yes"
             android.bluetooth.BluetoothAdapter.SCAN_MODE_CONNECTABLE -> "no (connectable only)"
             android.bluetooth.BluetoothAdapter.SCAN_MODE_NONE -> "no (not connectable)"
-            else -> "unknown"
+            else -> "unknown(scanMode=$mode)"
         }
-    }.getOrDefault("unknown")
+    }
 
     private fun acceptLoop(acceptSocket: () -> android.bluetooth.BluetoothSocket, control: Boolean) {
         while (running.get()) {
