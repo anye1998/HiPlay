@@ -805,3 +805,51 @@ BLUETOOTH_CONNECT, BLUETOOTH_SCAN, BLUETOOTH_ADVERTISE` 这句话**技术上为�
 `Root probe` 明确报 `Cannot run program "su": error=13, Permission denied`（这台车机没有 su）。
 所以 7.10 的对照只能靠 **adb**（`adb shell "dumpsys bluetooth_manager | grep -i Address"`）
 或车机设置里的"蓝牙地址"项，App 这一侧到此为止，不再假装能读到。
+
+### 7.16 车机上广播终于发出，而且用的是**公开地址**——7.10 的阻塞在这台设备上不存在
+
+`hicar-log-20261114-211733.txt` + 手机 nRF 截图（21:17）。权限修好后第一次真正把 0xFDEE 广播打出去：
+
+```
+手机端 nRF:
+  宋Plus   98:BB:1E:67:87:ED   BONDED   -57 dBm
+  Device type: CLASSIC and LE      Advertising type: Legacy
+  Flags: GeneralDiscoverable
+  Service Data: UUID 0xFDEE  Data: 0x010101038DC1E204341003
+  Complete Local Name: 宋Plus
+
+车机端:
+  HiCar advertisement started (11 bytes of 0xFDEE service data, device name in the scan response)
+  HiCar access point ready on 5 GHz, control port 4005   (channel 40 / 5200 MHz)
+  HiCar records ready: business channel 3, control on 0xFE35
+```
+
+payload `01 01 01 03 8D C1 E2 04 34 10 03` 与车机日志里的 `payload=` 逐字节一致，机型 `8DC1E234` 也在里面。
+
+**地址这一关，这台车机是通的**：
+
+- `98` = `1001 1000`，I/G 位为 0，最高两位 `10`——按 7.14 的两条硬判据，它**只可能是公开地址**
+  （`10` 不是随机地址的合法前缀）。
+- 更需要留意的是 nRF 把这条 LE 广播标成 **BONDED**：绑定是经典链路的 BD_ADDR 建立的，说明手机拿到的这个地址
+  能对上已有的绑定——要么它本身就是 BR 地址（公开），要么被 LE 隐私解析成了身份地址。两种情况手机**都有可拨的地址**。
+
+对比 7.10：华为平板的 `65:…`/`51:…` 是轮换的私有地址、且从未绑定，手机"看见但拨不到"。
+**这台车机上那个阻塞不存在。**
+
+**但手机仍然没拨号**：`HiCar waiting for the phone: 60s, connections=0`（可发现、广播在、监听在）。
+所以剩下的变量不再是地址，而是**载荷/机型码**，以及手机侧 HiCar 服务本身的状态。
+
+**一条被实测推翻的日志措辞（已改）**：`requestPublicAddress()` 失败时原来写的是
+"the platform keeps a private advertising address … so it has nothing to dial"。这次车机同样抛
+`NoSuchMethodException`，可它实际发的是公开地址——`NoSuchMethodException` 只说明**我们没权限问**，
+不说明平台用什么。措辞已改成"这版不让应用选地址，结论要看手机扫描器"，不再预设。
+
+**下一步两个零成本实验**（都不需要重编）：
+
+1. **换机型码**：界面新增一键 `Use test model 00040A04`（参考项目的测试向量）。华为的机型码由 Partner 平台
+   分配，我们那个 `8DC1E234` 是本机随机生成的，手机很可能在"设备库"里查不到它，于是不弹框。
+2. **看手机怎么想**：手机开 USB 调试，扫描时 `adb logcat | grep -iE "hicar|fdee"`，看 HiCar 服务读到这条广播后
+   丢在哪一步。这是唯一能看到手机侧判断依据的窗口。
+
+自扫描这次听到 12 台其它 BLE 设备、没有任何 0xFDEE 载荷——与之前一致：控制器不把自己的广播回报给宿主，
+这条自检在车机上同样是盲的，不能用来判断"是否发出"。

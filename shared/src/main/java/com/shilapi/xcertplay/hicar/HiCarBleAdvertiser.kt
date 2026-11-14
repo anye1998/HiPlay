@@ -238,10 +238,15 @@ class HiCarBleAdvertiser(
             )
             true
         } catch (failure: Throwable) {
+            // NoSuchMethodException means only "this app cannot ask" — not "the stack uses a private
+            // address". The BYD head unit answered with NoSuchMethodException and then advertised
+            // from a public address that the phone already had bonded, so the earlier wording here
+            // ("the platform keeps a private address, so the phone has nothing to dial") was a claim
+            // the code had no way to make. What decides it is the phone's scanner.
             onLog(
-                "HiCar advertisement: the platform keeps a private advertising address " +
-                    "(${failure.javaClass.simpleName}); a HiCar phone reads the BR address from that " +
-                    "field, so it has nothing to dial and never shows its prompt",
+                "HiCar advertisement: this build does not let an app choose the advertising address " +
+                    "(${failure.javaClass.simpleName}); the stack picks it, so read the address and its " +
+                    "type from the phone's scanner before drawing any conclusion",
             )
             false
         }

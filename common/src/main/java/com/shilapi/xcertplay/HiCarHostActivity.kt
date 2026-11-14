@@ -28,6 +28,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
@@ -160,6 +161,11 @@ class HiCarHostActivity : ComponentActivity() {
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
+            // The model id is the one payload field that can be varied without a rebuild, and it is
+            // the first thing a phone can reject: Huawei allocates these ids per product, so a random
+            // one is not a head unit any phone has ever seen. This is the reference project's test
+            // vector, one tap away so a comparison run does not need the soft keyboard.
+            TextButton(onClick = { model = TEST_MODEL }) { Text("Use test model $TEST_MODEL") }
             Text(
                 "Connection code: $pin   (the phone asks for these six digits the first time)",
                 style = MaterialTheme.typography.titleMedium,
@@ -571,6 +577,9 @@ class HiCarHostActivity : ComponentActivity() {
 
         /** `adb logcat -s HiCar` on a head unit: short, and stable across sessions. */
         const val LOG_TAG = "HiCar"
+
+        /** The reference receiver's test vector; unverified against a real phone, hence "test". */
+        const val TEST_MODEL = "00040A04"
         const val PREFERENCES = "hicar-receiver"
         const val KEY_PIN = "connection_code"
         val PIN_PATTERN = Regex("[0-9]{6}")
