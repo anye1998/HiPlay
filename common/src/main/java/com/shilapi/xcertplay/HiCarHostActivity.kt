@@ -118,7 +118,7 @@ class HiCarHostActivity : ComponentActivity() {
             trace.lineSequence().filter { it.isNotBlank() }.take(40).forEach { appendLog(it) }
             appendLog("--- end of previous exception ---")
         }
-        model = experimentalModel()
+        model = storedModel()
         pin = storedPin()
         setContent {
             MaterialTheme {
@@ -156,16 +156,34 @@ class HiCarHostActivity : ComponentActivity() {
             )
             OutlinedTextField(
                 value = model,
-                onValueChange = { model = it.uppercase().take(8) },
+                onValueChange = { value ->
+                    model = value.uppercase().take(8)
+                    // Persisted as soon as it is a whole id: the value a phone accepts must survive a
+                    // restart, or the next run silently advertises a different device.
+                    if (MODEL_PATTERN.matches(model)) rememberModel(model)
+                },
                 label = { Text("Advertised model (8 hex digits)") },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
             // The model id is the one payload field that can be varied without a rebuild, and it is
             // the first thing a phone can reject: Huawei allocates these ids per product, so a random
-            // one is not a head unit any phone has ever seen. This is the reference project's test
-            // vector, one tap away so a comparison run does not need the soft keyboard.
-            TextButton(onClick = { model = TEST_MODEL }) { Text("Use test model $TEST_MODEL") }
+            // one is not a head unit any phone has ever seen. 00040A04 is the value a real Mate 80
+            // prompts on, so it is the default rather than a button that has to be found first.
+            TextButton(
+                onClick = {
+                    model = if (model == TEST_MODEL) experimentalModel() else TEST_MODEL
+                    rememberModel(model)
+                },
+            ) {
+                Text(
+                    if (model == TEST_MODEL) {
+                        "Use this install's own id ${experimentalModel()}"
+                    } else {
+                        "Use test model $TEST_MODEL"
+                    },
+                )
+            }
             Text(
                 "Connection code: $pin",
                 style = MaterialTheme.typography.headlineSmall,
@@ -552,6 +570,24 @@ class HiCarHostActivity : ComponentActivity() {
         return generated
     }
 
+    /**
+     * The advertised model id, remembered across restarts.
+     *
+     * `00040A04` is the default rather than something to be re-entered: a Mate 80 prompts on that
+     * value and stays silent on this install's own random id, so defaulting to the random one meant
+     * every fresh launch advertised a device no phone has ever seen.
+     */
+    private fun storedModel(): String {
+        val preferences = getSharedPreferences(PREFERENCES, MODE_PRIVATE)
+        preferences.getString(KEY_MODEL, null)?.takeIf { MODEL_PATTERN.matches(it) }?.let { return it }
+        preferences.edit().putString(KEY_MODEL, TEST_MODEL).apply()
+        return TEST_MODEL
+    }
+
+    private fun rememberModel(value: String) {
+        getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit().putString(KEY_MODEL, value).apply()
+    }
+
     /** The identity the phone sees; derived from this installation, not a Huawei credential. */
     private fun identity(): String {
         val seed = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID).orEmpty()
@@ -585,11 +621,19 @@ class HiCarHostActivity : ComponentActivity() {
         /** `adb logcat -s HiCar` on a head unit: short, and stable across sessions. */
         const val LOG_TAG = "HiCar"
 
-        /** The reference receiver's test vector; unverified against a real phone, hence "test". */
+        /**
+         * The model id a real phone prompts on.
+         *
+         * It came from the reference receiver as a test vector, but it is no longer unverified: with
+         * this value a Mate 80 Pro Max shows its HiCar prompt and dials, and with this install's own
+         * random id the same phone stays silent. That is why it is the default.
+         */
         const val TEST_MODEL = "00040A04"
         const val PREFERENCES = "hicar-receiver"
         const val KEY_PIN = "connection_code"
+        const val KEY_MODEL = "advertised_model"
         val PIN_PATTERN = Regex("[0-9]{6}")
+        val MODEL_PATTERN = Regex("[0-9A-F]{8}")
 
         /** The longest value the system accepts; bring-up sessions are short anyway. */
         const val DISCOVERABLE_SECONDS = 300
