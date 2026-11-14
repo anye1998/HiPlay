@@ -95,3 +95,9 @@ set_target_properties(hicarauth PROPERTIES
 find_library(ANDROID_LOG log)
 target_link_libraries(hicarauth PRIVATE ${ANDROID_LOG})
 target_link_options(hicarauth PRIVATE -Wl,--no-undefined -Wl,-z,max-page-size=16384)
+
+# A separate, deliberately tiny library: reading an interface address is not authentication, and a
+# failure to load the HiChain engine must not take the address lookup down with it (or the reverse).
+add_library(netiface SHARED netiface_jni.c)
+target_compile_options(netiface PRIVATE -fvisibility=hidden -fstack-protector-strong)
+target_link_options(netiface PRIVATE -Wl,--no-undefined -Wl,-z,max-page-size=16384)

@@ -27,6 +27,15 @@ class WirelessHotspotInfo(
     val hostAddresses: List<InetAddress> = listOfNotNull(hostAddress),
     /** Wi-Fi AP hint for 0x5703; independent of the receiver's AirPlay identity in [bssid]. */
     val accessPointBssid: ByteArray? = null,
+    /**
+     * The framework's Wi-Fi Direct device address for the group owner, when it reported one.
+     *
+     * Kept apart from [bssid] because the two are not the same claim: [bssid] is what the access
+     * point broadcasts, this is the persistent P2P identity. A receiver that needs the broadcast
+     * address may prefer this only when the interface itself cannot be read — see
+     * `HiCarAccessPointBssid` — and callers that only want [bssid] see no change.
+     */
+    val groupOwnerDeviceAddress: String? = null,
 ) {
     override fun toString(): String =
         "WirelessHotspotInfo(backend=${backend.label}, ssid='$ssid', " +

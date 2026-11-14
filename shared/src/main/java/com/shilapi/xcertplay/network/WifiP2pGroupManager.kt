@@ -578,6 +578,7 @@ class WifiP2pGroupManager(
                 hostAddress = hostAddress,
                 bandLabel = band,
                 backend = WirelessHotspotBackend.WIFI_P2P,
+                groupOwnerDeviceAddress = group.owner?.deviceAddress?.takeIf { it.isNotBlank() },
             )
         }
     }
@@ -645,6 +646,7 @@ class WifiP2pGroupManager(
                 bandLabel = if (requestedChannel == UNKNOWN_CHANNEL) "Auto"
                     else WifiP2pLegacyChannels.bandLabelFor(requestedChannel),
                 backend = WirelessHotspotBackend.WIFI_P2P,
+                groupOwnerDeviceAddress = group.owner?.deviceAddress?.takeIf { it.isNotBlank() },
             )
         }
     }
@@ -886,16 +888,7 @@ class WifiP2pGroupManager(
                     latch.countDown()
                     return@requestGroupInfo
                 }
-                p2pManager.removeGroup(channel, object : WifiP2pManager.ActionListener {
-                    override fun onSuccess() {
-                        latch.countDown()
-                    }
-
-                    override fun onFailure(reason: Int) {
-                        diagnostic("Wi-Fi P2P remove rejected code=$reason reason=${failureReason(reason)}")
-                        latch.countDown()
-                    }
-                })
+                issueRemoveGroup(channel, latch, attempt = 1)
             }
         } catch (failure: RuntimeException) {
             Log.w(TAG, "Wi-Fi P2P removeGroup could not be issued", failure)
@@ -907,6 +900,38 @@ class WifiP2pGroupManager(
         } catch (interrupted: InterruptedException) {
             Thread.currentThread().interrupt()
         }
+    }
+
+    /**
+     * Removes the group, retrying once when the framework answers BUSY.
+     *
+     * A group that has just been created is still being configured in the supplicant, so the first
+     * removeGroup after a rejected startup is commonly refused with BUSY (seen on a HUAWEI
+     * MRX-AL09). Ignoring that leaves the group holding the radio and turns the next startup into a
+     * reclaim of a group this session has already given up on.
+     */
+    private fun issueRemoveGroup(channel: WifiP2pManager.Channel, latch: CountDownLatch, attempt: Int) {
+        p2pManager.removeGroup(channel, object : WifiP2pManager.ActionListener {
+            override fun onSuccess() {
+                latch.countDown()
+            }
+
+            override fun onFailure(reason: Int) {
+                diagnostic("Wi-Fi P2P remove rejected code=$reason reason=${failureReason(reason)} attempt=$attempt")
+                if (reason == WifiP2pManager.BUSY && attempt < REMOVE_GROUP_ATTEMPTS) {
+                    try {
+                        Thread.sleep(REMOVE_GROUP_RETRY_MILLIS)
+                    } catch (interrupted: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        latch.countDown()
+                        return
+                    }
+                    issueRemoveGroup(channel, latch, attempt + 1)
+                    return
+                }
+                latch.countDown()
+            }
+        })
     }
 
     private fun waitNanos(nanos: Long) {
@@ -963,6 +988,9 @@ class WifiP2pGroupManager(
         const val TAG = "xcertplay-usb"
         const val NANOS_PER_MILLISECOND = 1_000_000L
         const val REMOVE_GROUP_TIMEOUT_MILLIS = 2_000L
+        /** One retry on BUSY; a second refusal means the supplicant is not going to comply now. */
+        const val REMOVE_GROUP_ATTEMPTS = 2
+        const val REMOVE_GROUP_RETRY_MILLIS = 600L
         const val UNKNOWN_CHANNEL = 0
         val REQUEST_POLL_NANOS: Long = TimeUnit.MILLISECONDS.toNanos(500)
         const val TOKEN_ALPHABET =

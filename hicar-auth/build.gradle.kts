@@ -19,6 +19,10 @@ android {
     defaultConfig {
         minSdk = 24
         buildConfigField("boolean", "ENGINE_BUILT", engineFetched.toString())
+        // Both native libraries find their Kotlin side by fully qualified name, so neither the class
+        // nor the native methods may be renamed if shrinking is ever switched on. Nothing shrinks
+        // today; this keeps a later build-type change from turning into a link error at runtime.
+        consumerProguardFiles("consumer-rules.pro")
         if (engineFetched) {
             ndk {
                 abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64")

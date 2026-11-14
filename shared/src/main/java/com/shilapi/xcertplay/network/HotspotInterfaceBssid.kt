@@ -10,6 +10,20 @@ import java.util.Locale
  * Opaque/privacy IPv6 identifiers cannot be decoded and must not become a BSSID.
  */
 internal object HotspotInterfaceBssid {
+    private val MAC = Regex("(?i)([0-9a-f]{2}:){5}[0-9a-f]{2}")
+
+    /**
+     * A value that can be sent as a BSSID: well formed, unicast, and not one of the placeholders
+     * Android substitutes when an app is not allowed to see the real address.
+     */
+    fun usable(value: String?): Boolean {
+        val candidate = value?.trim() ?: return false
+        if (!MAC.matches(candidate)) return false
+        if (candidate.equals("02:00:00:00:00:00", true) || candidate == "00:00:00:00:00:00") return false
+        // A multicast address can never be a group owner.
+        return (candidate.substring(0, 2).toInt(16) and 1) == 0
+    }
+
     fun read(interfaceName: String?): String? {
         // The caller must pass the active local GO/AP interface, never a station or peer.
         if (interfaceName.isNullOrBlank()) return null

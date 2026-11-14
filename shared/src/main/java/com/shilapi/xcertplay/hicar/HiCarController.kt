@@ -216,17 +216,22 @@ class HiCarController(
         }
         // The phone joins by BSSID, so a placeholder is worse than stopping: it produces a
         // phone-side "network not found" with no clue on this side.
-        val bssid = HiCarAccessPointBssid.resolve(info)
+        val attempt = HiCarAccessPointBssid.inspect(info)
+        val bssid = attempt.resolution
         if (bssid == null) {
             report(HiCarStatus.Failed("hotspot bssid"))
+            // Name every source that was tried: a bare "cannot read" costs another device run.
             onLog(
-                "HiCar cannot read this group's BSSID (framework=${info.bssid ?: "none"}, " +
-                    "interface=${info.interfaceName ?: "none"}); refusing to send a placeholder",
+                "HiCar cannot read this group's BSSID (interface=${info.interfaceName ?: "none"}; " +
+                    attempt.reasons.joinToString("; ") + "); refusing to send a placeholder",
             )
             runCatching { hotspot?.close() }
             return null
         }
-        onLog("HiCar access point BSSID resolved from ${bssid.source.label}")
+        onLog("HiCar access point BSSID ${bssid.bssid} from ${bssid.source.label}")
+        if (attempt.reasons.isNotEmpty()) {
+            onLog("HiCar BSSID other sources: ${attempt.reasons.joinToString("; ")}")
+        }
         val networkOffer = try {
             HiCarNetworkOffer(
                 ssid = info.ssid,

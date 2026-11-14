@@ -10,7 +10,11 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class HiCarAccessPointBssidTest {
-    private fun info(bssid: String?, interfaceName: String? = "p2p0") = WirelessHotspotInfo(
+    private fun info(
+        bssid: String?,
+        interfaceName: String? = "p2p0",
+        ownerDeviceAddress: String? = null,
+    ) = WirelessHotspotInfo(
         ssid = "DIRECT-HL-0412",
         passphrase = "0f1e2d3c4b5a",
         security = Iap2WirelessSecurity.WPA_WPA2,
@@ -21,6 +25,7 @@ class HiCarAccessPointBssidTest {
         hostAddress = null,
         bandLabel = "5 GHz",
         backend = WirelessHotspotBackend.WIFI_P2P,
+        groupOwnerDeviceAddress = ownerDeviceAddress,
     )
 
     @Test
@@ -43,9 +48,12 @@ class HiCarAccessPointBssidTest {
     }
 
     @Test
-    fun twoSourcesThatDisagreeAreNotGuessedBetween() {
-        // A stale or foreign value must not be sent: the phone would join a network that is not ours.
-        assertNull(HiCarAccessPointBssid.choose("0a:1b:2c:3d:4e:5f", "0a:1b:2c:3d:4e:60"))
+    fun whenTheTwoSourcesDisagreeTheKernelValueWinsAndSaysSo() {
+        // sysfs is the kernel's own value for that exact interface; the framework can hold a cached
+        // view of a recreated interface. Either way the disagreement stays visible in the label.
+        val choice = HiCarAccessPointBssid.choose("0a:1b:2c:3d:4e:5f", "0a:1b:2c:3d:4e:60")
+        assertEquals("0a:1b:2c:3d:4e:60", choice?.bssid)
+        assertEquals(HiCarAccessPointBssid.Source.SYSFS_OVER_INTERFACE, choice?.source)
     }
 
     @Test
@@ -89,5 +97,74 @@ class HiCarAccessPointBssidTest {
         }
         assertFalse("the file must not be read for an invalid interface name", asked)
         assertEquals(HiCarAccessPointBssid.Source.INTERFACE, choice?.source)
+    }
+
+    @Test
+    fun theSecondTabletRunFallsBackToTheOwnerDeviceAddress() {
+        // hicar-log-20261114-115903.txt: framework 02:00:00:00:00:00, interface p2p-p2p0-2, sysfs
+        // unreadable, no link-local. The framework's Wi-Fi Direct owner address was never tried
+        // because the placeholder is not null; it is the last source that can answer here.
+        val attempt = HiCarAccessPointBssid.inspect(
+            info(bssid = "02:00:00:00:00:00", interfaceName = "p2p-p2p0-2", ownerDeviceAddress = "0a:1b:2c:3d:4e:5f"),
+            readSysfs = { throw java.io.FileNotFoundException("/sys/class/net/p2p-p2p0-2/address") },
+            deriveFromLinkLocal = { null },
+        )
+        assertEquals("0a:1b:2c:3d:4e:5f", attempt.resolution?.bssid)
+        assertEquals(HiCarAccessPointBssid.Source.OWNER, attempt.resolution?.source)
+        assertTrue(attempt.reasons.toString(), attempt.reasons.any { it.startsWith("sysfs=FileNotFound") })
+        assertTrue(attempt.reasons.toString(), attempt.reasons.any { it.startsWith("link-local=") })
+    }
+
+    @Test
+    fun aMaskedInterfaceWithALinkLocalAddressNeedsNoFileAccess() {
+        val attempt = HiCarAccessPointBssid.inspect(
+            info(bssid = "02:00:00:00:00:00", interfaceName = "p2p0", ownerDeviceAddress = "a2:b3:c4:d5:e6:f7"),
+            readSysfs = { null },
+            deriveFromLinkLocal = { "0a:1b:2c:3d:4e:5f" },
+        )
+        // The interface's own address describes the access point; the owner identity is persistent
+        // and may be a different, non-broadcast address while it is randomised.
+        assertEquals("0a:1b:2c:3d:4e:5f", attempt.resolution?.bssid)
+        assertEquals(HiCarAccessPointBssid.Source.LINK_LOCAL, attempt.resolution?.source)
+    }
+
+    @Test
+    fun theKernelTableAnswersWhenBothJavaAndSysfsRefuse() {
+        // The framework masks the address and Huawei's sysfs entry is unreadable; getifaddrs() is the
+        // same data `ip link` prints and is not filtered by the framework.
+        val attempt = HiCarAccessPointBssid.inspect(
+            info(bssid = "02:00:00:00:00:00", interfaceName = "p2p-p2p0-2"),
+            readSysfs = { throw java.io.FileNotFoundException("/sys/class/net/p2p-p2p0-2/address") },
+            readKernel = { "0a:1b:2c:3d:4e:5f" },
+            deriveFromLinkLocal = { null },
+        )
+        assertEquals("0a:1b:2c:3d:4e:5f", attempt.resolution?.bssid)
+        assertEquals(HiCarAccessPointBssid.Source.KERNEL, attempt.resolution?.source)
+    }
+
+    @Test
+    fun anOwnerAddressThatIsItselfAPlaceholderIsNotUsed() {
+        val attempt = HiCarAccessPointBssid.inspect(
+            info(bssid = "02:00:00:00:00:00", ownerDeviceAddress = "00:00:00:00:00:00"),
+            readSysfs = { null },
+            deriveFromLinkLocal = { null },
+        )
+        assertNull(attempt.resolution)
+        assertTrue(attempt.reasons.toString(), attempt.reasons.any { it.startsWith("owner=00:00") })
+    }
+
+    @Test
+    fun aTotalFailureNamesEverySourceItTried() {
+        val attempt = HiCarAccessPointBssid.inspect(
+            info(bssid = null, interfaceName = null),
+            readSysfs = { null },
+            deriveFromLinkLocal = { null },
+        )
+        assertNull(attempt.resolution)
+        val report = attempt.reasons.joinToString("; ")
+        assertTrue(report, report.contains("framework=none"))
+        assertTrue(report, report.contains("sysfs=no valid interface name"))
+        assertTrue(report, report.contains("owner=absent"))
+        assertEquals(3, attempt.reasons.size)
     }
 }
