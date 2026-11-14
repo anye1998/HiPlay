@@ -79,12 +79,9 @@ class HiCarBleAdvertiser(
                 started.countDown()
             }
         }
-        val settings = AdvertiseSettings.Builder()
-            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
-            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
-            .setConnectable(true)
-            .setTimeout(0)
-            .build()
+        val settingsBuilder = baseSettings()
+        val askedForPublicAddress = requestPublicAddress(settingsBuilder)
+        val settings = settingsBuilder.build()
         val data = AdvertiseData.Builder()
             .addServiceData(ParcelUuid(HiCarCodes.SERVICE_DISCOVERY), serviceData)
             .setIncludeDeviceName(false)
@@ -99,12 +96,17 @@ class HiCarBleAdvertiser(
             .build()
         return try {
             try {
-                leAdvertiser.startAdvertising(settings, data, scanResponse, callback)
-            } catch (unsupported: IllegalArgumentException) {
-                // A stack that refuses a scan response still takes the advertisement; losing the
-                // name is better than losing the beacon.
-                onLog("HiCar advertisement: scan response refused (${unsupported.message}); advertising without the name")
-                leAdvertiser.startAdvertising(settings, data, callback)
+                advertise(leAdvertiser, settings, data, scanResponse, callback)
+            } catch (denied: SecurityException) {
+                // The hidden setter accepted the value but the stack refuses to act on it without
+                // BLUETOOTH_PRIVILEGED. Drop the request rather than the beacon: an advertisement
+                // with a private address still proves everything else in the chain.
+                if (!askedForPublicAddress) throw denied
+                onLog(
+                    "HiCar advertisement: the public address needs BLUETOOTH_PRIVILEGED " +
+                        "(${denied.message}); retrying with the platform's own address",
+                )
+                advertise(leAdvertiser, baseSettings().build(), data, scanResponse, callback)
             }
             advertiser = leAdvertiser
             callbacks = callback
@@ -116,6 +118,36 @@ class HiCarBleAdvertiser(
         } catch (failure: RuntimeException) {
             onLog("HiCar advertisement failed: ${failure.javaClass.simpleName}")
             false
+        }
+    }
+
+    /**
+     * The advertising parameters HiCar needs regardless of address type.
+     *
+     * Connectable + legacy is exactly the ADV_IND event Huawei requires; a non-connectable event
+     * (ADV_NONCONN_IND) makes the phone connect and then never show the HiCar prompt.
+     */
+    private fun baseSettings(): AdvertiseSettings.Builder = AdvertiseSettings.Builder()
+        .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
+        .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
+        .setConnectable(true)
+        .setTimeout(0)
+
+    /** Starts advertising, dropping the device name if this stack will not carry a scan response. */
+    private fun advertise(
+        leAdvertiser: BluetoothLeAdvertiser,
+        settings: AdvertiseSettings,
+        data: AdvertiseData,
+        scanResponse: AdvertiseData,
+        callback: AdvertiseCallback,
+    ) {
+        try {
+            leAdvertiser.startAdvertising(settings, data, scanResponse, callback)
+        } catch (unsupported: IllegalArgumentException) {
+            // A stack that refuses a scan response still takes the advertisement; losing the name
+            // is better than losing the beacon.
+            onLog("HiCar advertisement: scan response refused (${unsupported.message}); advertising without the name")
+            leAdvertiser.startAdvertising(settings, data, callback)
         }
     }
 
@@ -168,6 +200,42 @@ class HiCarBleAdvertiser(
         context.checkSelfPermission(android.Manifest.permission.BLUETOOTH_ADVERTISE) ==
             android.content.pm.PackageManager.PERMISSION_GRANTED
 
+    /**
+     * Asks the platform to advertise with the adapter's public address instead of a private one.
+     *
+     * This is the one HiCar requirement an app cannot satisfy through the SDK. A HiCar phone takes
+     * the head unit's BR/EDR address from the advertisement's *own address*: Huawei's HiCar
+     * Bluetooth adaptation guide tells vendors to patch AOSP (`own_addr_type = BLE_ADDR_PUBLIC`,
+     * and the random address replaced with the controller address), and its fallback for stacks
+     * that keep a random MAC is a whole extra GATT server that hands the fixed MAC to the phone.
+     * Neither is an app-level API: `AdvertiseSettings.Builder.setOwnAddressType` is `@hide
+     * @SystemApi` and needs `BLUETOOTH_PRIVILEGED` for any value but the default.
+     *
+     * So this tries the hidden setter and reports what actually happened. A `NoSuchMethodException`
+     * here is the answer, not a failure to work around: it means the advertisement will carry a
+     * resolvable private address, and a phone that derives the BR address from it has nothing to
+     * dial — which looks exactly like "the phone ignores a beacon it clearly received".
+     */
+    private fun requestPublicAddress(builder: AdvertiseSettings.Builder): Boolean {
+        val parameterType = Int::class.javaPrimitiveType ?: return false
+        return try {
+            builder.javaClass.getMethod("setOwnAddressType", parameterType)
+                .invoke(builder, ADDRESS_TYPE_PUBLIC)
+            onLog(
+                "HiCar advertisement: public advertising address accepted by the platform; check the " +
+                    "phone's scanner — the address must now be the adapter's own, not a private one",
+            )
+            true
+        } catch (failure: Throwable) {
+            onLog(
+                "HiCar advertisement: the platform keeps a private advertising address " +
+                    "(${failure.javaClass.simpleName}); a HiCar phone reads the BR address from that " +
+                    "field, so it has nothing to dial and never shows its prompt",
+            )
+            false
+        }
+    }
+
     private fun describeScanMode(mode: Int): String = when (mode) {
         BluetoothAdapter.SCAN_MODE_NONE -> "not connectable"
         BluetoothAdapter.SCAN_MODE_CONNECTABLE -> "connectable, not discoverable"
@@ -182,5 +250,10 @@ class HiCarBleAdvertiser(
         AdvertiseCallback.ADVERTISE_FAILED_INTERNAL_ERROR -> "internal error"
         AdvertiseCallback.ADVERTISE_FAILED_FEATURE_UNSUPPORTED -> "feature unsupported"
         else -> "code $errorCode"
+    }
+
+    private companion object {
+        /** `AdvertisingSetParameters.ADDRESS_TYPE_PUBLIC`, @hide @SystemApi, value 0. */
+        const val ADDRESS_TYPE_PUBLIC = 0
     }
 }

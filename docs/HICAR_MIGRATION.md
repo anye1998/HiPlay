@@ -541,6 +541,7 @@ HiCar waiting for the phone: 150s ... discoverable=no (connectable only)   ← 1
    `Not discoverable yet ... Press 'Make discoverable' first`。
 3. **`address=02:00:00:00:00:00`** 说明框架对本机 BR 地址同样屏蔽——而 11 字节载荷里不含地址，
    所以手机只能通过 inquiry 找车机。这条路径成立的前提就是"可被发现"。
+   ***已更正（见 7.10）**：手机取的是 BLE 广播的"广播地址"，不做 inquiry；可发现性不是必要条件。*
 
 **另一个需要记录的硬限制**：`BluetoothAdapter.getBluetoothClass()` 不在公开 SDK 中，应用**连本机 CoD 都读不到**，
 更不可能把它改成"车载音响"。平板的 CoD 属于"计算机"类，如果手机的 HiCar 只接受车载类设备，这就是侧载无法绕过的
@@ -561,3 +562,70 @@ aReplacementSessionDetachesTheOldClusterSurfaceUntilItsOwnMainFrame` 失败过 *
   这是上游测试依赖内部字段的脆弱点，修复它需要改动 CarPlay 侧行为，不属于本次任务范围。
 
 处理方式：记录在此，不通过重跑或跳过掩盖；CI 若因此偶发变红，应按"重跑该 job"处理，而不是改断言。
+
+### 7.10 第八次实测：广播确认在空口，手机缺的是"BR 地址"
+
+`hicar-log-20261114-142324.txt` 与手机端 nRF Connect 截图（14:22）是这一轮的两份证据。第一次拿到**第三方证明广播真的发了出去**：
+
+```
+HiCar advertisement started (11 bytes of 0xFDEE service data, device name in the scan response)
+手机端: HUAWEI MatePad Pro  65:4C:79:F7:29:33  -59 dBm
+        Service Data: UUID 0xFDEE Data 0x0101010361460B04EC100A
+        Complete Local Name: HUAWEI MatePad Pro
+```
+
+三点解读：
+
+1. **"N/A 行"的歧义解决了**。上一轮手机截图里有三个 `N/A`，无法指认哪个是我们的；把名字放进扫描响应后，
+   手机直接显示 `HUAWEI MatePad Pro`，payload 与我们发出的 11 字节逐字节一致（序号从 `08` 走到 `0A`）。
+   **广播在空口，手机收到了。** 这句话现在有证据，不再是推断。
+2. **`F8:AF:05:1B:02:90` 结案**。新的自扫描逐台报告带出了名字 `华为AI音箱 2e-04113`——它是隔壁的华为音箱，
+   不是平板本身。上一轮"可能是系统自己的 0xFDEE 广播顶掉了我们的包"这个猜想**排除**。
+3. **手机仍不弹框**，而且这次全程 `discoverable=no (connectable only)`。按下面的官方流程，可发现性**不是**必要条件。
+
+**根因（有官方文档，不是推测）**：华为《HiCar 蓝牙》适配文档写得很直：
+
+> 本方案有两处修改点：`btm_ble_set_random_address(*controller_get_interface()->get_address())`，
+> Android 源码里此处使用的是随机地址，需要修改成上面代码片段中的内容；
+> `p_cb->own_addr_type=BLE_ADDR_PUBLIC`，Android 源码里使用的 `BLE_ADDR_RANDOM`，需要修改成为 `BLE_ADDR_PUBLIC`。
+
+同一文档给出的替代方案（`persist.sys.hicar.random.mac=true`）同样说明随机 MAC 时不够用：
+开启后 `startAdv` 会**额外起一个 GATT Server**，手机连上 GATT Server 才从数据里拿到固定 MAC。
+也就是说"随机地址"要么被改成公开地址，要么得配一条额外的私有通道——不存在"随机地址也能用"。
+
+机制读起来是这样：**手机把 BLE 广播的"广播地址"直接当作车机的 BR/EDR 地址**，用它发起经典蓝牙连接，
+连上（RFCOMM 免配对）之后才弹 HiCar 框。我们今天发出去的地址是 `65:4C:79:F7:29:33`，首字节 `0x65` 的最高两位是
+`01`，按 Core 规范这是**可解析私有地址（RPA）**，不可能是任何真实设备的 BR MAC。手机拿这个地址拨号自然拨不到，
+于是"包收到了、什么都没发生"——与观测完全吻合。
+
+**这条要求在 App 层无法满足（已核实）**：
+
+- `javap android.bluetooth.le.AdvertiseSettings$Builder`（`android-37.0/android.jar`）公开方法只有
+  `setAdvertiseMode / setConnectable / setDiscoverable / setTimeout / setTxPowerLevel`；
+  `AdvertisingSetParameters$Builder` 同样没有 `setOwnAddressType`。
+- AOSP 源码里两者都是 `@hide @SystemApi`，注释原文：*"If used to set address type anything other than
+  ADDRESS_TYPE_DEFAULT, then it will require BLUETOOTH_PRIVILEGED permission"*。
+- 华为文档的落点同样是"修改 AOSP / 设置系统属性"，属于 ROM 侧改动。
+
+**同时排除的一个旧猜想**：7.8 第 3 条"手机要靠 inquiry 找车机，所以必须 BR 可被发现"**不成立**——手机用的是广播地址，
+不做 inquiry。本次 `discoverable=no` 与失败无关；可发现性只在配对/回连这类经典流程里才需要。
+
+**这一轮加的东西**：
+
+- `HiCarBleAdvertiser.requestPublicAddress()`：反射尝试隐藏的 `setOwnAddressType(0)`，成功与失败都写一行明确日志。
+  失败时不假装成功，日志直接写明"广播地址是私有地址，手机没有可拨的 BR 地址"。
+- 广播设置处注明 `setConnectable(true)` 就是 **ADV_IND**：华为文档明确警告非定向不可连接事件
+  （`ADV_NONCONN_IND`）会让手机连上后仍不弹框，这一项我们本来就满足（legacy + connectable）。
+- 自扫描报告逐台列出（地址 / 次数 / RSSI / 名字 / payload），这一轮正是靠它把"华为AI音箱"认出来的。
+
+**剩余路线（都不在 App 层）**：
+
+| 路线 | 前提 | 代价 |
+| --- | --- | --- |
+| 改 ROM：`own_addr_type = BLE_ADDR_PUBLIC`，并用控制器地址替换随机地址 | root / 定制 ROM | 与"侧载 APK"的目标冲突 |
+| 华为 `persist.sys.hicar.random.mac` + 自建 GATT Server | 系统属性 + HiCar SDK 的 GATT 协议（未公开） | 协议不可得 |
+| 换到能控制 HCI 的平台（Linux/BlueZ，即参考项目 `HelloCar` 的路径） | 非 Android 车机 | 偏离"Android 车机端"前提 |
+
+**结论**：在未改 ROM 的普通 Android 平板上，HiCar 的 BLE 发现这一步走不通。原因不是我们的载荷、
+不是权限、不是可发现性，而是"广播地址必须是 BR 地址"这个系统级要求。这条写进最终交付报告的能力缺口表，
+并作为本项目**唯一已定位到根因的外部限制**记录在案。

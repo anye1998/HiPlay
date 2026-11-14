@@ -205,7 +205,7 @@ CarPlay 那套 iAP2 + AirPlay RTSP 一行都用不上，能复用的只有字节
 
 | 能力 | 判定 |
 | --- | --- |
-| BLE FDEE 广播（不配对） | 可实现，纯 Android API |
+| BLE FDEE 广播（不配对） | 载荷/名称/ADV_IND 已实测被手机收到；**但广播地址必须等于车机 BR 地址，App 层不可设置**（`setOwnAddressType` 为 `@hide @SystemApi`，需 `BLUETOOTH_PRIVILEGED`），故手机仍不弹框，详见 HICAR_MIGRATION 7.10 |
 | RFCOMM 双服务 + 参数协商 + 业务通道分配 | 可实现，纯协议逻辑，可单测 |
 | DMSDP 控制通道（明文/加密、心跳、时钟） | 可实现，AES-CTR 是标准件 |
 | Wi-Fi 能力协商 + 凭据下发 | 可实现，可单测 |
