@@ -355,7 +355,11 @@ class HiCarController(
     }
 
     private fun serve(socket: android.bluetooth.BluetoothSocket, control: Boolean) {
-        onLog("HiCar ${if (control) "control" else "business"} channel connected")
+        // The peer address makes a connection attempt identifiable in a report: a phone that dials is
+        // the first hard evidence the discovery stage worked, and which phone it was matters when the
+        // car is bonded to more than one.
+        val peer = runCatching { socket.remoteDevice?.address }.getOrNull() ?: "unknown"
+        onLog("HiCar ${if (control) "control" else "business"} channel connected (peer $peer)")
         if (!control) report(HiCarStatus.Authenticating)
         val negotiator = HiCarChannelNegotiator(
             summary = config.localIdentity.toByteArray(Charsets.US_ASCII),
@@ -367,6 +371,7 @@ class HiCarController(
                 seed = config.localIdentity,
                 localIdentity = config.localIdentity,
                 pin = config.pin,
+                onLog = { message -> onLog(message) },
             )
         } else {
             // No engine or no code: the exchange still runs so the log shows how far the phone got,

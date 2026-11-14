@@ -19,9 +19,11 @@ internal class HiChainAuthenticator(
     private val seed: String,
     private val localIdentity: String,
     private val pin: String,
+    private val onLog: (String) -> Unit = {},
 ) : HiCarAuthenticator {
     private var handle: Long = 0
     private var started = false
+    private var stepIndex = 0
 
     override var sessionKey: ByteArray? = null
         private set
@@ -48,17 +50,36 @@ internal class HiChainAuthenticator(
             throw HiCarAuthException(HiCarAuthBlocker.NATIVE_HICHAIN_LIBRARY_MISSING)
         }
         started = true
+        stepIndex = 0
+        // The code the engine will authenticate with, masked. A run where this does not match the
+        // code on the screen has one obvious explanation, and the log should be able to show it
+        // without anyone having to reproduce the screen.
+        onLog(
+            "HiChain begin: role=accessory peer=$peerIdentity pin=${pin.take(2)}…${pin.takeLast(2)} " +
+                "(${pin.length} digits, to be compared with the code on this screen)",
+        )
     }
 
     override fun step(chunk: ByteArray, keyLength: Int): List<ByteArray> {
         if (!started || handle == 0L) throw HiCarAuthException(HiCarAuthBlocker.NATIVE_HICHAIN_LIBRARY_MISSING)
         val step = HiChainNative.stepDecoded(handle, chunk, keyLength)
             ?: throw HiCarAuthException(HiCarAuthBlocker.NATIVE_HICHAIN_LIBRARY_MISSING)
-        if (step.error != 0) throw HiCarAuthException(HiCarAuthBlocker.VENDOR_SIGNATURE_REQUIRED)
+        stepIndex++
+        if (step.error != 0) {
+            // Every non-zero error used to be reported as "needs a vendor-signed app", which sent the
+            // investigation to the wrong place: a wrong PIN, an unsupported key length and a broken
+            // packet all landed there. The numeric code is what separates them, so it goes in the log.
+            onLog(
+                "HiChain step $stepIndex failed: engine error=${step.error}, keyLength=$keyLength; " +
+                    "a wrong code on the phone is the most likely cause, but the number is what decides",
+            )
+            throw HiCarAuthException(HiCarAuthBlocker.PIN_NOT_TRUSTED)
+        }
         if (step.finished) {
             val key = HiChainNative.sessionKey(handle)
                 ?: throw HiCarAuthException(HiCarAuthBlocker.NATIVE_HICHAIN_LIBRARY_MISSING)
             sessionKey = key
+            onLog("HiChain step $stepIndex finished: ${key.size}-byte session key")
         }
         return step.packets
     }
