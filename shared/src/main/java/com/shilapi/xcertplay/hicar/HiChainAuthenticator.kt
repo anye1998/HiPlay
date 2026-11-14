@@ -85,11 +85,22 @@ internal class HiChainAuthenticator(
     }
 
     override fun close() {
+        // A session that ran steps and then ended without a key is the phone rejecting the confirm:
+        // HiChain gives the driver no finer message than "wrong password", so the log has to say what
+        // actually happened, or the next run starts from a guess.
+        if (started && stepIndex > 0 && sessionKey == null) {
+            onLog(
+                "HiChain ended after $stepIndex step(s) with no session key: the phone's confirm did not " +
+                    "match ours, which for this protocol means the code on the phone differs from the " +
+                    "code on this screen (or the link dropped first)",
+            )
+        }
         if (handle != 0L) {
             HiChainNative.close(handle)
             handle = 0
         }
         started = false
+        stepIndex = 0
         sessionKey?.let { Arrays.fill(it, 0) }
         sessionKey = null
     }

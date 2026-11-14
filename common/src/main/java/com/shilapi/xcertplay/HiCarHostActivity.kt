@@ -167,9 +167,16 @@ class HiCarHostActivity : ComponentActivity() {
             // vector, one tap away so a comparison run does not need the soft keyboard.
             TextButton(onClick = { model = TEST_MODEL }) { Text("Use test model $TEST_MODEL") }
             Text(
-                "Connection code: $pin   (the phone asks for these six digits the first time)",
-                style = MaterialTheme.typography.titleMedium,
+                "Connection code: $pin",
+                style = MaterialTheme.typography.headlineSmall,
                 fontFamily = FontFamily.Monospace,
+            )
+            // The code is the only shared secret in the handshake, and it changes whenever the trust
+            // store is wiped. Saying so next to the digits is cheaper than a failed pairing run.
+            Text(
+                "The phone asks for these six digits the first time. This code changes every time " +
+                    "Reset pairing is pressed, so read it from the screen when the prompt appears.",
+                style = MaterialTheme.typography.bodySmall,
             )
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Button(onClick = ::toggle, enabled = model.length == 8) {

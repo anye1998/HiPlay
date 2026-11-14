@@ -896,3 +896,50 @@ HiChain PAKE 六步，全部打通；**在最后一步被手机拒掉**（手机
 
 **下一次操作建议**：先点 `Reset pairing`（清掉此前多次失败留下的半成品信任状态并换新码），记下新码，
 再 Start，弹窗出现时**照着屏幕逐位输入**；同时把手机弹窗截图发来——它的措辞能直接分辨上面两种可能。
+
+### 7.18 手机只要求"输入密码"：方向确认了，但码对不上
+
+用户补充的三条事实（Mate 80 Pro Max，装的是 21:26 那版 `8cd3c37` 之前的 APK）：
+
+- 手机弹窗**只有输入密码**，没有"请在车机上输入"这类反向提示 → 7.17 列的两种可能里，**方向是第 1 种**，
+  即手机要求输入车机屏幕上的六位数，我们的假设成立，不需要在车机端加输入框。
+- 用户输入的是车机屏幕上的 `530631`。
+- 结果是"密码不正确"。
+
+**先把"数字被弄坏"这一类可能排除掉（读代码，不是猜）**：
+
+| 环节 | 代码事实 | 结论 |
+| --- | --- | --- |
+| 生成 | `String.format("%06d", random.nextInt(1_000_000))` | 以 0 开头也保留六位，不会变成 5 位 |
+| 存储/显示 | 同一个 `String` 直接显示、直接传给控制器 | 显示值与使用值同源 |
+| JNI | `copy_string(..., PIN_DIGITS)`，逐位校验 `'0'..'9'` | 非 6 位数字直接返回 0，不会"半截"参与运算 |
+| 引擎 | `hc_pin { uint32_t length; uint8_t pin[HC_PIN_BUFF_LEN]; }`，PAKE 的 HKDF 输入按 `length` 取 | 不依赖字符串结尾，不会被后面的脏字节影响 |
+| 密钥长度 | `keyLength` 只接受 16/32，其他会抛 `key length` | 21:26 的日志里没有这行，**密钥长度不是原因** |
+
+排除之后只剩两种，而它们的分界线就是新日志里的那一行：
+
+1. **那一轮用的码和屏幕上显示的不是同一个**。码存在首选项里、只在 `Reset pairing` 或清数据时更换；
+   用户此前被要求按过 Reset，很可能读到的是**上一轮**的码（`530631`）而引擎用的是新码。
+   新日志会在鉴权开始时打 `HiChain begin: ... pin=53…31 (6 digits, ...)`，掩码后仍可逐位对首尾。
+2. **码相同但协议参数不同**。HiCar 的"密码不正确"是 **confirm 不匹配的通用文案**，不是"数字比对"的结果；
+   PAKE 的 confirm 覆盖派生密钥，任何参数不一致都会显示同一句话。
+
+**本轮加的一条日志（把第 1 种和第 2 种分开）**：
+
+```
+HiChain ended after 6 step(s) with no session key: the phone's confirm did not match ours, which for
+this protocol means the code on the phone differs from the code on this screen (or the link dropped first)
+```
+
+以前通道被手机关掉只打一行 `HiCar channel closed: IOException`，看不出"鉴权走到第几步、有没有拿到密钥"。
+现在只要 PAKE 跑过步数却没拿到 session key，就会明确写出这句。
+
+界面顺带做了两件小事：连接码改成大号等宽字；下面那行说明改成"每次按 Reset pairing 都会换新码，
+弹窗出现时照屏幕读"，因为这次的失败很可能就是读了旧码。
+
+**下一次运行的判读顺序**（先 Reset、再 Start，不要反过来）：
+
+1. 按 `Reset pairing` → 记下屏幕上的新码（此时旧码立刻作废）；
+2. `Start` → 手机弹窗出现时**照屏幕逐位输入**；
+3. 导出日志，看两行：`HiChain begin: ... pin=XX…YY`（是否与屏幕一致）与
+   `HiChain ended after N step(s) ...`（N 是否 6、有没有 session key）。
