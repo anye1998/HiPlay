@@ -30,6 +30,9 @@ import java.io.File
 internal object HiCarAccessPointBssid {
     private val INTERFACE_NAME = Regex("[A-Za-z0-9_.:-]{1,32}")
 
+    /** The framework names a group interface `p2p-p2p0-5`; the kernel may only know `p2p0`. */
+    private val GROUP_NAME = Regex("(?i)^p2p-(.+)-\\d+$")
+
     /** Well-formed, unicast, and not one of Android's placeholder addresses. */
     fun usable(value: String?): Boolean = HotspotInterfaceBssid.usable(value)
 
@@ -39,6 +42,7 @@ internal object HiCarAccessPointBssid {
         SYSFS("sysfs only; the framework reported a placeholder"),
         SYSFS_OVER_INTERFACE("sysfs; the framework reported a different address"),
         KERNEL("kernel interface table; the framework reported a placeholder"),
+        KERNEL_AND_LINK_LOCAL("kernel interface table and the interface's IPv6 link-local agree"),
         LINK_LOCAL("MAC decoded from the interface's IPv6 link-local address"),
         OWNER("Wi-Fi Direct owner device address; may not be the broadcast address"),
     }
@@ -95,13 +99,20 @@ internal object HiCarAccessPointBssid {
             reasons += "framework=${info.bssid ?: "none"} (${if (info.bssid == null) "absent" else "placeholder"})"
         }
 
+        val baseName = name?.let { baseInterfaceName(it) }
+        fun readSysfsOrNull(candidate: String): String? =
+            runCatching { readSysfs(candidate) }.getOrNull()?.trim()?.takeIf(::usable)
+
         val sysfs = if (name != null && INTERFACE_NAME.matches(name)) {
             val raw = runCatching { readSysfs(name) }
             val value = raw.getOrNull()?.trim()?.takeIf(::usable)
             if (value == null) {
-                reasons += "sysfs=${raw.exceptionOrNull()?.let { it.javaClass.simpleName } ?: "unusable"}"
-            }
-            value
+                val fromBase = baseName?.takeIf { INTERFACE_NAME.matches(it) }?.let(::readSysfsOrNull)
+                if (fromBase == null) {
+                    reasons += "sysfs=${raw.exceptionOrNull()?.let { it.javaClass.simpleName } ?: "unusable"}"
+                }
+                fromBase
+            } else value
         } else {
             reasons += "sysfs=no valid interface name (${name ?: "none"})"
             null
@@ -111,12 +122,17 @@ internal object HiCarAccessPointBssid {
             val raw = runCatching { readKernel(name) }
             val value = raw.getOrNull()?.trim()?.takeIf(::usable)
             if (value == null) {
-                reasons += "kernel=" + (
-                    raw.exceptionOrNull()?.let { it.javaClass.simpleName }
-                        ?: runCatching { describeKernel(name) }.getOrDefault("unavailable")
-                    )
-            }
-            value
+                val fromBase = baseName?.takeIf { INTERFACE_NAME.matches(it) }?.let { candidate ->
+                    runCatching { readKernel(candidate) }.getOrNull()?.trim()?.takeIf(::usable)
+                }
+                if (fromBase == null) {
+                    reasons += "kernel=" + (
+                        raw.exceptionOrNull()?.let { it.javaClass.simpleName }
+                            ?: runCatching { describeKernel(name) }.getOrDefault("unavailable")
+                        )
+                }
+                fromBase
+            } else value
         } else null
 
         val linkLocal = if (name != null && INTERFACE_NAME.matches(name)) {
@@ -131,12 +147,24 @@ internal object HiCarAccessPointBssid {
         }
 
         choose(framework, sysfs)?.let { return Attempt(it, reasons) }
-        if (kernel != null) return Attempt(Resolution(kernel, Source.KERNEL), reasons)
+        if (kernel != null) {
+            // Two independent kernel views agreeing is the strongest evidence available here.
+            val source = if (linkLocal != null && kernel.equals(linkLocal, true)) {
+                Source.KERNEL_AND_LINK_LOCAL
+            } else {
+                Source.KERNEL
+            }
+            return Attempt(Resolution(kernel, source), reasons)
+        }
         if (linkLocal != null) return Attempt(Resolution(linkLocal, Source.LINK_LOCAL), reasons)
         if (owner != null) return Attempt(Resolution(owner, Source.OWNER), reasons)
         reasons += "owner=absent"
         return Attempt(null, reasons)
     }
+
+    /** `p2p-p2p0-5` becomes `p2p0`; anything else stays as it is. */
+    fun baseInterfaceName(name: String): String? =
+        GROUP_NAME.matchEntire(name)?.groupValues?.get(1)?.takeIf { it.isNotBlank() }
 
     /** Convenience for callers that only need the address. */
     fun resolve(

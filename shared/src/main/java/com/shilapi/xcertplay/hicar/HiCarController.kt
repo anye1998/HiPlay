@@ -109,7 +109,15 @@ class HiCarController(
                 onLog("HiCar authentication blocked: ${blocked.blocker.message}")
             } catch (failure: SecurityException) {
                 report(HiCarStatus.Failed("permission"))
-                onLog("HiCar needs the nearby-devices Bluetooth permission")
+                // Name them: RFCOMM needs CONNECT while advertising needs ADVERTISE, and a bare
+                // "permission" sends the reader to the settings page without knowing which switch.
+                val missing = missingPermissions()
+                onLog(
+                    "HiCar needs the nearby-devices Bluetooth permission" +
+                        if (missing.isEmpty()) " (all declared permissions are granted; " +
+                            "${failure.message ?: "the platform refused the call"})"
+                        else " (missing: ${missing.joinToString()})",
+                )
             } catch (failure: Exception) {
                 report(HiCarStatus.Failed(failure.javaClass.simpleName))
                 onLog("HiCar start failed: ${failure.javaClass.simpleName}")
@@ -285,11 +293,31 @@ class HiCarController(
                 onLog(
                     "HiCar waiting for the phone: ${seconds}s, connections=$connections, " +
                         "advertising=${if (advertiser != null) "on" else "off"}, " +
-                        "listeners=${if (services != null) "open" else "closed"}",
+                        "listeners=${if (services != null) "open" else "closed"}, " +
+                        "discoverable=${discoverableState()}",
                 )
             }
         }
     }
+
+    /**
+     * Whether this device can still be found by inquiry.
+     *
+     * The system grants discoverability for a fixed, short window (a HUAWEI MRX-AL09 grants 120 s even
+     * when 300 is requested), after which the advertisement is still visible over BLE but nothing can
+     * reach the car over BR/EDR. Without this in the heartbeat, an expired window looks exactly like a
+     * phone that ignored us.
+     */
+    private fun discoverableState(): String = runCatching {
+        val adapter = appContext.getSystemService(android.bluetooth.BluetoothManager::class.java)?.adapter
+            ?: return "unknown"
+        when (adapter.scanMode) {
+            android.bluetooth.BluetoothAdapter.SCAN_MODE_CONNECTABLE_DISCOVERABLE -> "yes"
+            android.bluetooth.BluetoothAdapter.SCAN_MODE_CONNECTABLE -> "no (connectable only)"
+            android.bluetooth.BluetoothAdapter.SCAN_MODE_NONE -> "no (not connectable)"
+            else -> "unknown"
+        }
+    }.getOrDefault("unknown")
 
     private fun acceptLoop(acceptSocket: () -> android.bluetooth.BluetoothSocket, control: Boolean) {
         while (running.get()) {
@@ -435,6 +463,13 @@ class HiCarController(
             workers.add(this)
             start()
         }
+
+    /** Which declared permission is not granted; empty means the refusal came from somewhere else. */
+    private fun missingPermissions(): List<String> {
+        if (Build.VERSION.SDK_INT < 31) return emptyList()
+        return listOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_ADVERTISE)
+            .filter { appContext.checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+    }
 
     private fun hasPermissions(): Boolean {
         if (Build.VERSION.SDK_INT < 31) return true

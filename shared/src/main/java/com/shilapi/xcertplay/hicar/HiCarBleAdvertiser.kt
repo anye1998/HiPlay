@@ -23,7 +23,7 @@ import java.util.concurrent.TimeUnit
  * finds a listener.
  */
 class HiCarBleAdvertiser(
-    context: Context,
+    private val context: Context,
     private val onLog: (String) -> Unit = {},
 ) : Closeable {
     private val adapter: BluetoothAdapter? =
@@ -51,14 +51,15 @@ class HiCarBleAdvertiser(
             return false
         }
         stop()
-        // The phone cannot act on the advertisement unless it can also reach this device over BR/EDR,
-        // and that needs the device to be discoverable: the payload carries the model and a sequence
-        // number, not the car's address. Logging the adapter state makes "nobody reacted" explainable.
-        onLog(
-            "HiCar advertisement: address=${local.address ?: "none"}, " +
-                "mode=${describeScanMode(local.scanMode)}, name='${local.name ?: ""}', " +
-                "payload=${serviceData.joinToString(" ") { String.format(Locale.ROOT, "%02x", it) }}",
-        )
+        if (!hasAdvertisePermission()) {
+            // startAdvertising would throw SecurityException here and lose the real reason; say it
+            // first, because the rest of the chain (access point, RFCOMM) is already up by now.
+            onLog("HiCar advertisement needs the nearby-devices permission (BLUETOOTH_ADVERTISE)")
+            return false
+        }
+        // Logging the adapter state makes "nobody reacted" explainable, but these getters are
+        // permission-checked: a diagnostic line must never be what stops the advertisement.
+        runCatching { onLog(describeAdapter(local, serviceData)) }
         val leAdvertiser = local.bluetoothLeAdvertiser ?: return false
         val started = CountDownLatch(1)
         val outcome = java.util.concurrent.atomic.AtomicReference<Boolean?>(null)
@@ -116,6 +117,16 @@ class HiCarBleAdvertiser(
             // Stopping an advertisement the platform already dropped is not an error.
         }
     }
+
+    @SuppressLint("MissingPermission")
+    private fun describeAdapter(local: BluetoothAdapter, serviceData: ByteArray): String =
+        "HiCar advertisement: address=${local.address ?: "none"}, " +
+            "mode=${describeScanMode(local.scanMode)}, name='${local.name ?: ""}', " +
+            "payload=${serviceData.joinToString(" ") { String.format(Locale.ROOT, "%02x", it) }}"
+
+    private fun hasAdvertisePermission(): Boolean =
+        context.checkSelfPermission(android.Manifest.permission.BLUETOOTH_ADVERTISE) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
 
     private fun describeScanMode(mode: Int): String = when (mode) {
         BluetoothAdapter.SCAN_MODE_NONE -> "not connectable"

@@ -435,3 +435,40 @@ HiCar listeners started: hicar-control, hicar-business
 可发现性是目前最能解释"手机不弹窗"的差异，但不是已被证实的充分条件。
 如果加上可发现性后手机仍不弹窗，下一个变量是**型号字节**（当前 `61460BEC` 是本机随机生成的，
 参考项目的测试向量用的是 `00040A04`），手机可能用型号去匹配它的设备库。
+
+### 7.6 第七次实测：Start 恢复，但广播被权限挡住
+
+`hicar-log-20261114-130043.txt`（12:58 启动、13:00 导出）带来三条硬信息：
+
+```
+HiCar records ready: business channel 7, control on 0xFE35
+HiCar needs the nearby-devices Bluetooth permission
+Discoverable request granted for 120s; press Start to advertise   (点了两次)
+```
+
+1. **点 Start 不再闪退**（用户确认）。上一版的闪退来自 Start 里直接拉起系统可发现界面，已把它移出 Start。
+2. **广播没有发出去**：`records ready` 说明 RFCOMM 建记录成功，也就说明 `BLUETOOTH_CONNECT` 是有的；
+   因此这里的 `SecurityException` 只能是 **`BLUETOOTH_ADVERTISE` 未授予**。链路走到了最后一步才被挡，而日志原文
+   只写"需要权限"，不点名是哪一项。
+3. **可发现性拿到了**，但系统把请求的 300 秒压成 **120 秒**（日志两次 `granted for 120s`）。也就是说：
+   点了"Make discoverable"之后必须在 120 秒内让手机发起连接，否则窗口过期，手机又能看到广播却找不到地址。
+
+另外 BSSID 这次是 `02:DC:03:2B:48:D0`，来源仍是 IPv6 EUI-64；内核来源报
+`kernel=p2p-p2p0-5 has no AF_PACKET entry`——接口在、但没有 `AF_PACKET` 项，说明 bionic 的 `getifaddrs()`
+在该版本上不返回链路层地址（`libnetiface.so` 本身加载成功了，这从错误措辞能区分出来）。
+
+**修复（本分支）**：
+
+- **权限点名**：SecurityException 分支会列出缺的具体权限（`missing: android.permission.BLUETOOTH_ADVERTISE`），
+  全部已授予时改为打印平台给的原始消息，不再只说"需要权限"。
+- **广播器先查权限**：`startAdvertising` 之前显式检查 `BLUETOOTH_ADVERTISE`，缺了就写一行明确日志并返回 false；
+  同时把 `address/mode/name/payload` 这段诊断日志包进 `runCatching`——上一版它自己就会抛 SecurityException，
+  是"诊断代码把功能搞挂"的典型。
+- **BSSID 基名兜底**：框架给 `p2p-p2p0-5`、内核只认 `p2p0` 时，sysfs 与内核读取都会再试基名；
+  若内核值与 IPv6 EUI-64 反解值一致，标注为 `KERNEL_AND_LINK_LOCAL`（两个独立内核视图互相印证，
+  这是当前能拿到的最强证据）。
+- **心跳带上可发现性**：`discoverable=yes / no (connectable only)`，这样 120 秒窗口过期在日志里是可见的，
+  而不是看起来像"手机不理我"。
+
+**下一步的唯一判据**：先让平板授予"附近的设备"权限（系统设置 → 应用 → 权限），
+确认 `HiCar advertisement started` 出现、心跳里 `advertising=on`；再在 120 秒窗口内用手机发起连接。

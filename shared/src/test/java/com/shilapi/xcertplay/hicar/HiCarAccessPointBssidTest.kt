@@ -154,6 +154,38 @@ class HiCarAccessPointBssidTest {
     }
 
     @Test
+    fun theFrameworkGroupNameIsShortenedToTheKernelBaseName() {
+        assertEquals("p2p0", HiCarAccessPointBssid.baseInterfaceName("p2p-p2p0-5"))
+        assertNull("a plain interface name is not rewritten", HiCarAccessPointBssid.baseInterfaceName("p2p0"))
+        assertNull(HiCarAccessPointBssid.baseInterfaceName("wlan0"))
+    }
+
+    @Test
+    fun theKernelBaseNameIsTriedWhenTheGroupNameHasNoAddress() {
+        // hicar-log-20261114-130043.txt: framework p2p-p2p0-5, kernel knows no AF_PACKET entry for it.
+        val attempt = HiCarAccessPointBssid.inspect(
+            info(bssid = "02:00:00:00:00:00", interfaceName = "p2p-p2p0-5"),
+            readSysfs = { throw java.io.FileNotFoundException("/sys/class/net/p2p-p2p0-5/address") },
+            readKernel = { name -> if (name == "p2p0") "02:dc:03:2b:48:d0" else null },
+            deriveFromLinkLocal = { "02:DC:03:2B:48:D0" },
+            describeKernel = { "no entry" },
+        )
+        assertEquals("02:dc:03:2b:48:d0", attempt.resolution?.bssid)
+        assertEquals(HiCarAccessPointBssid.Source.KERNEL_AND_LINK_LOCAL, attempt.resolution?.source)
+    }
+
+    @Test
+    fun aKernelValueThatDisagreesWithTheLinkLocalIsStillReportedAsKernelOnly() {
+        val attempt = HiCarAccessPointBssid.inspect(
+            info(bssid = "02:00:00:00:00:00", interfaceName = "p2p0"),
+            readSysfs = { null },
+            readKernel = { "0a:1b:2c:3d:4e:5f" },
+            deriveFromLinkLocal = { "0a:1b:2c:3d:4e:60" },
+        )
+        assertEquals(HiCarAccessPointBssid.Source.KERNEL, attempt.resolution?.source)
+    }
+
+    @Test
     fun aTotalFailureNamesEverySourceItTried() {
         val attempt = HiCarAccessPointBssid.inspect(
             info(bssid = null, interfaceName = null),
