@@ -11,6 +11,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -323,6 +324,10 @@ class HiCarHostActivity : ComponentActivity() {
     }
 
     private fun appendLog(line: String) {
+        // Mirrored into logcat: on a head unit with adb, `adb logcat -s HiCar` shows the same lines
+        // live, and the export file is no longer the only way to read a failed attempt. The tag is
+        // short on purpose — logcat truncates tags over 23 characters on older platforms.
+        Log.i(LOG_TAG, line)
         // The list is capped: a reconnect loop must not grow without bound on a head unit.
         if (log.size >= MAX_LOG_LINES) log.removeAt(0)
         log.add(line)
@@ -528,6 +533,9 @@ class HiCarHostActivity : ComponentActivity() {
     private companion object {
         const val MAX_LOG_LINES = 200
         const val MAX_HISTORY_LINES = 5_000
+
+        /** `adb logcat -s HiCar` on a head unit: short, and stable across sessions. */
+        const val LOG_TAG = "HiCar"
         const val PREFERENCES = "hicar-receiver"
         const val KEY_PIN = "connection_code"
         val PIN_PATTERN = Regex("[0-9]{6}")

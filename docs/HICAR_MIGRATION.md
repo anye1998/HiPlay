@@ -703,3 +703,18 @@ HiCar sniff: 3 0xFDEE advertisement(s) captured; payloads below
 **注意**：不要往车机上安装本 APK 去"试"。前装车机自带的 HiCar 服务已经在用 0xFDEE 广播、5 GHz 热点和
 RFCOMM 记录，我们的接收端会和它抢同一个射频与广播位；而且车机的 HiCar 栈是系统签名的，侧载 APK 既装不上，
 也代表不了我们的实现。车机的价值是**对照样本**，不是运行环境。
+
+### 7.13 换到有 adb 的安卓车机：判定清单独立成文
+
+车机（安卓、无前装 HiCar、有 adb）比平板更接近项目目标环境，而且 adb 让 7.10 的根因可以直接判定而不是推断。
+判定步骤写在 **`docs/HICAR_ADB.md`**，核心只有一步：
+
+> 在车机上跑本 APK 发出 0xFDEE 广播，用手机 nRF 看这条广播的 MAC，和 `dumpsys bluetooth_manager` 里的
+> `Address`（BR 地址）比。**相等** → 7.10 的阻塞在车机上不存在，可以继续调载荷与 RFCOMM；
+> **是 `0x4x–0x7x` 的私有地址** → 车机同样被封死，只能走改 ROM。
+
+同时配了 HCI 取证法（`btsnoop_hci.log` 里 `LE Set Advertising Parameters` 的 `Own_Address_Type`），
+这是"公开还是私有"的最终判据，不依赖任何推断。
+
+为此本轮把应用日志**镜像到 logcat**（tag `HiCar`）：车机上 `adb logcat -s HiCar` 与界面日志逐行一致，
+不用截图、不用导出文件。组件名也记在清单里（`com.shihab.diplay.hudtest/com.shilapi.xcertplay.HiCarLauncherAlias`）。
