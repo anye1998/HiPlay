@@ -19,6 +19,7 @@ import java.net.ServerSocket
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /** What the HiCar receiver is doing, for the driver and for diagnostics. */
 sealed class HiCarStatus {
@@ -83,6 +84,9 @@ class HiCarController(
     private val accept = Executors.newCachedThreadPool { runnable -> Thread(runnable, "hicar-accept") }
     private val sockets = CopyOnWriteArrayList<Closeable>()
     private val workers = CopyOnWriteArrayList<Thread>()
+
+    /** How many RFCOMM connections arrived; the waiting heartbeat reports it. */
+    private val connections = AtomicInteger(0)
 
     private var hotspot: WirelessHotspotManager? = null
     private var services: HiCarRfcommServices? = null
@@ -256,6 +260,35 @@ class HiCarController(
         val control = thread("hicar-control") { acceptLoop(rfcomm::acceptControl, control = true) }
         val business = thread("hicar-business") { acceptLoop(rfcomm::acceptBusiness, control = false) }
         onLog("HiCar listeners started: ${control.name}, ${business.name}")
+        startWaitingHeartbeat()
+    }
+
+    /**
+     * Says, once every 30 seconds, that the receiver is up and nobody has connected.
+     *
+     * Without it an exported log ends at "listeners started" and reads the same whether the phone
+     * never tried, tried and failed before RFCOMM, or the receiver had already died. Those need
+     * different next steps, so the log has to tell them apart.
+     */
+    private fun startWaitingHeartbeat() {
+        thread("hicar-wait") {
+            val startedAt = System.nanoTime()
+            while (running.get()) {
+                try {
+                    Thread.sleep(WAIT_HEARTBEAT_MILLIS)
+                } catch (interrupted: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return@thread
+                }
+                if (!running.get()) return@thread
+                val seconds = (System.nanoTime() - startedAt) / 1_000_000_000
+                onLog(
+                    "HiCar waiting for the phone: ${seconds}s, connections=$connections, " +
+                        "advertising=${if (advertiser != null) "on" else "off"}, " +
+                        "listeners=${if (services != null) "open" else "closed"}",
+                )
+            }
+        }
     }
 
     private fun acceptLoop(acceptSocket: () -> android.bluetooth.BluetoothSocket, control: Boolean) {
@@ -270,6 +303,7 @@ class HiCarController(
                 return
             }
             sockets.add(socket)
+            connections.incrementAndGet()
             accept.execute { serve(socket, control) }
         }
     }
@@ -428,6 +462,9 @@ class HiCarController(
         const val KIND_NETWORK_COMMAND = 33
         const val PREFERENCES = "hicar-receiver"
         const val KEY_SEQUENCE = "discovery_sequence"
+
+        /** Long enough to stay out of the way, short enough that a 2-minute test shows progress. */
+        const val WAIT_HEARTBEAT_MILLIS = 30_000L
 
         /** The phone usually takes the next address after the access point itself. */
         fun clientAddressFor(owner: String): String? {

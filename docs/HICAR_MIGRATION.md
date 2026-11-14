@@ -385,3 +385,53 @@ Wi-Fi P2P remove rejected code=2 reason=Wi-Fi P2P is busy
 即使拿到真实 MAC，也要确认它就是该组实际广播的 BSSID（Android 10+ 对 Wi-Fi Direct 做 per-group 随机化，
 内核接口地址通常正是广播值，但本项目没有真机证据）。`owner.deviceAddress` 是持久身份，可能与广播地址不同，
 故排在最后一位且日志会标注。
+
+### 7.5 第六次实测：链路全通，卡在手机不认识这台车机
+
+`hicar-log-20261114-123104.txt` 是本项目第一次把**接收端整条链路拉起来**：
+
+```
+Wi-Fi P2P ready mode=ALIGNED_5_GHZ band=5 GHz channel=161 frequencyMHz=5805 verified=true
+HiCar access point BSSID 32:59:B5:15:B1:22 from MAC decoded from the interface's IPv6 link-local address
+HiCar BSSID other sources: framework=02:00:00:00:00:00 (placeholder); sysfs=FileNotFoundException; kernel=unavailable; owner=02:00:00:00:00:00 (placeholder)
+HiCar access point ready on 5 GHz, control port 4005
+HiCar records ready: business channel 7, control on 0xFE35
+HiCar advertisement started (11 bytes of 0xFDEE service data)
+HiCar listeners started: hicar-control, hicar-business
+```
+
+四点解读：
+
+1. **BSSID 是 EUI-64 算出来的**：`32:59:B5:15:B1:22` 首字节 `0x32` 的本地管理位置位，符合 Android 为 Wi-Fi Direct
+   分配的随机化地址特征；`HiCarNetworkOffer` 接受了它，说明格式与信道都过关。**注意这不是"读到"的**，是从接口的
+   IPv6 链路本地地址反解出来的（`ff:fe` 标记存在才成立）。
+2. **内核来源仍然失败**（`kernel=unavailable`）。上一轮加 `libnetiface.so` 就是为了它，因此这一轮把它改成了可分辨的
+   三态：库未加载 / 内核表里没有该接口 / 接口有但无 `AF_PACKET` 项。三种原因的修法完全不同。
+3. **`owner` 也是占位值**，说明华为对 Wi-Fi Direct 设备地址同样做了屏蔽，不只是 `NetworkInterface`。
+4. **手机端不弹窗**（用户实测）。广播已成功、两个 RFCOMM 记录已监听，但手机没有反应——问题在**发现阶段**，不在协议层。
+
+**参考实现的关键差异（这一轮才看清）**：两个参考项目都不是"广播一开就完事"：
+
+- `hicar-android-receiver`：`MainActivity` 先发 `ACTION_REQUEST_DISCOVERABLE`，**返回成功后才** `startFdee()`；
+- `HelloCar`（BlueZ）：adapter 属性里 `Discoverable=true`、`LocalName="HelloCar"`。
+
+也就是说，**设备必须同时对 BR/EDR 可被发现**。0xFDEE 载荷（11 字节）里只有型号和序号，**没有车机 BR 地址**，
+手机拿到广播后要靠 inquiry 去找到这台设备的 BR 地址；设备不可被发现，广播就是"看得见、够不着"。
+
+**修复（本分支）**：
+
+- `HiCarHostActivity`：点 Start 时先检查 `scanMode`，不是 `SCAN_MODE_CONNECTABLE_DISCOVERABLE` 就发
+  `ACTION_REQUEST_DISCOVERABLE`（300 秒），返回后再启动接收端；已可发现则直接启动。另加 **Discoverable + start**
+  按钮，便于不停止会话地重新驱动。没有蓝牙设置 UI 的设备会记录"无法请求可发现"并继续（广播与热点本身仍有测试价值）。
+- `HiCarBleAdvertiser`：启动广播时打印 `address / mode / name / payload` 十六进制，把"没人反应"变成可解释的日志。
+- `HiCarController`：每 30 秒一条心跳
+  `HiCar waiting for the phone: 90s, connections=0, advertising=on, listeners=open`，
+  区分"手机从未尝试"与"手机连了但失败"——此前导出日志在这两种情况下一模一样。
+- `HiCarAccessPointBssid` 的 `kernel=` 原因改为具体三态。
+
+**必须说清的未验证点**：两个参考项目**自己也标注 FDEE 广播是未验证的实验**
+（ref1 的日志原文：`FDEE 广播启动成功：11 字节 service data；这不是 HiCar 连接成功`
+与 `未验证手机识别`）。所以"手机认识这个广播"这件事，在本项目和两个参考项目里都**没有成功证据**；
+可发现性是目前最能解释"手机不弹窗"的差异，但不是已被证实的充分条件。
+如果加上可发现性后手机仍不弹窗，下一个变量是**型号字节**（当前 `61460BEC` 是本机随机生成的，
+参考项目的测试向量用的是 `00040A04`），手机可能用型号去匹配它的设备库。

@@ -86,6 +86,7 @@ internal object HiCarAccessPointBssid {
         readSysfs: (String) -> String? = ::readInterfaceAddress,
         readKernel: (String) -> String? = NetInterfaceMac::read,
         deriveFromLinkLocal: (String) -> String? = HotspotInterfaceBssid::read,
+        describeKernel: (String) -> String = NetInterfaceMac::describe,
     ): Attempt {
         val name = info.interfaceName
         val reasons = ArrayList<String>(5)
@@ -110,7 +111,10 @@ internal object HiCarAccessPointBssid {
             val raw = runCatching { readKernel(name) }
             val value = raw.getOrNull()?.trim()?.takeIf(::usable)
             if (value == null) {
-                reasons += "kernel=${raw.exceptionOrNull()?.let { it.javaClass.simpleName } ?: "unavailable"}"
+                reasons += "kernel=" + (
+                    raw.exceptionOrNull()?.let { it.javaClass.simpleName }
+                        ?: runCatching { describeKernel(name) }.getOrDefault("unavailable")
+                    )
             }
             value
         } else null

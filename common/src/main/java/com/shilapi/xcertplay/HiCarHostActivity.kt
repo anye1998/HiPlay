@@ -1,6 +1,9 @@
 package com.shilapi.xcertplay
 
 import android.Manifest
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothManager
+import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -84,6 +87,19 @@ class HiCarHostActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Asks the system to make this device discoverable, then starts the receiver.
+     *
+     * Both reference receivers publish the 0xFDEE advertisement only while the device is discoverable
+     * over BR/EDR: the payload carries the model and a sequence number, not the car's BR address, so
+     * the phone has to find the address by inquiry. Without this the advertisement is visible but
+     * nothing can act on it, which is exactly what a phone that never prompts looks like.
+     */
+    private val discoverable = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        appendLog("Discoverable request finished: result=${result.resultCode}")
+        startReceiver()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         model = experimentalModel()
@@ -138,6 +154,7 @@ class HiCarHostActivity : ComponentActivity() {
                 }
                 Button(onClick = ::clearLog) { Text("Clear log") }
                 Button(onClick = ::resetPairing) { Text("Reset pairing") }
+                Button(onClick = ::requestDiscoverableThenStart) { Text("Discoverable + start") }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 // The export survives the session: a failed attempt is usually over by the time the
@@ -168,6 +185,25 @@ class HiCarHostActivity : ComponentActivity() {
         } else if (missingPermissions().isNotEmpty()) {
             permissions.launch(missingPermissions())
         } else {
+            requestDiscoverableThenStart()
+        }
+    }
+
+    /** Skips the system prompt when the device is already discoverable. */
+    private fun requestDiscoverableThenStart() {
+        if (bluetoothAdapter?.scanMode == BluetoothAdapter.SCAN_MODE_CONNECTABLE_DISCOVERABLE) {
+            appendLog("Already discoverable over Bluetooth")
+            startReceiver()
+            return
+        }
+        val request = Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE)
+            .putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, DISCOVERABLE_SECONDS)
+        try {
+            discoverable.launch(request)
+        } catch (missing: ActivityNotFoundException) {
+            // Head units without the Bluetooth settings UI cannot grant this; say so and continue,
+            // because the advertisement and the access point are still worth testing on their own.
+            appendLog("No activity can make this device discoverable; continuing without inquiry")
             startReceiver()
         }
     }
@@ -327,6 +363,9 @@ class HiCarHostActivity : ComponentActivity() {
         return needed
     }
 
+    private val bluetoothAdapter: BluetoothAdapter?
+        get() = getSystemService(BluetoothManager::class.java)?.adapter
+
     private fun missingPermissions(): Array<String> = requiredPermissions()
         .filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
         .toTypedArray()
@@ -387,5 +426,8 @@ class HiCarHostActivity : ComponentActivity() {
         const val PREFERENCES = "hicar-receiver"
         const val KEY_PIN = "connection_code"
         val PIN_PATTERN = Regex("[0-9]{6}")
+
+        /** The longest value the system accepts; bring-up sessions are short anyway. */
+        const val DISCOVERABLE_SECONDS = 300
     }
 }

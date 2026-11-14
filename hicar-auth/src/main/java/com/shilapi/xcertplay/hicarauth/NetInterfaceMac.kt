@@ -24,6 +24,26 @@ object NetInterfaceMac {
         return runCatching { nativeRead(interfaceName) }.getOrNull()?.takeIf { it.isNotBlank() }
     }
 
+    /**
+     * Why [read] returned nothing.
+     *
+     * "unavailable" was not good enough on the device: a library that failed to load and an interface
+     * the kernel does not expose need different fixes, and the log could not tell them apart.
+     */
+    fun describe(interfaceName: String?): String {
+        if (!loaded) return "libnetiface not loaded"
+        if (interfaceName.isNullOrBlank()) return "no interface name"
+        val named = runCatching {
+            java.net.NetworkInterface.getNetworkInterfaces()?.toList().orEmpty()
+        }.getOrDefault(emptyList())
+        val present = named.any { it.name == interfaceName }
+        if (!present) {
+            val visible = named.joinToString(",") { it.name }
+            return "no interface $interfaceName (visible: $visible)"
+        }
+        return "$interfaceName has no AF_PACKET entry"
+    }
+
     @JvmStatic
     private external fun nativeRead(interfaceName: String): String?
 }

@@ -10,6 +10,7 @@ import android.bluetooth.le.BluetoothLeAdvertiser
 import android.content.Context
 import android.os.ParcelUuid
 import java.io.Closeable
+import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
@@ -50,6 +51,14 @@ class HiCarBleAdvertiser(
             return false
         }
         stop()
+        // The phone cannot act on the advertisement unless it can also reach this device over BR/EDR,
+        // and that needs the device to be discoverable: the payload carries the model and a sequence
+        // number, not the car's address. Logging the adapter state makes "nobody reacted" explainable.
+        onLog(
+            "HiCar advertisement: address=${local.address ?: "none"}, " +
+                "mode=${describeScanMode(local.scanMode)}, name='${local.name ?: ""}', " +
+                "payload=${serviceData.joinToString(" ") { String.format(Locale.ROOT, "%02x", it) }}",
+        )
         val leAdvertiser = local.bluetoothLeAdvertiser ?: return false
         val started = CountDownLatch(1)
         val outcome = java.util.concurrent.atomic.AtomicReference<Boolean?>(null)
@@ -106,6 +115,13 @@ class HiCarBleAdvertiser(
         } catch (_: RuntimeException) {
             // Stopping an advertisement the platform already dropped is not an error.
         }
+    }
+
+    private fun describeScanMode(mode: Int): String = when (mode) {
+        BluetoothAdapter.SCAN_MODE_NONE -> "not connectable"
+        BluetoothAdapter.SCAN_MODE_CONNECTABLE -> "connectable, not discoverable"
+        BluetoothAdapter.SCAN_MODE_CONNECTABLE_DISCOVERABLE -> "discoverable"
+        else -> "mode $mode"
     }
 
     private fun reason(errorCode: Int): String = when (errorCode) {
