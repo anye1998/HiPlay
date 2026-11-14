@@ -67,7 +67,12 @@ stage() {
     echo "FAILED    ${elapsed}s  exit=$code"
     echo "--- last lines of $log ---"
     tail -n 25 "$log" | sed 's/^/  | /'
-    if [ -f scripts/build_stage_report.py ]; then
+    # A failing test is not a failing compile. Reporting it as "KOTLIN COMPILE" sends the reader
+    # looking for a syntax error that does not exist.
+    if grep -qE "tests completed, [0-9]+ failed|There were failing tests" "$log"; then
+        echo "  FAILED STAGE: UNIT TESTS (assertions failed; the code compiled)"
+        grep -E "^ *[A-Za-z0-9_.]+ > .* FAILED|tests completed," "$log" | head -10 | sed 's/^/  /'
+    elif [ -f scripts/build_stage_report.py ]; then
         python3 scripts/build_stage_report.py "$log" 2>/dev/null | sed 's/^/  /' || true
     fi
     exit 1

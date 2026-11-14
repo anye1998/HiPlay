@@ -341,3 +341,47 @@ HiCar access point rejected: HiCar AP BSSID
   关闭本轮热点、并写明确日志（`framework=…, interface=…`），**不发送占位地址**。
 - 单测 `HiCarAccessPointBssidTest` 9 个用例，含这台设备的形态：framework 给 `02:00:00:00:00:00`、
   sysfs 给真实地址 → 采用 sysfs；两源冲突 → 放弃；接口名含路径字符 → 不读文件。
+
+### 7.4 第五次实测：BSSID 两个来源都断了，同时踩到 removeGroup 的 BUSY
+
+装上带 `HiCarAccessPointBssid` 的 APK 再测（`hicar-log-20261114-115903.txt`），热点仍是 5 GHz 建组成功，
+BSSID 这一环报出了具体内容：
+
+```
+HiCar access point from Wi-Fi Direct at 5805 MHz
+HiCar cannot read this group's BSSID (framework=02:00:00:00:00:00, interface=p2p-p2p0-2); refusing to send a placeholder
+Wi-Fi P2P remove rejected code=2 reason=Wi-Fi P2P is busy
+```
+
+三个结论：
+
+1. **新增的失败日志起作用了**：这次能直接读到接口名 `p2p-p2p0-2`，不用再猜。
+2. **两个来源都不可用**：框架给占位 `02:00:00:00:00:00`；`/sys/class/net/p2p-p2p0-2/address` 也读不到
+   （华为在 Android 12 上封了这条路径，或该 netdev 名与 sysfs 项不一致）。
+3. **`WifiP2pGroupManager` 里其实还有一个没被尝试的来源**：`group.owner.deviceAddress`。它写在
+   `bssid = interfaceHardwareAddress(...) ?: group.owner?.deviceAddress` 的兜底位上，而占位地址**不是 null**，
+   于是兜底永远不触发。
+
+第四个现象是收尾时的 `remove rejected code=2 (BUSY)`：刚建组就拆，框架必然先回 BUSY，组便留在原地占着射频，
+下一次 Start 就得走"回收旧组"的路径。
+
+**修复（本分支）**：
+
+- **四来源解析 + 逐源说明**：`HiCarAccessPointBssid.inspect()` 依次尝试
+  框架接口地址 → sysfs → **内核接口表（新增 `libnetiface.so`）** → IPv6 链路本地 EUI-64 → `owner.deviceAddress`，
+  失败时把每个来源的结果写进日志，例如
+  `sysfs=FileNotFoundException; kernel=unavailable; link-local=interface p2p-p2p0-2 is gone; owner=absent`。
+- **直读内核**：`NetworkInterface.getHardwareAddress()` 的占位值是**框架层屏蔽**的结果，不是内核没有这个地址。
+  新增 `hicar-auth/src/main/cpp/netiface_jni.c`（`getifaddrs()` + `sockaddr_ll`），
+  拿到的就是 `ip link` 显示的值——包括 Android 为 Wi-Fi Direct 分配的随机化地址。四个 ABI 各 ~24 KB
+  （stripped 4–8 KB），`NEEDED` 只有 `libc/libm/libdl`。独立 `libnetiface.so`，不与 HiChain 引擎共命运。
+- **占位地址不再挡路**：`WirelessHotspotInfo` 新增 `groupOwnerDeviceAddress`（`bssid` 语义不变，CarPlay 不受影响），
+  作为最后一档来源；它本身是占位值时同样拒用。
+- **两源冲突的判定改了**：原来"冲突即放弃"，现在以 **sysfs 为准**并标注 `SYSFS_OVER_INTERFACE`。
+  理由是同名接口的 sysfs 值来自内核，框架值可能是接口重建后的缓存视图；这不是"猜"，是选更权威的那个来源。
+- **`removeGroup` 对 BUSY 重试一次**（600 ms 后），避免失败尝试把组留在射频上。
+
+**仍未验证的部分（不夸大）**：`libnetiface.so` 只验证了编译、符号导出与依赖，**没有在设备上跑过**；
+即使拿到真实 MAC，也要确认它就是该组实际广播的 BSSID（Android 10+ 对 Wi-Fi Direct 做 per-group 随机化，
+内核接口地址通常正是广播值，但本项目没有真机证据）。`owner.deviceAddress` 是持久身份，可能与广播地址不同，
+故排在最后一位且日志会标注。

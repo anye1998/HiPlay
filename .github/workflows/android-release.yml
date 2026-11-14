@@ -87,7 +87,11 @@ jobs:
         run: |
           unzip -l mobile/build/outputs/apk/debug/*.apk | grep -q "lib/arm64-v8a/libhicarauth.so"
           unzip -l mobile/build/outputs/apk/debug/*.apk | grep -q "lib/armeabi-v7a/libhicarauth.so"
-          echo "libhicarauth.so present in arm64-v8a and armeabi-v7a"
+          # The interface-address helper is a separate library on purpose; without it the HiCar
+          # credential string cannot carry a real BSSID and the connection stops one step later.
+          unzip -l mobile/build/outputs/apk/debug/*.apk | grep -q "lib/arm64-v8a/libnetiface.so"
+          unzip -l mobile/build/outputs/apk/debug/*.apk | grep -q "lib/armeabi-v7a/libnetiface.so"
+          echo "libhicarauth.so and libnetiface.so present in arm64-v8a and armeabi-v7a"
 
       - name: Name the failing build stage
         if: failure()
