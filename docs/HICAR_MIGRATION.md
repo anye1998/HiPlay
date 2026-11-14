@@ -698,15 +698,19 @@ HiCar sniff: 3 0xFDEE advertisement(s) captured; payloads below
 - 开发者选项里开"启用蓝牙 HCI 信息收集日志"，跑一次连接，再 `adb bugreport` 取 `btsnoop_hci.log`，
   用 Wireshark 看 `LE Set Advertising Parameters` 里的 **own_address_type**——这是"公开地址还是私有地址"的
   最终判据，比从广播地址反推更直接。
-- `adb shell dumpsys bluetooth_manager` 能看到车机侧 HiCar 服务的广播注册与状态。
+- `adb shell dumpsys bluetooth_manager` 能看到适配器地址、广播注册与扫描状态。没有前装 HiCar 的车机上
+  不存在"车机侧 HiCar 服务"，这一条看的是**蓝牙栈本身**，不是某个互联应用。
 
-**注意**：不要往车机上安装本 APK 去"试"。前装车机自带的 HiCar 服务已经在用 0xFDEE 广播、5 GHz 热点和
-RFCOMM 记录，我们的接收端会和它抢同一个射频与广播位；而且车机的 HiCar 栈是系统签名的，侧载 APK 既装不上，
-也代表不了我们的实现。车机的价值是**对照样本**，不是运行环境。
+**注意（仅适用于自带 HiCar 的车机）**：那种车机上不要安装本 APK 去"试"。它自带的 HiCar 服务已经在用 0xFDEE
+广播、5 GHz 热点和 RFCOMM 记录，我们的接收端会和它抢同一个射频与广播位；而且它的 HiCar 栈是系统签名的，
+侧载 APK 既装不上，也代表不了我们的实现。那种车机的价值是**对照样本**，不是运行环境。
+
+本项目的车机**两样都没有前装**（HiCar 与 CarPlay），所以结论相反：它没有自带服务可观察、也没有被占用的广播位，
+**本 APK 就是它唯一的互联栈**，直接装上去跑才是正确用法（见 7.13）。
 
 ### 7.13 换到有 adb 的安卓车机：判定清单独立成文
 
-车机（安卓、无前装 HiCar、有 adb）比平板更接近项目目标环境，而且 adb 让 7.10 的根因可以直接判定而不是推断。
+车机（安卓、**无前装 HiCar、无前装 CarPlay**、有 adb）比平板更接近项目目标环境，而且 adb 让 7.10 的根因可以直接判定而不是推断。
 判定步骤写在 **`docs/HICAR_ADB.md`**，核心只有一步：
 
 > 在车机上跑本 APK 发出 0xFDEE 广播，用手机 nRF 看这条广播的 MAC，和 `dumpsys bluetooth_manager` 里的
