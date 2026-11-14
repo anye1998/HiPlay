@@ -191,8 +191,20 @@ class HiCarBleAdvertiser(
         // and a receiver a phone only accepts as car audio would be ignored on that alone — but
         // BluetoothAdapter.getBluetoothClass() is not in the public SDK, so an app cannot even read
         // it, let alone set it. See the capability table in docs/HICAR_MIGRATION.md.
+        // A bond is the one thing that can turn this private advertising address back into something
+        // dialable: an LE bond gives the phone the IRK that resolves it to the tablet's identity
+        // address, which on a combo chip is its BR address. Without a bond there is nothing to
+        // resolve, so the address the phone reads from the advertisement leads nowhere.
+        val bonds = try {
+            local.bondedDevices
+                .map { "${it.address} '${it.name}'" }
+                .ifEmpty { listOf("none") }
+                .joinToString()
+        } catch (failure: Exception) {
+            failure.javaClass.simpleName
+        }
         return "HiCar advertisement: address=${read { local.address }}, mode=$mode, " +
-            "name='${read { local.name }}', " +
+            "name='${read { local.name }}', bonds=$bonds, " +
             "payload=${serviceData.joinToString(" ") { String.format(Locale.ROOT, "%02x", it) }}"
     }
 
