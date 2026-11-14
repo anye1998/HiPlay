@@ -9,6 +9,7 @@ class HiCarLogReportTest {
     private fun environment(
         connectionCode: String = "042917",
         running: Boolean = true,
+        audit: List<String> = listOf("--- device audit ---", "--- end of device audit ---"),
     ) = HiCarLogEnvironment(
         generated = "2026-11-13 14:30:00 +0800",
         applicationId = "com.shihab.diplay.hudtest",
@@ -23,6 +24,7 @@ class HiCarLogReportTest {
         connectionCode = connectionCode,
         running = running,
         status = "blocked: HiChain native engine is not bundled",
+        audit = audit,
     )
 
     @Test
@@ -77,5 +79,22 @@ class HiCarLogReportTest {
         val report = hicarLogReport(environment(), emptyList(), droppedLines = 0)
         assertTrue(report.contains("--- log (0 lines, oldest first) ---"))
         assertEquals(1, Regex("--- log \\(0 lines").findAll(report).count())
+    }
+
+    @Test
+    fun auditComesBeforeTheLogSoTheReaderSeesTheDeviceFirst() {
+        val report = hicarLogReport(
+            environment(audit = listOf("--- device audit ---", "build: test", "--- end of device audit ---")),
+            listOf("first"),
+            droppedLines = 0,
+        )
+        assertTrue(report.contains("build: test"))
+        assertTrue(report.indexOf("build: test") < report.indexOf("first"))
+    }
+
+    @Test
+    fun aFailedAuditSaysSoInsteadOfLookingComplete() {
+        val report = hicarLogReport(environment(audit = emptyList()), listOf("first"), droppedLines = 0)
+        assertTrue(report.contains("unavailable: the audit threw before producing a line"))
     }
 }

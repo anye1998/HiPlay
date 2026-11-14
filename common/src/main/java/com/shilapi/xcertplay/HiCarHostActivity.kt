@@ -78,6 +78,7 @@ class HiCarHostActivity : ComponentActivity() {
     private val history = ArrayList<String>()
     private var droppedFromHistory = 0
     private var exporting by mutableStateOf(false)
+    private var probing by mutableStateOf(false)
     private var exportUri by mutableStateOf<Uri?>(null)
     private var exportNotice by mutableStateOf("")
 
@@ -182,6 +183,13 @@ class HiCarHostActivity : ComponentActivity() {
                 // real head unit actually puts on the air.
                 Button(onClick = ::sniff) { Text("Sniff 0xFDEE (60s)") }
             }
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                // The same block the export carries, printed on screen: on a head unit without a
+                // file manager, reading it here and photographing it is faster than exporting.
+                Button(onClick = ::showAudit) { Text("Device audit") }
+                // Explicitly triggered, read-only, and it says so: reading bt_config.conf needs su.
+                Button(onClick = ::rootProbe) { Text("Root probe") }
+            }
             if (exportNotice.isNotEmpty()) {
                 Text(exportNotice, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
             }
@@ -233,6 +241,35 @@ class HiCarHostActivity : ComponentActivity() {
         sniffer = probe
         // 60 s: long enough to walk around the car while the head unit advertises.
         probe.start(null, 60_000L)
+    }
+
+    /** Prints the same device block the export carries, without leaving the screen. */
+    private fun showAudit() {
+        val lines = runCatching { HiCarDeviceAudit.collect(this) }.getOrElse {
+            listOf("device audit failed: ${it.javaClass.simpleName}: ${it.message}")
+        }
+        lines.forEach(::appendLog)
+    }
+
+    /**
+     * Runs the read-only root probe off the main thread.
+     *
+     * A separate button on purpose: this is the only code path that asks for superuser rights, and a
+     * refusal has to be a visible answer of its own rather than a line buried inside a Start attempt.
+     */
+    private fun rootProbe() {
+        if (probing) return
+        probing = true
+        appendLog("Root probe: asking su for a read-only look at bt_config.conf and dumpsys")
+        Thread {
+            val lines = runCatching { HiCarDeviceAudit.rootProbe() }.getOrElse {
+                listOf("root probe failed: ${it.javaClass.simpleName}: ${it.message}")
+            }
+            runOnUiThread {
+                lines.forEach(::appendLog)
+                probing = false
+            }
+        }.start()
     }
 
     private fun toggle() {
@@ -424,6 +461,9 @@ class HiCarHostActivity : ComponentActivity() {
                 connectionCode = pin,
                 running = running,
                 status = describe(status),
+                // Collected at export time so the file always reflects the device as it is now, not
+                // as it was when the screen was opened.
+                audit = runCatching { HiCarDeviceAudit.collect(this) }.getOrDefault(emptyList()),
             ),
             lines = history.toList(),
             droppedLines = droppedFromHistory,

@@ -20,6 +20,14 @@ internal data class HiCarLogEnvironment(
     val connectionCode: String,
     val running: Boolean,
     val status: String,
+    /**
+     * Device facts collected when the report was built, already formatted.
+     *
+     * A report that only says what the receiver did cannot explain a discovery failure, because the
+     * reason usually sits in the device: the advertised address, the permissions, the 5 GHz support.
+     * Empty means the audit itself failed, and the report says so rather than looking complete.
+     */
+    val audit: List<String> = emptyList(),
 )
 
 /**
@@ -49,6 +57,14 @@ internal fun hicarLogReport(
     appendLine("link: BLE 0xFDEE advertisement, insecure RFCOMM, channel negotiation, HiChain, DMSDP")
     if (droppedLines > 0) {
         appendLine("note: the oldest $droppedLines lines were dropped by the in-memory buffer")
+    }
+    appendLine()
+    if (environment.audit.isEmpty()) {
+        appendLine("--- device audit ---")
+        appendLine("unavailable: the audit threw before producing a line; the log below is still valid")
+        appendLine("--- end of device audit ---")
+    } else {
+        environment.audit.forEach { appendLine(it) }
     }
     appendLine()
     appendLine("--- log (${lines.size} lines, oldest first) ---")

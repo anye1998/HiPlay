@@ -718,3 +718,33 @@ RFCOMM 记录，我们的接收端会和它抢同一个射频与广播位；而�
 
 为此本轮把应用日志**镜像到 logcat**（tag `HiCar`）：车机上 `adb logcat -s HiCar` 与界面日志逐行一致，
 不用截图、不用导出文件。组件名也记在清单里（`com.shihab.diplay.hudtest/com.shilapi.xcertplay.HiCarLauncherAlias`）。
+
+**适用范围更正（15:05）**：7.12 的"拿真车机当对照样本"前提是那台车机**自带 HiCar**。本项目实际使用的车机
+**没有前装 HiCar**（用户确认），所以它没有可采集的 HiCar 广播——对它正确的做法是反过来：把本 APK 直接装上去当
+接收端，并用 adb 判定广播地址（见 7.13 与 `docs/HICAR_ADB.md`）。
+
+### 7.14 把取证做进 App：装上去、按两下、导出就有
+
+车机没有前装 HiCar、也没有前装 CarPlay（用户确认 15:05/15:06），所以它没有"自带服务可观察"，
+只能由我们自己的接收端去跑。为了让"跑一次 + 导出"就能拿到全部判据，本轮把 `docs/HICAR_ADB.md` 的 A–D 步
+搬进了应用：
+
+- **导出日志自带 `--- device audit ---` 段**（`HiCarDeviceAudit.collect()`），内容：
+  系统版本/机型/指纹、蓝牙开关与名称与 scanMode、**三个来源的本机地址**（API、Settings.Secure、内核 `/sys/class/net/*/address`）、
+  广播能力（`multipleAdvertisement`/`extendedAdvertising`/LE 2M/Coded/offloaded filtering）、已配对设备、
+  权限授予情况、Wi-Fi 与 5GHz、系统特性（`bluetooth_le`、`wifi.direct` 等）、su 是否存在。
+- **Device audit 按钮**：同一段直接打到界面，没有文件管理器的车机上拍照即可。
+- **Root probe 按钮**：显式触发、**只读**，`su -c` 跑三条命令读 `bt_config.conf`（含 `LE_LOCAL_KEY_IRK` 是否存在的判定）
+  与 `dumpsys bluetooth_manager` 的地址行。su 被拒时写明"未授予、未继续尝试"，不重试、不降级成猜测。
+- 每条拿不到的值都写明原因（`masked by the platform`、`needs API 26`、`FileNotFoundException`），
+  不静默省略、不用占位值假装读到。
+
+**一个必须记录的方法论更正**：7.10 用"首字节最高两位是 01 → RPA"来判定地址不可拨。这个推理**太强**：
+`4C:5E:0C` 既是真实 OUI，也符合私有地址的形状，光看字符串无法区分。可靠的两条判据是：
+
+1. 首字节的 **I/G 位为 1（奇数）** → 不可能是公开地址（公开地址必然是单播）。我们实际看到的
+   `65:…`、`51:…` 都满足这条，所以结论不变，理由更硬。
+2. 首字节最高两位为 **`10`（0x80–0xBF）** → 不可能是随机地址的合法形式 → 只能是公开地址。
+
+其余情况（`00`/`01` 开头且 I/G 位为 0）**是歧义的**，只能由扫描器打印的地址类型来定
+（`LE_ADV_IND` 的 TxAdd 位）。`HiCarDeviceAudit.addressType()` 就按这三种情况输出，歧义时明确写"ambiguous"。
