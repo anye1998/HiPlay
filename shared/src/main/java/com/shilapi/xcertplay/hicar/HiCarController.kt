@@ -214,10 +214,23 @@ class HiCarController(
             onLog("HiCar access point address has no free peer address")
             return null
         }
+        // The phone joins by BSSID, so a placeholder is worse than stopping: it produces a
+        // phone-side "network not found" with no clue on this side.
+        val bssid = HiCarAccessPointBssid.resolve(info)
+        if (bssid == null) {
+            report(HiCarStatus.Failed("hotspot bssid"))
+            onLog(
+                "HiCar cannot read this group's BSSID (framework=${info.bssid ?: "none"}, " +
+                    "interface=${info.interfaceName ?: "none"}); refusing to send a placeholder",
+            )
+            runCatching { hotspot?.close() }
+            return null
+        }
+        onLog("HiCar access point BSSID resolved from ${bssid.source.label}")
         val networkOffer = try {
             HiCarNetworkOffer(
                 ssid = info.ssid,
-                bssid = info.bssid.orEmpty(),
+                bssid = bssid.bssid,
                 passphrase = info.passphrase,
                 ownerAddress = owner,
                 clientAddress = client,

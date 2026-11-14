@@ -309,3 +309,35 @@ LocalOnlyHotspot reservation band=2.4 GHz channel=0
   （Wi-Fi Direct 在 API 31 受位置权限约束）；被拒时会**列出具体哪几项**，不再只说一句"权限未授予"。
 - 单测 `HiCarAccessPointsTest` 6 个用例，直接覆盖这台设备踩中的形态：
   `local-only hotspot settled on 2412 MHz → 关闭它 → 改用 Wi-Fi Direct 的 5745 MHz`。
+
+### 7.3 第四次实测：5 GHz 通了，卡在 BSSID 占位地址
+
+第二天用新 APK 再测（`hicar-log-20261114-114233.txt`），热点这一环**已经过了**：
+
+```
+Wi-Fi P2P preflight wifiEnabled=true locationEnabled=true permissionGranted=true stationMHz=5805 fiveGhzSupported=true
+Wi-Fi P2P create mode=ALIGNED_5_GHZ frequencyMHz=5805
+Wi-Fi P2P ready mode=ALIGNED_5_GHZ band=5 GHz channel=161 frequencyMHz=5805 verified=true
+HiCar access point from Wi-Fi Direct at 5805 MHz
+HiCar access point rejected: HiCar AP BSSID
+```
+
+解读：
+
+1. Wi-Fi Direct 建组成功，5 GHz 信道 161 / 5805 MHz，`verified=true`；说明上一轮的建网改造有效。
+2. 下一环立刻失败：`HiCarNetworkOffer` 的 BSSID 校验拒绝。原因是 `WifiP2pGroupManager` 从
+   `NetworkInterface.getHardwareAddress()` 拿到的 p2p 接口地址是 Android 的占位值 `02:00:00:00:00:00`，
+   而 HiCar 的凭据串必须带**真实** BSSID（占位地址会让手机"找不到网络"，在车机侧看起来像手机的问题）。
+3. 参考实现对此有专门处理：`OwnGroupAddress.read()` 同时读 `NetworkInterface` 与
+   `/sys/class/net/<iface>/address`，两者一致才采用；都不行时**明确失败并拒绝发送占位地址**
+   （`NetworkResource.Offer.ssidOnly` 虽然支持"无 BSSID"，但在参考项目里从未被调用，属未验证的死代码，不能用）。
+
+**修复**（本分支）：
+
+- 新增 `HiCarAccessPointBssid`：`usable()`（格式、单播位、排除 `02:00…`/`00:00…`）、
+  `choose()`（两源必须一致，不一致就不猜）、`resolve()`（优先 `NetworkInterface` 值，缺失或占位时读
+  `/sys/class/net/<iface>/address`，接口名先过白名单正则再拼路径）。
+- `HiCarController` 在构造 `HiCarNetworkOffer` 前先解析 BSSID；解析不到就报 `Failed("hotspot bssid")`、
+  关闭本轮热点、并写明确日志（`framework=…, interface=…`），**不发送占位地址**。
+- 单测 `HiCarAccessPointBssidTest` 9 个用例，含这台设备的形态：framework 给 `02:00:00:00:00:00`、
+  sysfs 给真实地址 → 采用 sysfs；两源冲突 → 放弃；接口名含路径字符 → 不读文件。
