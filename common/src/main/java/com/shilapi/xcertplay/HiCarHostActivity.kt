@@ -88,20 +88,31 @@ class HiCarHostActivity : ComponentActivity() {
     }
 
     /**
-     * Asks the system to make this device discoverable, then starts the receiver.
+     * The system's "allow other devices to find this device" prompt.
      *
      * Both reference receivers publish the 0xFDEE advertisement only while the device is discoverable
      * over BR/EDR: the payload carries the model and a sequence number, not the car's BR address, so
-     * the phone has to find the address by inquiry. Without this the advertisement is visible but
-     * nothing can act on it, which is exactly what a phone that never prompts looks like.
+     * the phone has to find the address by inquiry.
+     *
+     * It is deliberately *not* part of Start. A system activity that is missing or refuses the request
+     * used to take the whole receiver down with it, and the access point, RFCOMM records and
+     * advertisement are all worth testing without inquiry. Pressing Start keeps working exactly as
+     * before; this is an extra step the driver chooses.
      */
     private val discoverable = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-        appendLog("Discoverable request finished: result=${result.resultCode}")
-        startReceiver()
+        val verdict = if (result.resultCode > 0) "granted for ${result.resultCode}s" else "declined"
+        appendLog("Discoverable request $verdict; press Start to advertise")
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        installCrashRecorder()
+        // Shown before the first attempt so the exported report carries it even if the next run works.
+        HiCarCrashRecord.take(this)?.let { trace ->
+            appendLog("--- previous run ended with an uncaught exception ---")
+            trace.lineSequence().filter { it.isNotBlank() }.take(40).forEach { appendLog(it) }
+            appendLog("--- end of previous exception ---")
+        }
         model = experimentalModel()
         pin = storedPin()
         setContent {
@@ -154,7 +165,7 @@ class HiCarHostActivity : ComponentActivity() {
                 }
                 Button(onClick = ::clearLog) { Text("Clear log") }
                 Button(onClick = ::resetPairing) { Text("Reset pairing") }
-                Button(onClick = ::requestDiscoverableThenStart) { Text("Discoverable + start") }
+                Button(onClick = ::requestDiscoverable) { Text("Make discoverable") }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 // The export survives the session: a failed attempt is usually over by the time the
@@ -185,15 +196,21 @@ class HiCarHostActivity : ComponentActivity() {
         } else if (missingPermissions().isNotEmpty()) {
             permissions.launch(missingPermissions())
         } else {
-            requestDiscoverableThenStart()
+            startReceiver()
         }
     }
 
-    /** Skips the system prompt when the device is already discoverable. */
-    private fun requestDiscoverableThenStart() {
-        if (bluetoothAdapter?.scanMode == BluetoothAdapter.SCAN_MODE_CONNECTABLE_DISCOVERABLE) {
+    /**
+     * Asks for discoverability and reports the outcome, without touching the receiver.
+     *
+     * Every failure mode is caught and logged: a missing settings activity, a permission the ROM wants
+     * but the app does not hold, and whatever else the vendor stack throws. None of them should turn a
+     * diagnostic step into a crash.
+     */
+    private fun requestDiscoverable() {
+        val mode = runCatching { bluetoothAdapter?.scanMode }.getOrNull()
+        if (mode == BluetoothAdapter.SCAN_MODE_CONNECTABLE_DISCOVERABLE) {
             appendLog("Already discoverable over Bluetooth")
-            startReceiver()
             return
         }
         val request = Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE)
@@ -201,10 +218,14 @@ class HiCarHostActivity : ComponentActivity() {
         try {
             discoverable.launch(request)
         } catch (missing: ActivityNotFoundException) {
-            // Head units without the Bluetooth settings UI cannot grant this; say so and continue,
-            // because the advertisement and the access point are still worth testing on their own.
-            appendLog("No activity can make this device discoverable; continuing without inquiry")
-            startReceiver()
+            appendLog("No activity can make this device discoverable on this ROM")
+        } catch (denied: SecurityException) {
+            appendLog(
+                "Discoverable request was refused by the system " +
+                    "(${denied.javaClass.simpleName}: ${denied.message ?: "no detail"})",
+            )
+        } catch (failure: RuntimeException) {
+            appendLog("Discoverable request failed (${failure.javaClass.simpleName}: ${failure.message})")
         }
     }
 
@@ -221,12 +242,20 @@ class HiCarHostActivity : ComponentActivity() {
             deviceName = "HiCar receiver",
             pin = pin,
         )
-        val next = HiCarController(
-            context = this,
-            config = config,
-            report = { next -> runOnUiThread { status = next } },
-            onLog = { line -> runOnUiThread { appendLog(line) } },
-        )
+        val next = try {
+            HiCarController(
+                context = this,
+                config = config,
+                report = { next -> runOnUiThread { status = next } },
+                onLog = { line -> runOnUiThread { appendLog(line) } },
+            )
+        } catch (failure: RuntimeException) {
+            // A constructor that refuses its configuration is a bug, not a device failure; say which
+            // one instead of closing the screen.
+            running = false
+            appendLog("HiCar receiver could not start (${failure.javaClass.simpleName}: ${failure.message})")
+            return
+        }
         controller = next
         next.start()
     }
@@ -363,6 +392,26 @@ class HiCarHostActivity : ComponentActivity() {
         return needed
     }
 
+    /**
+     * Records an uncaught exception before the process dies, once.
+     *
+     * A static guard keeps a second instance (or a recreated activity) from stacking handlers, which
+     * would record the same crash several times.
+     */
+    private fun installCrashRecorder() {
+        if (crashHandlerInstalled) return
+        crashHandlerInstalled = true
+        val previous = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, failure ->
+            HiCarCrashRecord.record(
+                this,
+                failure,
+                SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date()),
+            )
+            previous?.uncaughtException(thread, failure)
+        }
+    }
+
     private val bluetoothAdapter: BluetoothAdapter?
         get() = getSystemService(BluetoothManager::class.java)?.adapter
 
@@ -429,5 +478,8 @@ class HiCarHostActivity : ComponentActivity() {
 
         /** The longest value the system accepts; bring-up sessions are short anyway. */
         const val DISCOVERABLE_SECONDS = 300
+
+        /** Static: an activity recreated by a configuration change must not wrap the handler twice. */
+        @Volatile private var crashHandlerInstalled = false
     }
 }
