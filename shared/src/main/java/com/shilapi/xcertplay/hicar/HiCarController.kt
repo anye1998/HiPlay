@@ -407,9 +407,13 @@ class HiCarController(
                     }
                     // A key does not mean the phone has finished with this channel: at 11:29 it sent
                     // another JSON envelope (oper_type 3, message 3) right after the handshake, and
-                    // answering that with an OPTIONS greeting is what killed the connection. The
-                    // protocol that arrives is what decides — not the fact that authentication ended.
-                    if (looksLikeEnvelope(buffer, read)) {
+                    // answering that with an OPTIONS greeting is what killed the connection.
+                    //
+                    // The switch is decided by the record marker, not by "this chunk is not JSON":
+                    // an envelope that spans two reads continues with a byte that is not `{`, and the
+                    // run at 11:53 died on exactly such a chunk. Anything that is not a DMSDP record
+                    // belongs to the envelope parser, which reports its own errors accurately.
+                    if (identity.awaitingRest || !isControlRecord(buffer, read)) {
                         for (reply in identity.feed(buffer, read)) {
                             output.write(reply)
                             output.flush()
@@ -427,7 +431,7 @@ class HiCarController(
                         continue
                     }
                     val key = authenticator.sessionKey
-                        ?: throw HiCarWireException("non-envelope bytes before authentication")
+                        ?: throw HiCarWireException("DMSDP record before authentication")
                     onLog("HiCar: the phone switched from envelopes to DMSDP records on the business channel")
                     session = openControlSession(output, key)
                     session?.let { opened ->
@@ -506,17 +510,17 @@ class HiCarController(
     }
 
     /**
-     * True when the bytes begin with a JSON object.
+     * True when the chunk begins with a DMSDP record marker (`0x00` plaintext, `0xAB encrypted`).
      *
-     * The phone's HiCar envelopes always start with `{`, while a DMSDP record starts with its
-     * marker byte, so the first non-space byte is enough to tell the two protocols apart on a
-     * channel that carries both.
+     * Deliberately a positive test rather than "not JSON": between the two protocols there is a third
+     * case — the continuation of a split envelope — and guessing it into the wrong branch costs a
+     * whole pairing run.
      */
-    private fun looksLikeEnvelope(data: ByteArray, count: Int): Boolean {
+    private fun isControlRecord(data: ByteArray, count: Int): Boolean {
         for (index in 0 until count) {
             val byte = data[index].toInt() and 0xFF
             if (byte == ' '.code || byte == '\t'.code || byte == '\r'.code || byte == '\n'.code) continue
-            return byte == '{'.code
+            return byte == HiCarCodes.RECORD_PLAINTEXT || byte == HiCarCodes.RECORD_ENCRYPTED
         }
         return false
     }

@@ -58,6 +58,25 @@ class HiCarAuthExchangeTest {
     }
 
     @Test
+    fun aSplitEnvelopeIsReassembledAndSaysItIsStillAwaitingTheRest() {
+        // The phone may finish an envelope in a second write, and that continuation does not start
+        // with '{'. Anything that decides the protocol from the first byte has to ask this first.
+        val engine = FakeAuthenticator()
+        val exchange = exchange(engine)
+        val bytes = identityEnvelope("8899AABBCCDDEEFF")
+        val cut = bytes.size / 2
+
+        val first = exchange.feed(bytes.copyOfRange(0, cut))
+        assertTrue("half an envelope is still pending", exchange.awaitingRest)
+        assertTrue(first.isEmpty())
+
+        val second = exchange.feed(bytes.copyOfRange(cut, bytes.size))
+        assertFalse(exchange.awaitingRest)
+        assertEquals(1, second.size)
+        assertEquals("8899AABBCCDDEEFF", engine.begun)
+    }
+
+    @Test
     fun anEnvelopeArrivingAfterTheOperationIsOverIsNotFedToTheEngineAgain() {
         // A bind derives its key before the exchange phase, so "a key exists" cannot be the gate for
         // stepping the engine: that is exactly what the run at 11:35 lost.

@@ -204,6 +204,14 @@ class HiCarHostActivity : ComponentActivity() {
                 Button(onClick = ::resetPairing) { Text("Reset pairing") }
                 Button(onClick = ::requestDiscoverable) { Text("Make discoverable") }
             }
+            // Drivers keep pressing this before every attempt. It is the one control that invalidates
+            // a working pairing, so the cost belongs next to it rather than in a comment.
+            Text(
+                "Only press Reset pairing to clear a pairing that went wrong: it wipes the stored " +
+                    "trust and issues a new code, so a phone that had finished pairing would have to " +
+                    "be paired again. The code itself survives restarts.",
+                style = MaterialTheme.typography.bodySmall,
+            )
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 // The export survives the session: a failed attempt is usually over by the time the
                 // driver decides to report it, and a screenshot loses the part above the fold.

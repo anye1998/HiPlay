@@ -95,6 +95,15 @@ internal class HiCarIdentityExchange(
     private var failed = false
     private var keyLength = 32
 
+    /**
+     * True while part of an envelope is buffered.
+     *
+     * A single envelope can span reads, and the continuation of one does not start with `{`. Anyone
+     * deciding what protocol a chunk belongs to has to ask this first: the run at 11:53 was killed by
+     * a chunk that began mid-envelope and was therefore mistaken for a different protocol.
+     */
+    val awaitingRest: Boolean get() = partial.isNotEmpty()
+
     /** Feeds business-channel bytes; returns the envelopes to send back. */
     fun feed(chunk: ByteArray, count: Int = chunk.size): List<ByteArray> {
         if (failed) throw HiCarWireException("authentication session finished")

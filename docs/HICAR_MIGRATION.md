@@ -1164,3 +1164,37 @@ HiChain step 3 completed the operation (phase=END_SUCCESS), out=1
 
 出现这两行说明 exchange 完成、凭据已落盘，手机不会再要密码，接下来才是 Wi-Fi 加入与 DMSDP
 （届时日志会打 `the phone switched from envelopes to DMSDP records`）。
+
+### 7.24 分流按"记录标记"判定，不再按"像不像 JSON"
+
+`hicar-log-20261115-115311.txt`（11:51–11:53）。三个 `Start` 里前两个 `connections=0`（手机没连），
+第三个连上了，但只走了 **1 步** 就断：
+
+```
+HiChain step 1: phase=KEY_AGREEMENT_PROCESSING, key=0B, error=0, out=1
+HiCar protocol stopped: non-envelope bytes before authentication
+```
+
+**这是我们上一轮引入的回归，不是手机的问题。** 7.22 的分流规则是"第一段字节以 `{` 开头 → 信封，否则 DMSDP"。
+可是**一条信封可能分两次写入**：第二次的开头是 JSON 的中间内容（例如 `"` 或数字），
+于是被判成"非信封"，直接抛 `non-envelope bytes` 断链。同一份日志里前面的 `step 1` 成功、`step 2` 失败，
+正是这种跨包边界造成的。
+
+**修法：判据改成"这段字节是不是一条 DMSDP 记录的标记"（`0x00` 明文 / `0xAB` 密文），而不是"像不像 JSON"。**
+两协议之间存在第三种情况——被拆开的信封续包——用"不是 JSON 就换协议"必然误判；用正向标记判定则不会：
+
+```kotlin
+if (identity.awaitingRest || !isControlRecord(buffer, read)) {   // 默认仍走信封
+    ... identity.feed(...)
+}
+```
+
+`HiCarIdentityExchange.awaitingRest` 是本轮新增的：只要缓冲区里还有半条信封，下一位字节就属于它。
+单测 `aSplitEnvelopeIsReassembledAndSaysItIsStillAwaitingTheRest` 把这条锁住（拆成两半喂，第一半必须
+`awaitingRest=true` 且无回包，第二半才组装出信封）。
+
+**同时回答一个反复出现的操作疑问**：**不需要每次按 `Reset pairing`。** 六位码存在首选项里，重启不变，
+只有按 Reset（或清数据）才会换。Reset 的真实代价是**清掉 `files/hicar-huks` 里的信任材料**——
+一旦某次配对真的完成，按它等于把手机已存的凭据作废。因此界面在按钮下加了一行说明：
+只在配对出错时按；配对成功后不要再按。（当前尚未有任何一次配对完成，所以现在每次都需要输码，
+这是"配对未完成"的结果，不是"码会变"的结果。）
