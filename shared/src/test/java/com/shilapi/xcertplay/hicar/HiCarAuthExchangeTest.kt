@@ -58,8 +58,22 @@ class HiCarAuthExchangeTest {
     }
 
     @Test
-    fun aKeyLengthOtherThanSixteenOrThirtyTwoIsRefused() {
-        val exchange = exchange(FakeAuthenticator())
+    fun anEnvelopeArrivingAfterTheOperationIsOverIsNotFedToTheEngineAgain() {
+        // A bind derives its key before the exchange phase, so "a key exists" cannot be the gate for
+        // stepping the engine: that is exactly what the run at 11:35 lost.
+        val engine = FakeAuthenticator()
+        engine.operationComplete = true
+        val exchange = exchange(engine)
+        exchange.feed(identityEnvelope("8899AABBCCDDEEFF"))
+
+        val replies = exchange.feed(authEnvelope(message = 3, keyLength = 32))
+
+        assertTrue("a finished operation must not be stepped again", engine.lengths.isEmpty())
+        assertTrue(replies.isEmpty())
+    }
+
+    @Test
+    fun aKeyLengthOtherThanSixteenOrThirtyTwoIsRefused() {        val exchange = exchange(FakeAuthenticator())
         exchange.feed(identityEnvelope("8899AABBCCDDEEFF"))
         try {
             exchange.feed(authEnvelope(message = 17, keyLength = 20))
@@ -137,6 +151,8 @@ class HiCarAuthExchangeTest {
             private set
 
         override val complete: Boolean get() = sessionKey != null
+
+        override var operationComplete: Boolean = false
 
         override fun begin(peerIdentity: String) {
             begun = peerIdentity

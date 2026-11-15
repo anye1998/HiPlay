@@ -24,11 +24,15 @@ internal class HiChainAuthenticator(
     private var handle: Long = 0
     private var started = false
     private var stepIndex = 0
+    private var operationDone = false
 
     override var sessionKey: ByteArray? = null
         private set
 
     override val complete: Boolean get() = sessionKey != null
+
+    /** The engine's own end marker; a bind only reaches it after the exchange phase. */
+    override val operationComplete: Boolean get() = operationDone
 
     override fun begin(peerIdentity: String) {
         if (!HiChainNative.available) {
@@ -51,6 +55,7 @@ internal class HiChainAuthenticator(
         }
         started = true
         stepIndex = 0
+        operationDone = false
         // The code the engine will authenticate with, masked. A run where this does not match the
         // code on the screen has one obvious explanation, and the log should be able to show it
         // without anyone having to reproduce the screen.
@@ -96,6 +101,15 @@ internal class HiChainAuthenticator(
             sessionKey = key
             onLog("HiChain step $stepIndex finished: ${key.size}-byte session key")
         }
+        if (step.completed) {
+            // The bind exchange has been parsed and answered at this point. This, not the key, is
+            // what says the engine is done with the session.
+            operationDone = true
+            onLog(
+                "HiChain step $stepIndex completed the operation (phase=${step.describe()}), " +
+                    "out=${step.packets.size}",
+            )
+        }
         return step.packets
     }
 
@@ -109,6 +123,14 @@ internal class HiChainAuthenticator(
                 "HiChain ended after $stepIndex step(s) with no session key: either the phone rejected " +
                     "the confirm, or it closed while the exchange was still mid-phase — the step lines " +
                     "above carry the phase it reached",
+            )
+        }
+        // A key without a finished operation is the bind exchange abandoned half-way: the phone has
+        // its side done, we have a key, and the channel still dies — the case at 11:35.
+        if (started && stepIndex > 0 && sessionKey != null && !operationDone) {
+            onLog(
+                "HiChain ended after $stepIndex step(s) with a key but before the operation finished " +
+                    "(phase never reached END_SUCCESS); the exchange phase was incomplete",
             )
         }
         if (handle != 0L) {

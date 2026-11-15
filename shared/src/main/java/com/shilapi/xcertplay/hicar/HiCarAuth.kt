@@ -53,7 +53,18 @@ internal interface HiCarAuthenticator : Closeable {
     /** Non-null only after a successful authentication; 16 or 32 bytes. */
     val sessionKey: ByteArray?
 
+    /** True once a key exists. Note this happens *before* the operation itself is over. */
     val complete: Boolean
+
+    /**
+     * True once the engine reports the whole operation finished.
+     *
+     * A first-time bind derives the session key at the end of key agreement and then sends the
+     * exchange phase — 661 bytes of peer auth info in the run at 11:35 — which the engine must still
+     * parse and answer. Treating [complete] as "stop feeding" discarded that phase, left the phone
+     * waiting and cost the driver a second PIN prompt.
+     */
+    val operationComplete: Boolean
 }
 
 /**
@@ -175,11 +186,10 @@ internal class HiCarIdentityExchange(
                 if (!identityExchanged) throw HiCarWireException("authentication order")
                 val engine = authenticator
                     ?: throw HiCarAuthException(HiCarAuthBlocker.NATIVE_HICHAIN_LIBRARY_MISSING)
-                // The phone keeps using this envelope after the key exists — the run at 11:29 showed
-                // a message:3 arriving there. Feeding it to the engine again would step a finished
-                // session, so the message is recorded and left unanswered instead of ending the
-                // connection: what the phone says next is the only way to learn the sequence.
-                if (engine.complete) {
+                // The gate is the engine's own "operation over", not "a key exists": a bind derives
+                // the key at the end of key agreement and then still expects the exchange phase.
+                // The run at 11:35 sent exactly that (message 3, 661 bytes) and got nothing back.
+                if (engine.operationComplete) {
                     onLog(
                         "HiCar envelope after authentication: oper_type=$operType, " +
                             "message=${data.optInt("message", -1)}, keys=${keysOf(data)}, " +
@@ -252,6 +262,7 @@ internal class HiCarUnavailableAuthenticator(
 ) : HiCarAuthenticator {
     override val sessionKey: ByteArray? get() = null
     override val complete: Boolean get() = false
+    override val operationComplete: Boolean get() = false
 
     override fun begin(peerIdentity: String) = Unit
 

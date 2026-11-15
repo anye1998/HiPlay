@@ -1119,3 +1119,48 @@ HiCar envelope after authentication: oper_type=3, message=3, keys=..., N bytes; 
 顺带记录一个与本改动无关的环境问题：`:shared:testDebugUnitTest` 里
 `AmbientWorkerOwnerLockSymlinkTest` 三项失败，原因是 Windows 创建符号链接需要特权
 （`FileSystemException: 客户端没有所需的特权`），属本机权限限制，不是代码回归；其余 1868 项通过。
+
+### 7.23 鉴权后的 `message 3` 是 BIND 的 exchange 阶段，不是可有可无的通知
+
+`hicar-log-20261115-113545.txt`（11:35）。上一轮的分流生效了——不再误判 DMSDP、不再主动断链——于是第一次
+看清手机在鉴权后到底要什么：
+
+```
+HiChain finished: 32-byte session key; the phone keeps the envelope channel for now, DMSDP starts when it switches
+HiCar envelope after authentication: oper_type=3, message=3, keys=message,payload, 661 bytes; no reply is defined for it yet
+HiCar channel closed: IOException          <- 我们没回，手机关掉连接并重开流程
+```
+
+**这 661 字节是 HiChain 的 exchange 请求。** `hichain.c` 的消息与结果映射写得很清楚：
+
+```c
+{ PAKE_REQUEST, ... , KEY_AGREEMENT_STATE },
+{ PAKE_CLIENT_CONFIRM, KEY_AGREEMENT_END, OPERATION_STATE },
+{ EXCHANGE_REQUEST, END_SUCCESS, OVER_STATE },      // <- 这一步之后才算整个操作结束
+```
+
+也就是说首次绑定（BIND）分两段：**PAKE 协商**（此时就派生出 session key）→ **exchange**（双方交换各自的
+认证凭据并落盘）。我们在第一段结束就把引擎"关掉"了（`if (engine.complete)`，而 `complete` 只表示"有 key"），
+第二段完全没喂进去，手机等不到 `EXCHANGE_RESPONSE`，于是关连接、重开流程、再要一次密码。
+
+**修法：判据从"有 key"改成"引擎说操作结束"。**
+
+- `HiChainNative.Step.completed`：`error == 0 && result == END_SUCCESS(0)`，这是 `OVER_STATE` 的标志。
+- `HiCarAuthenticator.operationComplete`：新增，`HiChainAuthenticator` 在 `step.completed` 时置位；
+  `begin()` 重置。`complete`（有 key）保留，但它不再决定"是否继续喂引擎"。
+- `HiCarAuth` 的 `OPER_AUTH` 分支改为 `if (engine.operationComplete) 记录并忽略 else 正常 step`，
+  于是 `message 3` 会被当作 exchange 请求处理，引擎据此产出 `EXCHANGE_RESPONSE`，装进信封回给手机。
+- `close()` 增加一种独立结论：**有 key 但操作未完成**（`HiChain ended ... with a key but before the
+  operation finished`）——这正是 11:35 的情形，以前这种情况一句话都不留。
+- 单测：`anEnvelopeArrivingAfterTheOperationIsOverIsNotFedToTheEngineAgain`（操作结束后不再 step），
+  与原有"有 key 但 END_FAILED 不许导出""没 key 不算完成"共同锁住三种状态。
+
+**下一步预期**：
+
+```
+HiChain step 3: engine=0, phase=END_SUCCESS, key=32B, error=0, out=1
+HiChain step 3 completed the operation (phase=END_SUCCESS), out=1
+```
+
+出现这两行说明 exchange 完成、凭据已落盘，手机不会再要密码，接下来才是 Wi-Fi 加入与 DMSDP
+（届时日志会打 `the phone switched from envelopes to DMSDP records`）。

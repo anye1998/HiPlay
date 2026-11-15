@@ -80,6 +80,15 @@ class HiChainNative private constructor() {
             val finished: Boolean
                 get() = error == 0 && result != RESULT_END_FAILED && keyLength in setOf(16, 32)
 
+            /**
+             * True once the engine reports the operation itself as over (`END_SUCCESS`).
+             *
+             * A bind reaches [finished] at the end of key agreement, then still needs the exchange
+             * phase before the engine is done. [completed] is the gate for "stop feeding this
+             * session"; [finished] only says a key exists.
+             */
+            val completed: Boolean get() = error == 0 && result == RESULT_END_SUCCESS
+
             /** The phase names above, so a log line says "KEY_AGREEMENT_END" and not "3". */
             fun describe(): String = when (result) {
                 0 -> "END_SUCCESS"
@@ -114,6 +123,9 @@ class HiChainNative private constructor() {
 
         /** `END_FAILED` from the engine's own `hc_result` enum; the only result that is a failure. */
         private const val RESULT_END_FAILED = 1
+
+        /** `END_SUCCESS`: the whole operation is over, exchange phase included. */
+        private const val RESULT_END_SUCCESS = 0
 
         /** The store directory, created 0700 so the native check accepts it. */
         fun storeDirectory(file: File): File = file.apply {
