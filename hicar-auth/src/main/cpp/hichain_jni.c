@@ -19,7 +19,9 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdarg.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -29,6 +31,8 @@
 #include <mbedtls/sha256.h>
 
 #include "hichain.h"
+#include "hks_client.h"
+#include "hks_errno.h"
 #include "hks_file_api.h"
 #include "hks_hardware_api.h"
 
@@ -47,6 +51,11 @@ static const char SERVICE_TYPE[] = "CarDevice";
 
 static int g_root_fd = -1;
 static uint8_t g_udid[32];
+
+/* hks_init's own status. Kept rather than only returned, because a key-store failure must not stop
+ * the beacon: discovery and key agreement work without it, and the self-test has to be able to say
+ * which layer is broken instead of reporting "HiChain failed". */
+static int32_t g_hks_status = HKS_ERROR_NOT_SUPPORTED;
 
 static int storage_name_allowed(const char *name)
 {
@@ -262,8 +271,146 @@ Java_com_shilapi_xcertplay_hicarauth_HiChainNative_init(JNIEnv *env, jclass claz
     if (result != 0) {
         close(g_root_fd);
         g_root_fd = -1;
+        return result;
     }
-    return result;
+    /* Loads the key store and initialises the root key component. A failure here breaks the
+     * exchange phase but not discovery or key agreement, so it is recorded instead of returned:
+     * refusing to start would turn a key-store problem into "nothing works at all". */
+    g_hks_status = hks_init();
+    return 0;
+}
+
+/*
+ * Exercises the exact huks calls HiChain's bind exchange makes, in order, on one throwaway alias.
+ *
+ * The car is the only place these run for real, and driving to it to learn that signing is broken
+ * costs a test cycle; this runs on any device that can install the APK. Every line is a separate
+ * call with its own status, so a failure names the step instead of the subsystem.
+ */
+JNIEXPORT jstring JNICALL
+Java_com_shilapi_xcertplay_hicarauth_HiChainNative_selfTest(JNIEnv *env, jclass clazz)
+{
+    (void)clazz;
+    static const char SELF_ALIAS[] = "hicar.selftest";
+    static const char PEER_ALIAS[] = "hicar.selftest.peer";
+    static const uint8_t SELF_ID[] = "self-test";
+    static const uint8_t PEER_ID[] = "peer-test";
+    static const char MESSAGE[] = "hicar huks self test";
+
+    char report[1024];
+    uint32_t used = 0;
+    uint32_t failures = 0;
+
+    /* One line per call: "PASS <what> (<status>)". A FAIL line never hides the status either. */
+    #define ST_LINE(ok, ...) do { \
+        char line[192]; \
+        (void)snprintf(line, sizeof(line), __VA_ARGS__); \
+        int written = snprintf(report + used, sizeof(report) - used, "%s %s\n", (ok) ? "PASS" : "FAIL", line); \
+        if (written > 0) { \
+            used += (uint32_t)written; \
+            if (used >= sizeof(report)) used = sizeof(report) - 1; \
+        } \
+        if (!(ok)) failures++; \
+    } while (0)
+
+    if (g_root_fd < 0) {
+        return (*env)->NewStringUTF(env, "FAIL engine not initialised (no store directory)\n");
+    }
+
+    ST_LINE(g_hks_status == HKS_SUCCESS, "hks_init: status=%d", g_hks_status);
+
+    struct hks_blob self_alias = { HKS_BLOB_TYPE_ALIAS, (uint8_t *)SELF_ALIAS, sizeof(SELF_ALIAS) - 1 };
+    struct hks_blob peer_alias = { HKS_BLOB_TYPE_ALIAS, (uint8_t *)PEER_ALIAS, sizeof(PEER_ALIAS) - 1 };
+
+    /* A previous run may have left the alias behind; the test must not depend on a clean store. */
+    (void)hks_delete_key(&self_alias);
+    (void)hks_delete_key(&peer_alias);
+
+    struct hks_key_param pair_param;
+    memset(&pair_param, 0, sizeof(pair_param));
+    pair_param.key_type = HKS_KEY_TYPE_EDDSA_KEYPAIR_ED25519;
+    pair_param.key_usage = HKS_KEY_USAGE_SIGN | HKS_KEY_USAGE_VERIFY;
+    pair_param.key_mode = HKS_ALG_GCM;
+    pair_param.key_len = HKS_PUBLIC_BYTES_ED25519;
+    pair_param.key_auth_id.type = HKS_BLOB_TYPE_AUTH_ID;
+    pair_param.key_auth_id.data = (uint8_t *)SELF_ID;
+    pair_param.key_auth_id.size = sizeof(SELF_ID) - 1;
+
+    int32_t status = hks_generate_key(&self_alias, &pair_param);
+    ST_LINE(status == HKS_SUCCESS, "hks_generate_key (Ed25519 pair): status=%d", status);
+
+    uint8_t public_key[HKS_PUBLIC_BYTES_ED25519];
+    struct hks_blob public_blob = { HKS_BLOB_TYPE_KEY, public_key, sizeof(public_key) };
+    status = hks_export_public_key(&self_alias, &public_blob);
+    ST_LINE(status == HKS_SUCCESS && public_blob.size == HKS_PUBLIC_BYTES_ED25519,
+        "hks_export_public_key: status=%d, bytes=%u", status, public_blob.size);
+
+    uint8_t digest[32];
+    (void)mbedtls_sha256_ret((const uint8_t *)MESSAGE, sizeof(MESSAGE) - 1, digest, 0);
+    struct hks_blob hash = { HKS_BLOB_TYPE_KEY, digest, sizeof(digest) };
+
+    struct hks_key_param sign_param;
+    memset(&sign_param, 0, sizeof(sign_param));
+    sign_param.key_type = HKS_KEY_TYPE_EDDSA_KEYPAIR_ED25519;
+    sign_param.key_usage = HKS_KEY_USAGE_SIGN;
+    sign_param.key_mode = HKS_ALG_GCM;
+
+    uint8_t signature[HKS_SIGNATURE_MIN_SIZE];
+    struct hks_blob signature_blob = { HKS_BLOB_TYPE_KEY, signature, sizeof(signature) };
+    status = hks_asymmetric_sign(&self_alias, &sign_param, &hash, &signature_blob);
+    ST_LINE(status == HKS_SUCCESS && signature_blob.size == HKS_SIGNATURE_MIN_SIZE,
+        "hks_asymmetric_sign: status=%d, bytes=%u", status, signature_blob.size);
+
+    struct hks_key_param verify_param;
+    memset(&verify_param, 0, sizeof(verify_param));
+    verify_param.key_type = HKS_KEY_TYPE_EDDSA_PUBLIC_KEY_ED25519;
+    verify_param.key_usage = HKS_KEY_USAGE_VERIFY;
+    verify_param.key_mode = HKS_ALG_GCM;
+
+    /* The exchange phase verifies with the peer's raw public key, not with an alias: this exact
+     * call is the one that used to answer HKS_ERROR_NOT_SUPPORTED (error 29 downstream). */
+    status = hks_asymmetric_verify(&public_blob, &verify_param, &hash, &signature_blob);
+    ST_LINE(status == HKS_SUCCESS, "hks_asymmetric_verify (fresh signature): status=%d", status);
+
+    /* A verifier that accepts anything would also pass the line above, so break one bit. */
+    signature[0] ^= 0x01;
+    status = hks_asymmetric_verify(&public_blob, &verify_param, &hash, &signature_blob);
+    signature[0] ^= 0x01;
+    ST_LINE(status != HKS_SUCCESS, "hks_asymmetric_verify (tampered signature rejected): status=%d", status);
+
+    struct hks_key_param import_param;
+    memset(&import_param, 0, sizeof(import_param));
+    import_param.key_type = HKS_KEY_TYPE_EDDSA_PUBLIC_KEY_ED25519;
+    import_param.key_usage = HKS_KEY_USAGE_ENCRYPT | HKS_KEY_USAGE_DECRYPT;
+    import_param.key_mode = HKS_ALG_GCM;
+    import_param.key_len = HKS_PUBLIC_BYTES_ED25519;
+    import_param.key_auth_id.type = HKS_BLOB_TYPE_AUTH_ID;
+    import_param.key_auth_id.data = (uint8_t *)PEER_ID;
+    import_param.key_auth_id.size = sizeof(PEER_ID) - 1;
+
+    status = hks_import_public_key(&peer_alias, &import_param, &public_blob);
+    ST_LINE(status == HKS_SUCCESS, "hks_import_public_key (peer): status=%d", status);
+
+    status = hks_is_key_exist(&peer_alias);
+    ST_LINE(status == HKS_SUCCESS, "hks_is_key_exist (peer, after import): status=%d", status);
+
+    status = hks_delete_key(&peer_alias);
+    ST_LINE(status == HKS_SUCCESS, "hks_delete_key (peer): status=%d", status);
+    status = hks_is_key_exist(&peer_alias);
+    ST_LINE(status != HKS_SUCCESS, "hks_is_key_exist (peer, after delete): status=%d", status);
+
+    status = hks_delete_key(&self_alias);
+    ST_LINE(status == HKS_SUCCESS, "hks_delete_key (self): status=%d", status);
+
+    #undef ST_LINE
+
+    char verdict[64];
+    (void)snprintf(verdict, sizeof(verdict), "verdict: %s (%u failure(s))\n",
+        (failures == 0) ? "PASS" : "FAIL", failures);
+    if (used + strlen(verdict) < sizeof(report)) {
+        memcpy(report + used, verdict, strlen(verdict) + 1);
+    }
+    return (*env)->NewStringUTF(env, report);
 }
 
 JNIEXPORT jlong JNICALL

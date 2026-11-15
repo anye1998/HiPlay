@@ -203,6 +203,9 @@ class HiCarHostActivity : ComponentActivity() {
                 Button(onClick = ::clearLog) { Text("Clear log") }
                 Button(onClick = ::resetPairing) { Text("Reset pairing") }
                 Button(onClick = ::requestDiscoverable) { Text("Make discoverable") }
+                // The key store is what the bind exchange signs with, and a broken one is invisible
+                // until a phone is present. This runs the same calls without a phone.
+                Button(onClick = ::cryptoSelfTest) { Text("Crypto self-test") }
             }
             // Drivers keep pressing this before every attempt. It is the one control that invalidates
             // a working pairing, so the cost belongs next to it rather than in a comment.
@@ -310,6 +313,50 @@ class HiCarHostActivity : ComponentActivity() {
                 probing = false
             }
         }.start()
+    }
+
+    /**
+     * Runs the key store's self-test and prints every line.
+     *
+     * It needs no phone and no radio, so it can run on the bench: a bind's exchange phase signs with
+     * a long-term Ed25519 key and verifies the peer's signature, and when either of those is broken
+     * the phone can only say "wrong password". This says which call returned what.
+     */
+    private fun cryptoSelfTest() {
+        val config = HiCarRuntimeConfig(
+            model = model,
+            localIdentity = identity(),
+            deviceName = "HiCar receiver",
+            pin = pin,
+        )
+        appendLog("HiChain self-test: running (no phone needed)")
+        Thread({
+            val tester = try {
+                HiCarController(
+                    context = this,
+                    config = config,
+                    report = {},
+                    onLog = { line -> runOnUiThread { appendLog(line) } },
+                )
+            } catch (failure: RuntimeException) {
+                runOnUiThread {
+                    appendLog("HiChain self-test: could not build the receiver (${failure.javaClass.simpleName})")
+                }
+                return@Thread
+            }
+            try {
+                tester.cryptoSelfTest()
+            } catch (failure: RuntimeException) {
+                runOnUiThread {
+                    appendLog(
+                        "HiChain self-test: threw ${failure.javaClass.simpleName}: ${failure.message}",
+                    )
+                }
+            } finally {
+                // The instance never started, so this only releases what it allocated.
+                runCatching { tester.close() }
+            }
+        }, "hicar-selftest").start()
     }
 
     private fun toggle() {

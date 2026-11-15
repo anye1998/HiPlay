@@ -59,6 +59,17 @@ class HiChainNative private constructor() {
         @Synchronized
         external fun close(handle: Long)
 
+        /**
+         * Runs the key-store calls a bind's exchange phase makes, in order, on a throwaway alias.
+         *
+         * Returns one line per call plus a verdict, or null when the engine is not in this build.
+         * The point is that this runs anywhere the APK installs: finding out on the car that
+         * Ed25519 signing is broken costs a whole test cycle.
+         */
+        @JvmStatic
+        @Synchronized
+        external fun selfTest(): String?
+
         /** One engine step: what the engine wants sent, plus what it reported. */
         class Step(
             val code: Int,

@@ -10,6 +10,7 @@
  */
 
 #include <stddef.h>
+#include <string.h>
 
 #include "ed25519.h"
 
@@ -38,4 +39,22 @@ HICAR_EXPORT int ED25519_verify(const unsigned char *message, size_t message_len
         return 0;
     }
     return ed25519_verify(signature, message, message_len, public_key);
+}
+
+/*
+ * OpenSSL order: (out_public_key, private_key), where private_key is the 32-byte seed.
+ *
+ * huks stores a key pair as 64 bytes of seed||public, derives the public half with this call right
+ * after generating the seed, and signs with the same layout, so the seed is the only input here.
+ */
+HICAR_EXPORT void ED25519_public_from_private(unsigned char out_public_key[32],
+    const unsigned char private_key[32])
+{
+    unsigned char expanded[64];
+
+    if (out_public_key == NULL || private_key == NULL) {
+        return;
+    }
+    ed25519_create_keypair(out_public_key, expanded, private_key);
+    memset(expanded, 0, sizeof(expanded));
 }

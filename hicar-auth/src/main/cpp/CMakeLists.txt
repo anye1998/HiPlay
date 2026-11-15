@@ -53,6 +53,8 @@ add_library(hicarauth SHARED
 
 target_include_directories(hicarauth PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/ed25519"
+    # Supplies the three ED25519_* declarations hks_service.c takes from OpenSSL's ec_local.h.
+    "${CMAKE_CURRENT_SOURCE_DIR}/openssl_shim"
     "${THIRD}/deviceauth/interfaces/innerkits/deviceauth_lite"
     "${THIRD}/huks/interfaces/innerkits/huks_lite"
     "${THIRD}/securec/include"
@@ -74,14 +76,16 @@ target_include_directories(hicarauth PRIVATE
 
 # _CUT_LOG_: the upstream logging writes through a hiview logger that does not exist on Android.
 # Without it the engine still builds but every protocol step prints to a missing backend.
-# _CUT_AUTHENTICATE_ is upstream's own switch for the scaled-down HUKS build: it removes the
-# x25519 helpers, which are the only part of huks_lite that reaches into OpenSSL's internals
-# (ec_local.h). HiChain itself only needs the ECDH P-256, HMAC and digest paths, so this keeps
-# OpenSSL out of the APK. If a future upstream version uses those helpers, the link step fails
-# loudly instead of silently degrading.
+#
+# _CUT_AUTHENTICATE_ is deliberately NOT defined. It is upstream's switch for the scaled-down HUKS
+# build, and it cuts far more than the x25519 helpers: the key store, hks_asymmetric_sign/verify,
+# the long-term key pair and the alias list all disappear with it. That is why HiChain's bind
+# exchange used to fail with HC_VERIFY_EXCHANGE_FAILED (29) — see docs/HICAR_MIGRATION.md 7.27.
+# The only thing it was ever protecting us from is `#include <ec_local.h>` at the top of
+# hks_service.c, which exists solely to see three ED25519_* declarations; openssl_shim/ provides
+# them, and huks_lite references no other OpenSSL symbol.
 target_compile_definitions(hicarauth PRIVATE
     _CUT_LOG_
-    _CUT_AUTHENTICATE_
     _GNU_SOURCE
     _POSIX_C_SOURCE=200809L)
 

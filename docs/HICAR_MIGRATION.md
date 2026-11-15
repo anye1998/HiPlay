@@ -1342,3 +1342,71 @@ OpenSSL 的 BN/EC 内部头，NDK 没有），要么在我们这层用"别名 �
 也更符合当前目标（一台车机、一对 LTPK）。
 
 因此本轮**没有功能变化**，手机行为与 7.27 相同；这一轮的价值是把"不可能"变成"可实现"，并且每步都可核对。
+
+### 7.29 路线 A 落地：不再裁 HUKS，而是补上它缺的三个声明
+
+7.27 的结论是"`_CUT_AUTHENTICATE_` 把 Ed25519 签名/验签整段裁掉了"。继续查下去，这个宏的代价比当时写的还大，
+而修法比当时估计的还小：
+
+**一、这个宏裁掉的不只是验签。** `hks_client.c` 里有 17 处、`hks_access.c` 7 处、`hks_service.c` 7 处守卫。当
+它被定义时，被替换成 `return HKS_ERROR_NOT_SUPPORTED` 的不只是 `hks_asymmetric_verify`，还包括
+`hks_generate_key`（长期密钥对）、`hks_export_public_key`、`hks_import_public_key`、`hks_is_key_exist`、
+`hks_delete_key`、`hks_asymmetric_sign`，以及**整个密钥存储层**（`hks_storage.c` 全文都在守卫里）。
+顺带一个之前没注意的事实：`hks_register_file_callbacks` 在裁剪版里是 `return HKS_SUCCESS;`——
+也就是**什么都没注册却报成功**。我们的 JNI 一直在注册那三个文件回调（`hks_keystore`/`info1.data`/`info2.data`），
+从未真正生效过。
+
+**二、OpenSSL 的依赖只是一行 `#include`。** `hks_service.c` 顶部：
+
+```c
+#ifndef _CUT_AUTHENTICATE_
+#include <ec_local.h>
+#endif
+```
+
+而整份 `hks_service.c` 里**没有任何** `EC_KEY` / `EC_POINT` / `BN_` / `EVP_` 调用（已 grep 全树确认）：
+x25519 那一段上游早就改成 mbedtls 了。这一行存在的唯一目的，是拿到 `ED25519_sign`、`ED25519_verify`、
+`ED25519_public_from_private` 三个**声明**。
+
+**三、因此修法是补声明，而不是补算法。** 本轮：
+
+| 改动 | 内容 |
+| --- | --- |
+| `hicar-auth/src/main/cpp/openssl_shim/ec_local.h` | 只放三个声明，参数顺序按 huks 的调用点写；开头加了保护，若真 OpenSSL 头先出现则 `#error` 而不是悄悄冲突 |
+| `hicar_ed25519.c` | 补 `ED25519_public_from_private(out_pub, seed32)`，用 vendored 的 `ed25519_create_keypair` 派生，私钥展开后清零 |
+| `CMakeLists.txt` | **删掉 `_CUT_AUTHENTICATE_`**；include 路径加上 `openssl_shim` |
+| `hichain_jni.c` | `init()` 里在注册两个回调之后调用 `hks_init()`（加载密钥库 + 初始化根密钥），结果存进 `g_hks_status` |
+
+于是 huks 用的是**上游真实的密钥管理与存储**，不是我们另写的一套：`hks_storage_write_key_info`、
+`hks_service_asymmetric_verify` 现在都是 `.so` 里真实存在的函数（可用 `llvm-nm` 核对）。
+7.28 里计划的"别名 → 文件"极简存储**没有做**，也不需要了。
+
+**四、本轮新增一个不依赖手机的验证入口。** 交换阶段的失败在车上极难定位（要先有手机、PIN、
+发现链路全通），所以加了 `Crypto self-test` 按钮 → `HiChainNative.selfTest()`，在 native 里按顺序做：
+
+```
+hks_init → hks_generate_key(Ed25519) → hks_export_public_key → hks_asymmetric_sign
+        → hks_asymmetric_verify(正确签名, 期望 status=0)
+        → hks_asymmetric_verify(翻转一位, 期望 status≠0)
+        → hks_import_public_key → hks_is_key_exist → hks_delete_key → hks_is_key_exist(应为不存在)
+```
+
+每行独立打印 `PASS/FAIL + 具体 status`，最后一行给 verdict。它跑在一个一次性别名上（开头先删，
+所以不依赖干净存储），**不需要手机、不需要射频**，平板或车机上点一下即可。
+
+**五、一个必须说清的新风险。** 裁剪版的 `hks_refresh_key_info` 是空操作；现在它是真的，
+而 `hks_service_refresh_key_info()` 会 `hks_storage_clean_key_info()`（清空缓冲并**回写一个空库到文件**）。
+好在 deviceauth 只在 `key_info_init()` 里、且**仅当 `hks_init()` 返回 `HKS_ERROR_INVALID_KEY_FILE` 或
+`HKS_ERROR_READ_FILE_FAIL` 时**才调用它，正常路径不会触发。但反过来说：如果这台设备的根密钥初始化失败，
+`key_info_init()` 现在会返回失败，`get_instance()` 直接拿不到句柄——**连 PAKE 都走不到**，而裁剪版至少还能走到
+exchange 再失败。所以顺序必须是：**先让 self-test 全 PASS，再上车**，否则一次车机测试会被这个前置条件拦掉。
+
+**六、签名输入的一致性（为什么可以确定手机能验我们的签名）。** 两端跑的是同一份 deviceauth：
+adapter 的 `sign()` 与 `verify_with_public_key()` 都是"先 `sha256(message)`，再把 32 字节摘要交给 huks"，
+huks 把它当 Ed25519 的 message（Ed25519 内部再哈希一次）。手机侧的 `hks_service_asymmetric_sign` 是
+`ED25519_sign(sig, hash->data, hash->size, pub, priv)`，我们的 shim 与之逐参数一致。所以这是**同一约定**，
+不是我们自创的。
+
+**七、还没验证的部分（诚实记录）**：以上全部是代码与构建层面的确认。Ed25519 签名/验签、密钥落盘、
+跨会话持久化是否真的在这台车机上工作，**只有 self-test 的实际输出能回答**。在拿到 `verdict: PASS` 之前，
+不认为 exchange 已经修好。

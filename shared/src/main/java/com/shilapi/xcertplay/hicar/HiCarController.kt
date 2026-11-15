@@ -96,8 +96,40 @@ class HiCarController(
     /** Created only after the access point is up, so it can never answer with a placeholder offer. */
     private var liveNetwork: HiCarNetworkNegotiator? = null
 
-    fun start() {
-        if (!running.compareAndSet(false, true)) {
+    /**
+     * Runs the key store's self-test and writes every line to the log.
+     *
+     * This exists because the exchange phase's failures are invisible from the car: it needs a
+     * phone, a PIN and a working discovery chain before anything signs anything. The same calls can
+     * be exercised on their own, on any device, which is the difference between "the car cannot
+     * authenticate" and "signing returns -134".
+     */
+    fun cryptoSelfTest() {
+        if (!HiChainNative.available) {
+            onLog("HiChain self-test: the native engine is not in this build")
+            return
+        }
+        val prepared = HiChainNative.storeDirectory(appContext.getDir("hicar-huks", Context.MODE_PRIVATE))
+        if (!prepared.isDirectory) {
+            onLog("HiChain self-test: the store directory could not be created")
+            return
+        }
+        val initialized = HiChainNative.init(prepared.absolutePath, config.localIdentity)
+        if (initialized != 0) {
+            onLog("HiChain self-test: engine init failed ($initialized)")
+            return
+        }
+        val report = HiChainNative.selfTest()
+        if (report == null) {
+            onLog("HiChain self-test: the engine returned no report")
+            return
+        }
+        report.lineSequence().filter { it.isNotBlank() }.forEach { line ->
+            onLog("HiChain self-test: $line")
+        }
+    }
+
+    fun start() {        if (!running.compareAndSet(false, true)) {
             onLog("HiCar receiver is already running")
             return
         }
