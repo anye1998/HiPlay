@@ -69,7 +69,7 @@ internal class HiChainAuthenticator(
         // exists yet. Without this, a run that derived a key and then discarded it looked identical
         // to one where the phone rejected the code.
         onLog(
-            "HiChain step $stepIndex: engine=$step.code, phase=${step.describe()}, " +
+            "HiChain step $stepIndex: engine=${step.code}, phase=${step.describe()}, " +
                 "key=${step.keyLength}B, error=${step.error}, out=${step.packets.size}",
         )
         if (step.error != 0) {

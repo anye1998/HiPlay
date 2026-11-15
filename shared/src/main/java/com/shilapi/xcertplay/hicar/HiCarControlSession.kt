@@ -77,6 +77,14 @@ internal class HiCarControlSession(
                 if ((marker != HiCarCodes.RECORD_PLAINTEXT && marker != HiCarCodes.RECORD_ENCRYPTED) ||
                     size < 1 || size >= MAX_RECORD_BYTES
                 ) {
+                    // The header is framing, not payload: printing it is what separates "the phone
+                    // speaks another record format" from "we mis-parsed one byte". Without this the
+                    // only evidence was the words "control header".
+                    events.onLog(
+                        "DMSDP: unexpected record header marker=0x" +
+                            String.format(Locale.ROOT, "%02x", marker) + " size=$size, first bytes=" +
+                            wire.take(24).joinToString(" ") { String.format(Locale.ROOT, "%02x", it) },
+                    )
                     throw HiCarWireException("control header")
                 }
                 if (wire.size < size + RECORD_HEADER_BYTES) break

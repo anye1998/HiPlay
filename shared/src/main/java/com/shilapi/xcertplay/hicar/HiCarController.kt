@@ -405,7 +405,10 @@ class HiCarController(
                         val key = authenticator.sessionKey
                         if (key != null) {
                             report(HiCarStatus.Authenticated)
-                            onLog("HiChain finished: ${key.size}-byte session key; opening DMSDP")
+                            onLog(
+                                "HiChain finished: ${key.size}-byte session key; opening DMSDP on the " +
+                                    "${if (control) "control" else "business"} channel",
+                            )
                             liveNetwork?.authenticated = true
                             session = openControlSession(output, key)
                         }
@@ -475,8 +478,12 @@ class HiCarController(
             }
         }
         val session = HiCarControlSession(cipher, events)
-        output.write(session.initial())
+        val greeting = session.initial()
+        output.write(greeting)
         output.flush()
+        // Recorded so the next failure can be told apart by direction: a rejection that arrives
+        // before this line is the phone speaking first, and one after it answers our OPTIONS.
+        onLog("DMSDP: sent ${greeting.size}-byte OPTIONS greeting")
         return session
     }
 

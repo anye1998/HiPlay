@@ -1034,3 +1034,48 @@ HiChain finished: 32-byte session key; opening DMSDP
   "Use test model `00040A04`"，两个值都能一键到达，且都会持久化。
 - `TEST_MODEL` 的注释同步更正：它不再是"未经真机验证的测试向量"——Mate 80 Pro Max 在这个值上弹框并拨号，
   在本机随机 id 上完全静默，这条对照已经在 7.17 记录过。
+
+### 7.21 鉴权通过、密钥拿到，卡在 DMSDP 的第一条记录
+
+`hicar-log-20261115-112048.txt`（11:19 起，多次尝试）。**7.19 的修复生效了**，每一轮都是同一个结局：
+
+```
+HiChain step 1: phase=KEY_AGREEMENT_PROCESSING, key=0B, error=0, out=1
+HiChain step 2: phase=KEY_AGREEMENT_END,        key=32B, error=0, out=1
+HiChain step 2 finished: 32-byte session key
+HiChain finished: 32-byte session key; opening DMSDP
+DMSDP rejected: control header          <- 卡在这里
+HiCar protocol stopped: control header
+HiCar business channel connected (peer F8:3B:7E:3E:DD:06)   <- 手机立刻重拨
+```
+
+用户侧看到的现象（"每次输完密码又让再输"）由这条链解释：**我们一收到不认识的记录就关掉 socket，
+手机把这当成连接失败，于是重拨、重新开始 HiCar 流程，再要一次密码**。同一段日志里
+`connections=4 → 8` 就是这些重拨。密码本身没有问题——每轮都走到 `32-byte session key`。
+
+**现在唯一的未知量：手机在鉴权后第一句说的是什么。** `HiCarControlSession` 期望
+`marker(1) | size(2, 大端)`，marker 只能是 `0x00`（明文）或 `0xAB`（密文），size 在 1..1497。
+手机的这条记录两者都不满足，而原来的代码只报"control header"四个字、不留任何证据。
+
+本轮改成把**帧头**写进日志（帧头不是载荷，没有泄露内容的风险）：
+
+```
+DMSDP: unexpected record header marker=0x7b size=...
+       first bytes=7b 22 6f 70 65 72 5f 74 79 70 65 ...
+```
+
+加上两条定位信息：
+
+- `HiChain finished ...; opening DMSDP on the business/control channel`：DMSDP 现在跑在**哪条** RFCOMM 上。
+- `DMSDP: sent N-byte OPTIONS greeting`：拒绝发生在**我们发 OPTIONS 之前**（手机先说）还是**之后**（回应我们）。
+
+三种可能，要看字节才能定：
+
+| 首字节 | 含义 | 下一步 |
+| --- | --- | --- |
+| `0x7b`（`{`） | 手机还在说 HiCar 的 JSON 信封（`oper_type`），不是 DMSDP | 鉴权完成后仍要继续 `HiCarIdentityExchange`，DMSDP 等手机明确切换 |
+| `0x00`/`0xAB` 但 size 越界 | 记录长度字段位置或宽度不同（可能是 4 字节） | 按实测改 `pack`/`feed` 的帧格式 |
+| 其它（如 `0x01`） | 这条 socket 上根本不是 DMSDP，DMSDP 应在另一条通道 | 交换 business/control 的角色 |
+
+顺带修掉一处日志插值 bug：`engine=$step.code` 被 Kotlin 解析成 `$step` 后接 `.code`，
+日志里出现 `...Step@bb01e5e.code`，现改为 `${step.code}`。
