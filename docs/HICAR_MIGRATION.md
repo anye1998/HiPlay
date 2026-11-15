@@ -1198,3 +1198,34 @@ if (identity.awaitingRest || !isControlRecord(buffer, read)) {   // 默认仍走
 一旦某次配对真的完成，按它等于把手机已存的凭据作废。因此界面在按钮下加了一行说明：
 只在配对出错时按；配对成功后不要再按。（当前尚未有任何一次配对完成，所以现在每次都需要输码，
 这是"配对未完成"的结果，不是"码会变"的结果。）
+
+### 7.25 一次"手机完全没拨号"的会话：链路健康，静默在手机侧
+
+`hicar-log-20261115-120003.txt`（11:58:56 起，60 秒）。**没有任何协议失败**——连一次连接都没有：
+
+```
+HiCar advertisement started (11 bytes of 0xFDEE service data, device name in the scan response)
+HiCar listeners started: hicar-control, hicar-business
+HiCar waiting for the phone: 30s, connections=0, advertising=on, listeners=open, discoverable=yes
+HiCar waiting for the phone: 60s, connections=0, advertising=on, listeners=open, discoverable=yes
+```
+
+车机侧四项全绿（广播在发、两条 RFCOMM 在听、5 GHz 热点已就绪、可发现），**手机一次都没发起来**，
+所以既没有 `control channel connected`，也不会有 HiCar 的密码弹窗——弹窗是手机拨通之后才出现的。
+
+这类"静默不拨"在本次会话里出现过多次（11:51、11:52 两次 `connections=0`，11:52 第三次才连上），
+特征与失败原因都很明确：**它发生在多次失败尝试之后**。手机端在连续失败后会把该车标记为"连接失败、
+配对信息已清除"，此后一段时间不再主动拨号，直到用户在手机上重新发起。
+
+为此在心跳里加了一条**只出现一次**的判读提示（60 秒仍无连接时）：
+
+```
+HiCar: the phone has not dialled at all, which is its side of the link. Check, in this order:
+the phone is unlocked with its HiCar screen open; the HiCar entry for this car was removed after
+the last failed attempt; then Start again — the code has not changed, Reset pairing is not needed
+```
+
+它替代不了手机侧的操作，但能让日志自己说明"不是接收端的问题"，避免再把这类会话当成协议 bug 排查。
+
+**这轮同时确认的操作事实**：`Reset pairing` 换码后**手机不会因为新码而来拨**——是否拨号完全由手机侧
+发起。所以正确顺序始终是"先在手机上进 HiCar 连接界面，再在车机上 Start"，而不是先 Start 等手机。

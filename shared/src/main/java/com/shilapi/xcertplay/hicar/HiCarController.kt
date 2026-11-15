@@ -292,6 +292,7 @@ class HiCarController(
     private fun startWaitingHeartbeat() {
         thread("hicar-wait") {
             val startedAt = System.nanoTime()
+            var hinted = false
             while (running.get()) {
                 try {
                     Thread.sleep(WAIT_HEARTBEAT_MILLIS)
@@ -307,6 +308,18 @@ class HiCarController(
                         "listeners=${if (services != null) "open" else "closed"}, " +
                         "discoverable=${discoverableState()}",
                 )
+                // A minute with the beacon up and not one dial is not a receiver fault, and saying so
+                // here saves a round trip through the log: the advertisement, listeners and access
+                // point are all up, so the next thing to look at is the phone.
+                if (!hinted && connections.get() == 0 && seconds >= SILENT_PHONE_MILLIS / 1000) {
+                    hinted = true
+                    onLog(
+                        "HiCar: the phone has not dialled at all, which is its side of the link. Check, " +
+                            "in this order: the phone is unlocked with its HiCar screen open; the HiCar " +
+                            "entry for this car was removed after the last failed attempt; then Start " +
+                            "again — the code has not changed, Reset pairing is not needed",
+                    )
+                }
             }
         }
     }
@@ -560,6 +573,9 @@ class HiCarController(
 
         /** Long enough to stay out of the way, short enough that a 2-minute test shows progress. */
         const val WAIT_HEARTBEAT_MILLIS = 30_000L
+
+        /** Two heartbeats with no dial at all: the silence is on the phone's side. */
+        const val SILENT_PHONE_MILLIS = 60_000L
 
         /** The phone usually takes the next address after the access point itself. */
         fun clientAddressFor(owner: String): String? {
