@@ -1410,3 +1410,70 @@ huks 把它当 Ed25519 的 message（Ed25519 内部再哈希一次）。手机�
 **七、还没验证的部分（诚实记录）**：以上全部是代码与构建层面的确认。Ed25519 签名/验签、密钥落盘、
 跨会话持久化是否真的在这台车机上工作，**只有 self-test 的实际输出能回答**。在拿到 `verdict: PASS` 之前，
 不认为 exchange 已经修好。
+
+### 7.30 自检第一轮：只有验签失败（-132），原因是 OpenSSL 与 orlp 对"私钥"的定义不同
+
+`hicar-log-20261115-125114.txt` 是自检第一次运行。一行失败，其余全过：
+
+```
+PASS hks_init: status=0
+PASS hks_generate_key (Ed25519 pair): status=0
+PASS hks_export_public_key: status=0, bytes=32
+PASS hks_asymmetric_sign: status=0, bytes=64
+FAIL hks_asymmetric_verify (fresh signature): status=-132
+PASS hks_asymmetric_verify (tampered signature rejected): status=-132   <- 假通过
+PASS ... reload / identical public key / delete ...
+verdict: FAIL (1 failure(s))
+```
+
+`-132` = **`HKS_FAILURE`**，`hks_service_asymmetric_verify` 里它的含义只有一个：`ED25519_verify(...)`
+返回了假。也就是说**签名与公钥对不上**，不是参数、权限或存储问题（那些都 PASS 了）。
+
+**根因：两个库的 `ED25519_sign` 第 5 个参数不是一个东西。** 我们 7.28 的 shim 只做了改名与参数重排，
+把调用方的缓冲区原样转给 orlp：
+
+| | 第 5 个参数（私钥）的含义 |
+| --- | --- |
+| OpenSSL `ED25519_sign(sig, msg, len, pub, priv)` | **32 字节种子**，`SHA-512(seed)` 的展开在函数内部完成 |
+| orlp `ed25519_sign(sig, msg, len, pub, priv)` | **64 字节已展开的密钥**：`[0..31]` 是 clamp 后的标量，`[32..63]` 是 nonce 前缀 |
+
+而 huks 存的是第三种东西：`hks_service_generate_key` 里 `private_key = seed(32) || pub(32)`。
+于是我们送给 orlp 的"前缀"其实是**公钥**、送给它的"标量"是**未 clamp 的种子**，签出来的 R 与 S 与规范无关，
+用同一把公钥验必然失败。**讽刺的是公钥派生是对的**（那条走 `ed25519_create_keypair`，它自己做 SHA-512 与 clamp），
+所以 `export_public_key`、"reload 后公钥一致"都 PASS——这正是这个 bug 能藏住的原因。
+
+**修法**：`ED25519_sign` 里自己完成种子展开——`az = SHA-512(seed)`，clamp `az[0..31]`，
+把 `az`（64 字节，标量||前缀）交给 orlp。这就是 RFC 8032 规定的展开，也是 orlp 的 `keypair` 写进私钥缓冲的布局，
+所以两者从此一致。
+
+**验证方式不再靠推理**：用 Python 按 RFC 8032 独立实现了一遍 Ed25519，先对齐官方向量
+（test vector 2：`pub=3d4017c3…660c`、`sig=92a009a9…0c00`，逐字节相符），确认
+"展开种子 + clamp + 上式签名"就是标准算法；随后把这组固定值**嵌进自检**，成为三条不依赖密钥库、
+不依赖随机数的已知答案检查：
+
+```
+PASS RFC 8032 vector 2: derived public key matches
+PASS RFC 8032 vector 2: signature matches the published value
+PASS RFC 8032 vector 2: published signature verifies (returned 1)
+```
+
+同时修掉一处**误报**：上一轮 `tampered signature rejected` 显示 PASS，但那时有效签名也没过，
+"拒绝一个坏签名"毫无意义。现在它在有效签名未通过时明确输出 `SKIP`，不计入通过。
+
+**修复后在模拟器（MuMu，x86_64 / SDK 32）上的完整结果**：
+
+```
+PASS RFC 8032 vector 2 × 3
+PASS hks_init / generate_key / export_public_key(32) / asymmetric_sign(64)
+PASS hks_asymmetric_verify (fresh signature): status=0 (HKS_SUCCESS)
+PASS hks_asymmetric_verify (tampered signature rejected): status=-132 (…returned false)
+PASS import_public_key / is_key_exist / hks_init(reload) / is_key_exist(self) / identical / delete ×2
+verdict: PASS (0 failure(s))
+```
+
+顺带把 huks 的状态码翻成名字进日志（`-132` → `HKS_FAILURE (the cryptographic check returned false)`），
+下一次失败不用再查表。
+
+**结论**：exchange 阶段在密码学上已经可用——签名与验签都正确、密钥能落盘且跨重开保持同一把。
+尚未验证的是它与**真实手机**的互通（手机用同一份 deviceauth 的 `sha256` + `ED25519_sign(hash)` 约定），
+也就是下一次车机测试要回答的问题。

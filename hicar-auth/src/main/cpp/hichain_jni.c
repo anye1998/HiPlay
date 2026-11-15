@@ -31,6 +31,8 @@
 #include <mbedtls/sha256.h>
 
 #include "hichain.h"
+/* The Ed25519 shim's entry points; see openssl_shim/ec_local.h and hicar_ed25519.c. */
+#include "ec_local.h"
 #include "hks_client.h"
 #include "hks_errno.h"
 #include "hks_file_api.h"
@@ -281,6 +283,35 @@ Java_com_shilapi_xcertplay_hicarauth_HiChainNative_init(JNIEnv *env, jclass claz
 }
 
 /*
+ * Turns a huks status into the name its header gives it.
+ *
+ * A bare -132 is the difference between "the signature was wrong" and "the call was rejected", and
+ * every one of those numbers costs a test cycle to look up otherwise. Unknown values print as
+ * "unknown" so a missing name is visible rather than silently plausible.
+ */
+static const char *hks_status_name(int32_t status)
+{
+    switch (status) {
+        case HKS_SUCCESS: return "HKS_SUCCESS";
+        case HKS_FAILURE: return "HKS_FAILURE (the cryptographic check returned false)";
+        case HKS_ERROR_NOT_PERMITTED: return "HKS_ERROR_NOT_PERMITTED";
+        case HKS_ERROR_NOT_SUPPORTED: return "HKS_ERROR_NOT_SUPPORTED";
+        case HKS_ERROR_INVALID_ARGUMENT: return "HKS_ERROR_INVALID_ARGUMENT";
+        case HKS_ERROR_BUFFER_TOO_SMALL: return "HKS_ERROR_BUFFER_TOO_SMALL";
+        case HKS_ERROR_NULL_POINTER: return "HKS_ERROR_NULL_POINTER";
+        case HKS_ERROR_READ_FILE_FAIL: return "HKS_ERROR_READ_FILE_FAIL";
+        case HKS_ERROR_INVALID_PUBLIC_KEY: return "HKS_ERROR_INVALID_PUBLIC_KEY";
+        case HKS_ERROR_INVALID_PRIVATE_KEY: return "HKS_ERROR_INVALID_PRIVATE_KEY";
+        case HKS_ERROR_INVALID_KEY_INFO: return "HKS_ERROR_INVALID_KEY_INFO";
+        case HKS_ERROR_KEY_NOT_EXIST: return "HKS_ERROR_KEY_NOT_EXIST";
+        case HKS_ERROR_MALLOC_FAIL: return "HKS_ERROR_MALLOC_FAIL";
+        case HKS_ERROR_WRITE_FILE_FAIL: return "HKS_ERROR_WRITE_FILE_FAIL";
+        case HKS_ERROR_INVALID_KEY_FILE: return "HKS_ERROR_INVALID_KEY_FILE";
+        default: return "unknown";
+    }
+}
+
+/*
  * Exercises the exact huks calls HiChain's bind exchange makes, in order, on one throwaway alias.
  *
  * The car is the only place these run for real, and driving to it to learn that signing is broken
@@ -314,11 +345,73 @@ Java_com_shilapi_xcertplay_hicarauth_HiChainNative_selfTest(JNIEnv *env, jclass 
         if (!(ok)) failures++; \
     } while (0)
 
+    /* A check whose precondition failed proves nothing; saying PASS there would be a false signal. */
+    #define ST_SKIP(...) do { \
+        char line[192]; \
+        (void)snprintf(line, sizeof(line), __VA_ARGS__); \
+        int written = snprintf(report + used, sizeof(report) - used, "SKIP %s\n", line); \
+        if (written > 0) { \
+            used += (uint32_t)written; \
+            if (used >= sizeof(report)) used = sizeof(report) - 1; \
+        } \
+    } while (0)
+
     if (g_root_fd < 0) {
         return (*env)->NewStringUTF(env, "FAIL engine not initialised (no store directory)\n");
     }
 
-    ST_LINE(g_hks_status == HKS_SUCCESS, "hks_init: status=%d", g_hks_status);
+    /*
+     * RFC 8032 test vector 2, run against the Ed25519 shim directly.
+     *
+     * The rest of this report says whether huks is wired up; this says whether the algorithm behind
+     * it is correct, and it is the check that would have caught the first version of the shim, where
+     * a seed was handed to a function expecting an expanded key and every signature verified against
+     * nothing. Fixed values, no key store, no randomness: either the bytes match the RFC or they do
+     * not.
+     */
+    {
+        static const uint8_t KAT_SEED[32] = {
+            0x4c, 0xcd, 0x08, 0x9b, 0x28, 0xff, 0x96, 0xda,
+            0x9d, 0xb6, 0xc3, 0x46, 0xec, 0x11, 0x4e, 0x0f,
+            0x5b, 0x8a, 0x31, 0x9f, 0x35, 0xab, 0xa6, 0x24,
+            0xda, 0x8c, 0xf6, 0xed, 0x4f, 0xb8, 0xa6, 0xfb,
+        };
+        static const uint8_t KAT_PUBLIC[32] = {
+            0x3d, 0x40, 0x17, 0xc3, 0xe8, 0x43, 0x89, 0x5a,
+            0x92, 0xb7, 0x0a, 0xa7, 0x4d, 0x1b, 0x7e, 0xbc,
+            0x9c, 0x98, 0x2c, 0xcf, 0x2e, 0xc4, 0x96, 0x8c,
+            0xc0, 0xcd, 0x55, 0xf1, 0x2a, 0xf4, 0x66, 0x0c,
+        };
+        static const uint8_t KAT_SIGNATURE[64] = {
+            0x92, 0xa0, 0x09, 0xa9, 0xf0, 0xd4, 0xca, 0xb8,
+            0x72, 0x0e, 0x82, 0x0b, 0x5f, 0x64, 0x25, 0x40,
+            0xa2, 0xb2, 0x7b, 0x54, 0x16, 0x50, 0x3f, 0x8f,
+            0xb3, 0x76, 0x22, 0x23, 0xeb, 0xdb, 0x69, 0xda,
+            0x08, 0x5a, 0xc1, 0xe4, 0x3e, 0x15, 0x99, 0x6e,
+            0x45, 0x8f, 0x36, 0x13, 0xd0, 0xf1, 0x1d, 0x8c,
+            0x38, 0x7b, 0x2e, 0xae, 0xb4, 0x30, 0x2a, 0xee,
+            0xb0, 0x0d, 0x29, 0x16, 0x12, 0xbb, 0x0c, 0x00,
+        };
+        static const uint8_t KAT_MESSAGE[1] = { 0x72 };
+        uint8_t derived_public[32];
+        uint8_t derived_signature[64];
+        int verified;
+
+        ED25519_public_from_private(derived_public, KAT_SEED);
+        ST_LINE(memcmp(derived_public, KAT_PUBLIC, sizeof(KAT_PUBLIC)) == 0,
+            "RFC 8032 vector 2: derived public key matches");
+
+        ED25519_sign(derived_signature, KAT_MESSAGE, sizeof(KAT_MESSAGE), KAT_PUBLIC, KAT_SEED);
+        ST_LINE(memcmp(derived_signature, KAT_SIGNATURE, sizeof(KAT_SIGNATURE)) == 0,
+            "RFC 8032 vector 2: signature matches the published value");
+
+        verified = ED25519_verify(KAT_MESSAGE, sizeof(KAT_MESSAGE), KAT_SIGNATURE, KAT_PUBLIC);
+        ST_LINE(verified == 1, "RFC 8032 vector 2: published signature verifies (returned %d)",
+            verified);
+    }
+
+    ST_LINE(g_hks_status == HKS_SUCCESS, "hks_init: status=%d (%s)", g_hks_status,
+        hks_status_name(g_hks_status));
 
     struct hks_blob self_alias = { HKS_BLOB_TYPE_ALIAS, (uint8_t *)SELF_ALIAS, sizeof(SELF_ALIAS) - 1 };
     struct hks_blob peer_alias = { HKS_BLOB_TYPE_ALIAS, (uint8_t *)PEER_ALIAS, sizeof(PEER_ALIAS) - 1 };
@@ -338,13 +431,15 @@ Java_com_shilapi_xcertplay_hicarauth_HiChainNative_selfTest(JNIEnv *env, jclass 
     pair_param.key_auth_id.size = sizeof(SELF_ID) - 1;
 
     int32_t status = hks_generate_key(&self_alias, &pair_param);
-    ST_LINE(status == HKS_SUCCESS, "hks_generate_key (Ed25519 pair): status=%d", status);
+    ST_LINE(status == HKS_SUCCESS, "hks_generate_key (Ed25519 pair): status=%d (%s)", status,
+        hks_status_name(status));
 
     uint8_t public_key[HKS_PUBLIC_BYTES_ED25519];
     struct hks_blob public_blob = { HKS_BLOB_TYPE_KEY, public_key, sizeof(public_key) };
     status = hks_export_public_key(&self_alias, &public_blob);
     ST_LINE(status == HKS_SUCCESS && public_blob.size == HKS_PUBLIC_BYTES_ED25519,
-        "hks_export_public_key: status=%d, bytes=%u", status, public_blob.size);
+        "hks_export_public_key: status=%d (%s), bytes=%u", status, hks_status_name(status),
+        public_blob.size);
 
     uint8_t digest[32];
     (void)mbedtls_sha256_ret((const uint8_t *)MESSAGE, sizeof(MESSAGE) - 1, digest, 0);
@@ -360,7 +455,8 @@ Java_com_shilapi_xcertplay_hicarauth_HiChainNative_selfTest(JNIEnv *env, jclass 
     struct hks_blob signature_blob = { HKS_BLOB_TYPE_KEY, signature, sizeof(signature) };
     status = hks_asymmetric_sign(&self_alias, &sign_param, &hash, &signature_blob);
     ST_LINE(status == HKS_SUCCESS && signature_blob.size == HKS_SIGNATURE_MIN_SIZE,
-        "hks_asymmetric_sign: status=%d, bytes=%u", status, signature_blob.size);
+        "hks_asymmetric_sign: status=%d (%s), bytes=%u", status, hks_status_name(status),
+        signature_blob.size);
 
     struct hks_key_param verify_param;
     memset(&verify_param, 0, sizeof(verify_param));
@@ -371,13 +467,27 @@ Java_com_shilapi_xcertplay_hicarauth_HiChainNative_selfTest(JNIEnv *env, jclass 
     /* The exchange phase verifies with the peer's raw public key, not with an alias: this exact
      * call is the one that used to answer HKS_ERROR_NOT_SUPPORTED (error 29 downstream). */
     status = hks_asymmetric_verify(&public_blob, &verify_param, &hash, &signature_blob);
-    ST_LINE(status == HKS_SUCCESS, "hks_asymmetric_verify (fresh signature): status=%d", status);
+    int fresh_verified = (status == HKS_SUCCESS);
+    ST_LINE(fresh_verified, "hks_asymmetric_verify (fresh signature): status=%d (%s)", status,
+        hks_status_name(status));
 
-    /* A verifier that accepts anything would also pass the line above, so break one bit. */
+    /*
+     * A verifier that accepts anything would also pass the line above, so break one bit — but only
+     * claim anything when the valid signature verified. In the first run of this test the fresh
+     * verification failed and this line still said PASS, which reads as "the verifier is strict"
+     * when in fact it was rejecting everything.
+     */
     signature[0] ^= 0x01;
-    status = hks_asymmetric_verify(&public_blob, &verify_param, &hash, &signature_blob);
+    int tampered_status = hks_asymmetric_verify(&public_blob, &verify_param, &hash, &signature_blob);
     signature[0] ^= 0x01;
-    ST_LINE(status != HKS_SUCCESS, "hks_asymmetric_verify (tampered signature rejected): status=%d", status);
+    if (fresh_verified) {
+        ST_LINE(tampered_status != HKS_SUCCESS,
+            "hks_asymmetric_verify (tampered signature rejected): status=%d (%s)", tampered_status,
+            hks_status_name(tampered_status));
+    } else {
+        ST_SKIP("hks_asymmetric_verify (tampered signature rejected): not evaluated — the valid "
+            "signature did not verify, so rejecting this one proves nothing");
+    }
 
     struct hks_key_param import_param;
     memset(&import_param, 0, sizeof(import_param));
@@ -390,10 +500,12 @@ Java_com_shilapi_xcertplay_hicarauth_HiChainNative_selfTest(JNIEnv *env, jclass 
     import_param.key_auth_id.size = sizeof(PEER_ID) - 1;
 
     status = hks_import_public_key(&peer_alias, &import_param, &public_blob);
-    ST_LINE(status == HKS_SUCCESS, "hks_import_public_key (peer): status=%d", status);
+    ST_LINE(status == HKS_SUCCESS, "hks_import_public_key (peer): status=%d (%s)", status,
+        hks_status_name(status));
 
     status = hks_is_key_exist(&peer_alias);
-    ST_LINE(status == HKS_SUCCESS, "hks_is_key_exist (peer, after import): status=%d", status);
+    ST_LINE(status == HKS_SUCCESS, "hks_is_key_exist (peer, after import): status=%d (%s)", status,
+        hks_status_name(status));
 
     /*
      * Reload the store from disk and read the same key back.
@@ -405,28 +517,34 @@ Java_com_shilapi_xcertplay_hicarauth_HiChainNative_selfTest(JNIEnv *env, jclass 
      * here in one run rather than discovered across two.
      */
     status = hks_init();
-    ST_LINE(status == HKS_SUCCESS, "hks_init (reload after writes): status=%d", status);
+    ST_LINE(status == HKS_SUCCESS, "hks_init (reload after writes): status=%d (%s)", status,
+        hks_status_name(status));
 
     status = hks_is_key_exist(&self_alias);
-    ST_LINE(status == HKS_SUCCESS, "hks_is_key_exist (self, after reload): status=%d", status);
+    ST_LINE(status == HKS_SUCCESS, "hks_is_key_exist (self, after reload): status=%d (%s)", status,
+        hks_status_name(status));
 
     uint8_t reread_key[HKS_PUBLIC_BYTES_ED25519];
     struct hks_blob reread_blob = { HKS_BLOB_TYPE_KEY, reread_key, sizeof(reread_key) };
     status = hks_export_public_key(&self_alias, &reread_blob);
     int same_key = (status == HKS_SUCCESS) && (reread_blob.size == sizeof(public_key)) &&
         (memcmp(reread_key, public_key, sizeof(public_key)) == 0);
-    ST_LINE(same_key, "public key identical after reload: status=%d, equal=%s", status,
-        same_key ? "yes" : "no");
+    ST_LINE(same_key, "public key identical after reload: status=%d (%s), equal=%s", status,
+        hks_status_name(status), same_key ? "yes" : "no");
 
     status = hks_delete_key(&peer_alias);
-    ST_LINE(status == HKS_SUCCESS, "hks_delete_key (peer): status=%d", status);
+    ST_LINE(status == HKS_SUCCESS, "hks_delete_key (peer): status=%d (%s)", status,
+        hks_status_name(status));
     status = hks_is_key_exist(&peer_alias);
-    ST_LINE(status != HKS_SUCCESS, "hks_is_key_exist (peer, after delete): status=%d", status);
+    ST_LINE(status != HKS_SUCCESS, "hks_is_key_exist (peer, after delete): status=%d (%s)", status,
+        hks_status_name(status));
 
     status = hks_delete_key(&self_alias);
-    ST_LINE(status == HKS_SUCCESS, "hks_delete_key (self): status=%d", status);
+    ST_LINE(status == HKS_SUCCESS, "hks_delete_key (self): status=%d (%s)", status,
+        hks_status_name(status));
 
     #undef ST_LINE
+    #undef ST_SKIP
 
     char verdict[64];
     (void)snprintf(verdict, sizeof(verdict), "verdict: %s (%u failure(s))\n",
