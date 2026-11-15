@@ -37,8 +37,14 @@ set(CJSON_SRC "${THIRD}/cjson/cJSON.c")
 # ABI for code that can never run here.
 list(FILTER MBEDTLS_SRC EXCLUDE REGEX "/ssl_[^/]*\\.c$")
 
+# Ed25519: huks_lite calls OpenSSL's ED25519_sign/ED25519_verify, which the Android NDK does not
+# provide at all. The sources are vendored unmodified under ed25519/ with checksums in SHA256SUMS.
+file(GLOB ED25519_SRC "${CMAKE_CURRENT_SOURCE_DIR}/ed25519/*.c")
+
 add_library(hicarauth SHARED
     hichain_jni.c
+    hicar_ed25519.c
+    ${ED25519_SRC}
     ${AUTH_SRC}
     ${HUKS_SRC}
     ${SECUREC_SRC}
@@ -46,6 +52,7 @@ add_library(hicarauth SHARED
     ${CJSON_SRC})
 
 target_include_directories(hicarauth PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/ed25519"
     "${THIRD}/deviceauth/interfaces/innerkits/deviceauth_lite"
     "${THIRD}/huks/interfaces/innerkits/huks_lite"
     "${THIRD}/securec/include"

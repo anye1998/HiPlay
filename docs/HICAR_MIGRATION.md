@@ -1316,3 +1316,29 @@ send_exchange_response()                       auth_info/exchange_auth_info.c:59
 另有一条**不建议**的"捷径"：跳过验签（`verify_with_public_key` 直接返回 `HC_OK`）。它能让流程继续，
 但等于放弃长期密钥的签名校验，且我们的 `EXCHANGE_RESPONSE` 同样需要签名——手机端仍会拒绝，所以它也
 解决不了问题，只会制造"看起来通了"的假象。若将来为排查临时启用，必须是 debug-only 并在日志里明写。
+
+### 7.28 路线 A 第一步：自带的 Ed25519 已经进构建（尚未接线）
+
+按 7.27 的三选一，确定走 **A（自带 Ed25519 实现）**。本轮只做第一步，且必须是"能编译、可核对"的一步：
+
+- 新增 `hicar-auth/src/main/cpp/ed25519/`：取自 **orlp/ed25519**（zlib 许可）的原始源码，**未改一行**；
+  `ed25519/NOTICE.md` 记录来源、日期、为什么需要它，`SHA256SUMS` 记录 15 个文件的校验和（便于复核）。
+- 新增 `hicar-auth/src/main/cpp/hicar_ed25519.c`：把 orlp 的 `ed25519_sign/verify` 包装成 **OpenSSL 的
+  `ED25519_sign/ED25519_verify` 签名顺序**（huks_lite 正是按 OpenSSL 那套调用的），参数顺序差一位就要出错，
+  所以这层只做改名与重排，不含任何算法。
+- `CMakeLists.txt` 增加 `ED25519_SRC` 与 include 路径；四个 ABI 的 CMake 配置与编译全部通过。
+
+**这还不是修复本身**：huks 的桩函数仍在，`hks_asymmetric_verify` 依旧返回"不支持"。下一步是把
+`hks_client.c` 里被 `_CUT_AUTHENTICATE_` 替换掉的那几个入口接回真实实现：
+
+| 入口 | 现状 | 接线方式 |
+| --- | --- | --- |
+| `hks_asymmetric_verify` | 返回 `HKS_ERROR_NOT_SUPPORTED` | 对 `HKS_BLOB_TYPE_KEY` 直接 `ED25519_verify(message, len, sig, pk)` |
+| `hks_asymmetric_sign` | 同上 | 从存储取私钥后 `ED25519_sign` |
+| `hks_generate_key` / `hks_is_key_exist` / `hks_import_public_key` | 同上 | `ed25519_create_keypair`（种子来自 HUKS 随机/既有 seed）+ 现有文件回调落盘 |
+
+难点不在算法，而在 `hks_storage_*` 这套内部存储也一起被裁了：要么把它的非裁版本也编进来（它会牵出
+OpenSSL 的 BN/EC 内部头，NDK 没有），要么在我们这层用"别名 → 文件"的极简存储替代。后者更可控，
+也更符合当前目标（一台车机、一对 LTPK）。
+
+因此本轮**没有功能变化**，手机行为与 7.27 相同；这一轮的价值是把"不可能"变成"可实现"，并且每步都可核对。
