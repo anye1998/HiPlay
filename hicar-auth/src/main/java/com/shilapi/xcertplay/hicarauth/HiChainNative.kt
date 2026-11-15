@@ -60,6 +60,16 @@ class HiChainNative private constructor() {
         external fun close(handle: Long)
 
         /**
+         * Forgets the trust this session stored for one peer.
+         *
+         * The loopback self-test pairs two sessions inside this process; without this it would
+         * leave a permanently trusted peer behind in the car's key store.
+         */
+        @JvmStatic
+        @Synchronized
+        external fun forgetPeer(handle: Long, authId: String, userType: Int): Int
+
+        /**
          * Runs the key-store calls a bind's exchange phase makes, in order, on a throwaway alias.
          *
          * Returns one line per call plus a verdict, or null when the engine is not in this build.
@@ -104,15 +114,23 @@ class HiChainNative private constructor() {
             val failedResult: Boolean get() = error == 0 && result == RESULT_END_FAILED
 
             /** The phase names above, so a log line says "KEY_AGREEMENT_END" and not "3". */
-            fun describe(): String = when (result) {
-                0 -> "END_SUCCESS"
-                1 -> "END_FAILED"
-                2 -> "KEY_AGREEMENT_PROCESSING"
-                3 -> "KEY_AGREEMENT_END"
-                4 -> "OPERATION_PROCESSING"
-                5 -> "OPERATION_END"
-                else -> "result=$result"
-            }
+            fun describe(): String = describeResult(result)
+        }
+
+        /**
+         * Maps the engine's `hc_result` phase to its name.
+         *
+         * Exposed on the companion as well because a caller that tracks a session by its numbers
+         * (rather than by holding a [Step]) still needs the same names.
+         */
+        fun describeResult(result: Int): String = when (result) {
+            0 -> "END_SUCCESS"
+            1 -> "END_FAILED"
+            2 -> "KEY_AGREEMENT_PROCESSING"
+            3 -> "KEY_AGREEMENT_END"
+            4 -> "OPERATION_PROCESSING"
+            5 -> "OPERATION_END"
+            else -> "result=$result"
         }
 
         /**

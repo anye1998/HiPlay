@@ -1477,3 +1477,46 @@ verdict: PASS (0 failure(s))
 **结论**：exchange 阶段在密码学上已经可用——签名与验签都正确、密钥能落盘且跨重开保持同一把。
 尚未验证的是它与**真实手机**的互通（手机用同一份 deviceauth 的 `sha256` + `ED25519_sign(hash)` 约定），
 也就是下一次车机测试要回答的问题。
+
+### 7.31 在模拟器里跑完整 bind：两侧都是 END_SUCCESS，密钥一致
+
+7.30 修好签名之后，还剩下一个问题：**exchange 这个阶段本身能不能走完**。以前只有车机能回答——先要手机、
+先要 PIN、先要发现链路全通，一次测试几分钟，而且失败信息只有一句"密码错误"。
+
+本轮把它变成不必出门的实验：**在本进程里起两个会话**，一个当车机（accessory），一个当手机（centre），
+用 `start_pake` 让手机侧开口，然后把两边的数据包互相喂进去。两侧的身份不同（`selftest-car` / `selftest-phone`），
+用的是同一个六位码，走的完全是线上那条代码路径（PAKE + exchange + 落盘）。
+
+`Crypto self-test` 末尾新增输出：
+
+```
+HiChain loopback: 6 exchange(s); car=END_SUCCESS key=32B error=0, phone=END_SUCCESS key=32B error=0
+HiChain loopback: both sides derived the same 32-byte key
+HiChain loopback: operation complete car=true phone=true
+HiChain loopback: trust cleanup car=0 phone=0 (0 = removed)
+```
+
+四点必须分别看：
+
+1. **`car=END_SUCCESS`**：这正是 7.19 那次在车上永远到不了的状态。交换阶段现在真的结束了，
+   不再是 `KEY_AGREEMENT_END` 之后断掉、更不是 `END_FAILED(29)`。
+2. **两侧密钥相同**：PAKE 与 exchange 用的是同一份材料，说明签名、验签、加密三处都自洽。
+3. **`operation complete car=true`**：引擎自己认为整个操作结束（`OVER_STATE`），
+   这就是"可以停止喂引擎"的判据，也是 7.23 那个 bug 的反面。
+4. **`trust cleanup car=0 phone=0`**：回环会在密钥库里给"对方"存一条信任，测试必须自己擦掉。
+   这里报告的是 `delete_local_auth_info` 的返回值，`0` 表示已删除。
+   （顺带一说：我本来想直接读 `hks_keystore` 核对，被本机的安全策略拦下了——拦得对，那是密钥材料。
+   所以改成让 App 自己报告清理结果，反而更干净。）
+
+**这个实验证明了什么、没证明什么**：
+
+- 证明：从 PAKE 到 exchange 的整条流程、别名生成、长期密钥的生成/导出/签名/验签/导入、
+  会话密钥的派生，全部可用；两侧独立算出同一个 32 字节密钥。
+- **没有证明**：真实华为手机的实现与我们一致。两侧都是我们自己的引擎，
+  所以它能排除"我们内部不自洽"，不能排除"我们与华为的实现理解不同"。
+  后者只能靠车机实测。不过 7.22–7.24 的过程已经证明，手机愿意走完 PAKE 并接受我们的回包，
+  差异只可能出现在 exchange 这一段——而现在这一段的密码学已经自证了。
+
+**同时完成的两件小事**：`stepDecoded` 的相位名提成 `HiChainNative.describeResult()`（回环按数值跟踪，
+不再持有 `Step` 对象）；`forgetPeer()` 是给回环用的清理入口，走引擎自己的 `delete_local_auth_info`，
+不直接删文件。

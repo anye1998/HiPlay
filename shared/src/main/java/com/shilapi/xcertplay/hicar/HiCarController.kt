@@ -127,6 +127,111 @@ class HiCarController(
         report.lineSequence().filter { it.isNotBlank() }.forEach { line ->
             onLog("HiChain self-test: $line")
         }
+        loopbackHandshake()
+    }
+
+    /**
+     * Runs a complete bind between two sessions inside this process: one acting as the car, one as
+     * the phone.
+     *
+     * The key-store self-test proves each call in isolation; this proves the exchange phase, which
+     * is the part that used to end in `END_FAILED` on the car. Both sessions are the same engine
+     * with opposite roles and distinct identities, so a pass means the packet flow, the alias
+     * handling, the signatures and the shared key all agree — the one thing it cannot prove is that
+     * a real phone's implementation agrees, which is what the car test is for.
+     */
+    private fun loopbackHandshake() {
+        if (!PIN_DIGITS.matches(config.pin)) {
+            onLog("HiChain loopback: skipped, the connection code is not six digits")
+            return
+        }
+        var car = 0L
+        var phone = 0L
+        try {
+            car = HiChainNative.create(CAR_ID, PHONE_ID, config.pin, ROLE_ACCESSORY)
+            phone = HiChainNative.create(PHONE_ID, CAR_ID, config.pin, ROLE_CENTRE)
+            if (car == 0L || phone == 0L) {
+                onLog("HiChain loopback: could not create both sessions (car=$car, phone=$phone)")
+                return
+            }
+            val toCar = ArrayDeque<ByteArray>()
+            val toPhone = ArrayDeque<ByteArray>()
+            val firstStep = HiChainNative.stepDecoded(phone, null, KEY_BYTES)
+            if (firstStep == null) {
+                onLog("HiChain loopback: the phone side produced no first packet")
+                return
+            }
+            // Tracked as numbers rather than as Step objects: the type lives inside the binding's
+            // companion, and only these four values are ever read.
+            var phoneResult = firstStep.result
+            var phoneKeyLength = firstStep.keyLength
+            var phoneError = firstStep.error
+            var phoneCompleted = firstStep.completed
+            var carResult = -1
+            var carKeyLength = 0
+            var carError = -1
+            var carCompleted = false
+            toCar.addAll(firstStep.packets)
+            var exchanges = 0
+            while (exchanges < MAX_EXCHANGES && (toCar.isNotEmpty() || toPhone.isNotEmpty())) {
+                if (toCar.isNotEmpty()) {
+                    val step = HiChainNative.stepDecoded(car, toCar.removeFirst(), KEY_BYTES) ?: break
+                    carResult = step.result
+                    carKeyLength = step.keyLength
+                    carError = step.error
+                    carCompleted = step.completed
+                    toPhone.addAll(step.packets)
+                } else {
+                    val step = HiChainNative.stepDecoded(phone, toPhone.removeFirst(), KEY_BYTES) ?: break
+                    phoneResult = step.result
+                    phoneKeyLength = step.keyLength
+                    phoneError = step.error
+                    phoneCompleted = step.completed
+                    toCar.addAll(step.packets)
+                }
+                exchanges++
+            }
+            onLog(
+                "HiChain loopback: $exchanges exchange(s); car=" +
+                    "${HiChainNative.describeResult(carResult)} key=${carKeyLength}B error=$carError, " +
+                    "phone=${HiChainNative.describeResult(phoneResult)} key=${phoneKeyLength}B " +
+                    "error=$phoneError",
+            )
+            val carKey = HiChainNative.sessionKey(car)
+            val phoneKey = HiChainNative.sessionKey(phone)
+            when {
+                carKey == null || phoneKey == null ->
+                    onLog(
+                        "HiChain loopback: no session key on the " +
+                            (if (carKey == null) "car" else "phone") + " side",
+                    )
+                carKey.contentEquals(phoneKey) ->
+                    onLog("HiChain loopback: both sides derived the same ${carKey.size}-byte key")
+                else -> onLog("HiChain loopback: the two sides derived DIFFERENT keys")
+            }
+            onLog(
+                "HiChain loopback: operation complete car=$carCompleted phone=$phoneCompleted",
+            )
+        } catch (failure: RuntimeException) {
+            onLog("HiChain loopback: threw ${failure.javaClass.simpleName}: ${failure.message}")
+        } finally {
+            // Both sides stored a trust entry for the other; neither may survive the test. The
+            // statuses are reported because "cleaned up" is a claim, and a silent failure here
+            // would leave a permanently trusted fake peer in the car's key store.
+            if (car != 0L && phone != 0L) {
+                val carForgot = HiChainNative.forgetPeer(car, PHONE_ID, USER_TYPE_CONTROLLER)
+                val phoneForgot = HiChainNative.forgetPeer(phone, CAR_ID, USER_TYPE_ACCESSORY)
+                onLog(
+                    "HiChain loopback: trust cleanup car=$carForgot phone=$phoneForgot (0 = removed)",
+                )
+            }
+            if (car != 0L) {
+                HiChainNative.close(car)
+            }
+            if (phone != 0L) {
+                HiChainNative.close(phone)
+            }
+        }
     }
 
     fun start() {        if (!running.compareAndSet(false, true)) {
@@ -602,6 +707,22 @@ class HiCarController(
         const val KIND_NETWORK_COMMAND = 33
         const val PREFERENCES = "hicar-receiver"
         const val KEY_SEQUENCE = "discovery_sequence"
+
+        /** Roles and user types from the engine's own header; the car is always the accessory. */
+        const val ROLE_CENTRE = 1
+        const val ROLE_ACCESSORY = 2
+        const val USER_TYPE_ACCESSORY = 0
+        const val USER_TYPE_CONTROLLER = 1
+
+        /** The loopback's identities: distinct from anything a phone would present. */
+        const val CAR_ID = "selftest-car"
+        const val PHONE_ID = "selftest-phone"
+        const val KEY_BYTES = 32
+
+        /** Generous: a bind is a handful of messages, so exceeding this means it is looping. */
+        const val MAX_EXCHANGES = 24
+
+        val PIN_DIGITS = Regex("[0-9]{6}")
 
         /** Long enough to stay out of the way, short enough that a 2-minute test shows progress. */
         const val WAIT_HEARTBEAT_MILLIS = 30_000L

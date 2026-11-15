@@ -703,10 +703,35 @@ Java_com_shilapi_xcertplay_hicarauth_HiChainNative_sessionKey(JNIEnv *env, jclas
     return key;
 }
 
+/*
+ * Forgets the trust this session stored for one peer.
+ *
+ * Needed only by the loopback self-test, which pairs two sessions in this process and would
+ * otherwise leave a permanently trusted "peer" in the car's key store. Returns 0 when the entry is
+ * gone (or was never there), non-zero otherwise.
+ */
+JNIEXPORT jint JNICALL
+Java_com_shilapi_xcertplay_hicarauth_HiChainNative_forgetPeer(JNIEnv *env, jclass clazz, jlong handle,
+    jstring auth_id, jint user_type)
+{
+    (void)clazz;
+    struct session *session = (struct session *)(intptr_t)handle;
+    if (session == NULL || session->handle == NULL) {
+        return -1;
+    }
+    struct hc_user_info info;
+    memset(&info, 0, sizeof(info));
+    info.auth_id.length = copy_string(env, auth_id, info.auth_id.auth_id, MAX_ID_BYTES);
+    info.user_type = user_type;
+    if (info.auth_id.length == 0) {
+        return -1;
+    }
+    return delete_local_auth_info(session->handle, &info);
+}
+
 JNIEXPORT void JNICALL
 Java_com_shilapi_xcertplay_hicarauth_HiChainNative_close(JNIEnv *env, jclass clazz, jlong handle)
-{
-    (void)env;
+{    (void)env;
     (void)clazz;
     struct session *session = (struct session *)(intptr_t)handle;
     if (session == NULL) {
