@@ -1270,3 +1270,49 @@ HiChain step 3: engine reported END_FAILED; its own report follows
   `session already failed, N bytes ignored`，避免把真正的原因淹没在六条一样的失败里。
 
 （注：`message 900` 是 `INFORM_MESSAGE` 的枚举值，不是错误码；错误码在 payload 里。）
+
+### 7.27 根因定位：exchange 验签被我们自己的编译宏裁掉了（不是协议问题）
+
+`hicar-log-20261115-121807.txt`（12:18）第一次打印出引擎自己的错误码：
+
+```
+HiChain step 3: engine reported END_FAILED; its own report follows
+  engine reply 1: {"message":32896, "payload":{"errorCode":29}}
+```
+
+`29` = **`HC_VERIFY_EXCHANGE_FAILED`**。调用链一路读下来是确定的：
+
+```
+send_exchange_response()                       auth_info/exchange_auth_info.c:59
+ └ parse_exchange_request_data()               解密 + 取字段 + 验签
+    └ verify_peer_public_key()                 验签失败即 return HC_VERIFY_EXCHANGE_FAILED(29)
+       └ verify_with_public_key()              huks_adapter.c:1215
+          └ hks_asymmetric_verify()            huks_lite/.../hks_client.c:199
+             #ifdef _CUT_AUTHENTICATE_
+                 return HKS_ERROR_NOT_SUPPORTED;     ← 我们定义的宏，直接短路
+```
+
+**这个宏正是本项目自己在 `CMakeLists.txt` 里加的**（为了避免引入 OpenSSL：`soft_service/hks_service.c`
+里 `#include <ec_local.h>` 是 OpenSSL 内部头，NDK 里没有 BoringSSL 的这套内部结构）。代价在 7.23 之前
+一直没暴露，因为流程根本没走到 exchange；今天走到了，代价立刻显形：
+
+- `hks_asymmetric_verify` 在 `_CUT_AUTHENTICATE_` 下是一个**返回"不支持"的桩**；
+- 真正的实现 `hks_service_asymmetric_verify`（`soft_service/hks_service.c:679`）整段在
+  `#ifndef _CUT_AUTHENTICATE_` 里，而且它调用 `ED25519_verify(...)` —— **全树只有调用、没有实现**，
+  那份实现来自 OpenSSL。`CRYPTO_PUBLIC_KEY_BYTES = 32` 也说明长期密钥是 **Ed25519**，而 mbedtls 2.28.9
+  没有 Ed25519 签名/验签（只有 X25519 的 ECDH）。
+
+因此这不是协议、时序或码的问题：**当前这个 native 构建在密码学上做不完 bind 的 exchange 阶段**，
+手机端看到的就是"密码错误 + 配对信息清除"。
+
+**三条出路（都不小，必须选一条，不能再靠调参推进）**：
+
+| 路线 | 内容 | 代价 / 风险 |
+| --- | --- | --- |
+| A. 自带 Ed25519 | 引入一份紧凑的 Ed25519 实现（sign+verify），把 `hks_client.c` 的两个桩与 `hks_service.c` 被裁的 verify/sign/import 路径接回去 | 需要新增第三方源码并处理许可；还要用实验确定签名输入是"原文"还是"SHA-256 摘要"（两种都试，日志会写哪个成立） |
+| B. 承认边界 | 记录"Android + 本方案无法完成 HiCar bind"，能力表注明原因 | 与目标（车机端接收）冲突 |
+| C. 换平台 | 走 Linux/BlueZ（参考项目 HelloCar 的路径） | 偏离"Android 车机"前提 |
+
+另有一条**不建议**的"捷径"：跳过验签（`verify_with_public_key` 直接返回 `HC_OK`）。它能让流程继续，
+但等于放弃长期密钥的签名校验，且我们的 `EXCHANGE_RESPONSE` 同样需要签名——手机端仍会拒绝，所以它也
+解决不了问题，只会制造"看起来通了"的假象。若将来为排查临时启用，必须是 debug-only 并在日志里明写。
