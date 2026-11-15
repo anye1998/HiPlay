@@ -387,6 +387,7 @@ class HiCarController(
             onLog = { message -> onLog(message) },
         )
         var session: HiCarControlSession? = null
+        var announced = false
         val decoder = HiCarFrameDecoder()
         try {
             val input: InputStream = socket.inputStream
@@ -397,23 +398,40 @@ class HiCarController(
                 if (read < 0) break
                 if (!control) {
                     val active = session
-                    if (active == null) {
+                    if (active != null) {
+                        for (reply in active.feed(buffer, read)) {
+                            output.write(reply)
+                            output.flush()
+                        }
+                        continue
+                    }
+                    // A key does not mean the phone has finished with this channel: at 11:29 it sent
+                    // another JSON envelope (oper_type 3, message 3) right after the handshake, and
+                    // answering that with an OPTIONS greeting is what killed the connection. The
+                    // protocol that arrives is what decides — not the fact that authentication ended.
+                    if (looksLikeEnvelope(buffer, read)) {
                         for (reply in identity.feed(buffer, read)) {
                             output.write(reply)
                             output.flush()
                         }
                         val key = authenticator.sessionKey
-                        if (key != null) {
+                        if (key != null && !announced) {
+                            announced = true
                             report(HiCarStatus.Authenticated)
                             onLog(
-                                "HiChain finished: ${key.size}-byte session key; opening DMSDP on the " +
-                                    "${if (control) "control" else "business"} channel",
+                                "HiChain finished: ${key.size}-byte session key; the phone keeps the " +
+                                    "envelope channel for now, DMSDP starts when it switches",
                             )
                             liveNetwork?.authenticated = true
-                            session = openControlSession(output, key)
                         }
-                    } else {
-                        for (reply in active.feed(buffer, read)) {
+                        continue
+                    }
+                    val key = authenticator.sessionKey
+                        ?: throw HiCarWireException("non-envelope bytes before authentication")
+                    onLog("HiCar: the phone switched from envelopes to DMSDP records on the business channel")
+                    session = openControlSession(output, key)
+                    session?.let { opened ->
+                        for (reply in opened.feed(buffer, read)) {
                             output.write(reply)
                             output.flush()
                         }
@@ -485,6 +503,22 @@ class HiCarController(
         // before this line is the phone speaking first, and one after it answers our OPTIONS.
         onLog("DMSDP: sent ${greeting.size}-byte OPTIONS greeting")
         return session
+    }
+
+    /**
+     * True when the bytes begin with a JSON object.
+     *
+     * The phone's HiCar envelopes always start with `{`, while a DMSDP record starts with its
+     * marker byte, so the first non-space byte is enough to tell the two protocols apart on a
+     * channel that carries both.
+     */
+    private fun looksLikeEnvelope(data: ByteArray, count: Int): Boolean {
+        for (index in 0 until count) {
+            val byte = data[index].toInt() and 0xFF
+            if (byte == ' '.code || byte == '\t'.code || byte == '\r'.code || byte == '\n'.code) continue
+            return byte == '{'.code
+        }
+        return false
     }
 
     private fun thread(name: String, body: () -> Unit): Thread =

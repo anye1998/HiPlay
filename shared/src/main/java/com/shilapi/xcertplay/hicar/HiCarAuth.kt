@@ -175,6 +175,18 @@ internal class HiCarIdentityExchange(
                 if (!identityExchanged) throw HiCarWireException("authentication order")
                 val engine = authenticator
                     ?: throw HiCarAuthException(HiCarAuthBlocker.NATIVE_HICHAIN_LIBRARY_MISSING)
+                // The phone keeps using this envelope after the key exists — the run at 11:29 showed
+                // a message:3 arriving there. Feeding it to the engine again would step a finished
+                // session, so the message is recorded and left unanswered instead of ending the
+                // connection: what the phone says next is the only way to learn the sequence.
+                if (engine.complete) {
+                    onLog(
+                        "HiCar envelope after authentication: oper_type=$operType, " +
+                            "message=${data.optInt("message", -1)}, keys=${keysOf(data)}, " +
+                            "${dataText.length} bytes; no reply is defined for it yet",
+                    )
+                    return emptyList()
+                }
                 // Message 17 announces the key length the phone will accept; every other message
                 // keeps the current value, which starts at the engine's 32-byte default.
                 if (data.optInt("message", 0) == MESSAGE_STS_REQUEST) {
@@ -191,9 +203,20 @@ internal class HiCarIdentityExchange(
                 }
             }
 
-            else -> throw HiCarWireException("operation type")
+            else -> {
+                // An unknown operation is recorded rather than fatal: closing here is what made the
+                // phone restart its whole flow (and ask for the PIN again) with nothing to show for it.
+                onLog(
+                    "HiCar envelope with unknown oper_type=$operType " +
+                        "(message=${data.optInt("message", -1)}, keys=${keysOf(data)}, ${dataText.length} bytes); ignored",
+                )
+                emptyList()
+            }
         }
     }
+
+    private fun keysOf(data: JSONObject): String =
+        runCatching { data.keys().asSequence().sorted().joinToString(",") }.getOrDefault("unreadable")
 
     private fun envelope(operType: Int, data: JSONObject): ByteArray =
         JSONObject()

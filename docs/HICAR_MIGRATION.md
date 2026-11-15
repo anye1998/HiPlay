@@ -1079,3 +1079,43 @@ DMSDP: unexpected record header marker=0x7b size=...
 
 顺带修掉一处日志插值 bug：`engine=$step.code` 被 Kotlin 解析成 `$step` 后接 `.code`，
 日志里出现 `...Step@bb01e5e.code`，现改为 `${step.code}`。
+
+### 7.22 手机鉴权后说的还是 JSON 信封，不是 DMSDP
+
+`hicar-log-20261115-112906.txt`（11:29）。新增的帧头日志一次就把问题定位了：
+
+```
+HiChain finished: 32-byte session key; opening DMSDP on the business channel
+DMSDP: sent 115-byte OPTIONS greeting
+DMSDP: unexpected record header marker=0x7b size=8804,
+       first bytes=7b 22 64 61 74 61 22 3a 22 7b 5c 22 6d 65 73 73 61 67 65 5c 22 3a 33 2c
+DMSDP rejected: control header
+```
+
+`0x7b` 是 `{`，后面是 `"data":"{\"message\":3,` —— **手机在鉴权完成后继续使用 HiCar 的 JSON 信封
+（`oper_type` + `data` 字符串），根本没切到 DMSDP**。我们却在拿到 key 的瞬间就把这条 socket 当成 DMSDP
+通道，先发一条 `OPTIONS * DMSDP/1.0`（115 字节），再把对方的 JSON 当记录头解析，失败即关连接——
+手机于是重拨、重开 HiCar 流程、再要一次密码。这就是"每次输完密码又让再输"的完整原因。
+
+**修法不是猜协议，而是让内容决定走哪条路**：
+
+- 分流：读到的第一段字节以 `{` 开头 → 继续喂信封处理器；否则（DMSDP 记录以 marker 开头）才切控制通道。
+  只有这样才不会再出现"鉴权成功但被我们主动掐断"。
+- **鉴权完成后到达的信封不再喂给引擎**（引擎已结束，再 `step` 是拿完成态去跑），改为记录并**不回复**：
+  `oper_type`、`message`、字段名列表、字节数。当前不知道手机要什么回包，乱回比不回更糟。
+- **未知 `oper_type` 不再抛异常断开**，改为记录后忽略。之前 `else -> throw "operation type"`，
+  陌生消息一律等于断线，代价是整轮重来、用户再输一次密码。
+- `HiCarStatus.Authenticated` 在拿到 key 时照常上报，但**不再顺手打开 DMSDP**；DMSDP 的真正起点推迟到
+  "手机改用记录协议"那一刻。
+
+下一次预期看到这一行（手机要什么，就看它的字段名）：
+
+```
+HiCar envelope after authentication: oper_type=3, message=3, keys=..., N bytes; no reply is defined for it yet
+```
+
+拿到这一行就能判断它是"鉴权结果通知"（不需要回包，继续等下一步）还是"服务/能力查询"（需要构造回包）。
+
+顺带记录一个与本改动无关的环境问题：`:shared:testDebugUnitTest` 里
+`AmbientWorkerOwnerLockSymlinkTest` 三项失败，原因是 Windows 创建符号链接需要特权
+（`FileSystemException: 客户端没有所需的特权`），属本机权限限制，不是代码回归；其余 1868 项通过。
