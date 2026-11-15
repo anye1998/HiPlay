@@ -141,13 +141,13 @@
         </activity>
 
         <!-- A second icon, not a route inside DiPlay: the experimental receiver must not look like
-             part of the CarPlay flow. The label stays a literal because the screen's own copy is
-             English and a translation would need all twelve locales the resource tests enforce. -->
+             part of the CarPlay flow. The label stays a literal to match the screen's own copy, which
+             is Simplified Chinese on purpose and hardcoded so it reads the same on any ROM locale. -->
         <activity-alias
             android:name="com.shilapi.xcertplay.HiCarLauncherAlias"
             android:targetActivity="com.shilapi.xcertplay.HiCarHostActivity"
             android:exported="true"
-            android:label="HiCar (experimental)">
+            android:label="HiCar（实验）">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

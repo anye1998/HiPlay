@@ -247,7 +247,7 @@ HiChain 鉴权已按公开实现集成：`:hicar-auth` 模块把 OpenHarmony 的
 
 - 诊断报告里 `CarPlay setup:` 那一行现在会带上真实原因（`setupFailureDetail`），
   不再是干巴巴一句 `authentication unavailable`。
-- HiCar 界面新增桌面图标 **HiCar (experimental)**（`activity-alias`，独立入口，不进 DiPlay 主界面），
+- HiCar 界面新增桌面图标 **HiCar（实验）**（`activity-alias`，独立入口，不进 DiPlay 主界面；原名 HiCar (experimental)，7.32 起汉化），
   平板上不接 adb 也能直接打开。原来的 `am start` / 自定义 action 仍然可用。
 
 ### 7.1 第二次实测：连接其实已经发起，卡在等 MFi 协处理器
@@ -1520,3 +1520,38 @@ HiChain loopback: trust cleanup car=0 phone=0 (0 = removed)
 **同时完成的两件小事**：`stepDecoded` 的相位名提成 `HiChainNative.describeResult()`（回环按数值跟踪，
 不再持有 `Step` 对象）；`forgetPeer()` 是给回环用的清理入口，走引擎自己的 `delete_local_auth_info`，
 不直接删文件。
+
+### 7.32 界面汉化（只汉化控件，日志保持英文）
+
+用户提出"可以把 HiCar (experimental) 界面汉化吗"。范围经确认后定为：**控件与状态行汉化，
+日志区保持英文**。
+
+原因不是省事，而是日志的用途不同：日志是协议证据，`docs/HICAR_MIGRATION.md` 里 7.x 每段都逐字引用了它，
+贴给外部排查时也要能和文档对上；把 200 多行引擎日志译成中文，等于让"文档里的片段"和"屏幕上的片段"
+永久失配。界面文字则只服务于站在车机前的人，越像母语越好。
+
+改了什么：
+
+- 标题、链路说明、机型码输入框标签与切换按钮、连接码标题与提示、五个操作按钮
+  （开始/停止、清空日志、重置配对、允许被发现、加密自检）、措辞警告、
+  导出/分享/嗅探/设备体检/root 探针按钮、状态行、本机标识、导出与分享的提示文案。
+- `describe(status)` 全部分支改成中文：`热点 SSID，地址 (backend)`、`等待手机接入`、
+  `业务通道已通告，等待认证`、`控制通道已就绪；媒体阶段尚未实现` 等。
+  `Blocked` / `Failed` 两个分支保留引擎给的英文原文作为后半段——那行本来就是给排查用的。
+- 桌面图标 `activity-alias` 的 `android:label` 从 `HiCar (experimental)` 改为 `HiCar（实验）`，
+  与界面标题一致。
+
+**没有改成 `strings.xml` 资源**，这是有意为之，理由写在 `HiCarHostActivity` 的类注释里：
+
+1. 这个界面要在任何 ROM 语言下都显示中文。车机若以英文启动，汉化界面不该跟着变回英文——
+   否则最需要看懂的那一屏（为什么配对失败）又会变成外语。
+2. `JapaneseTranslationsTest` / `TraditionalChineseTranslationsTest` 要求 `values/` 里每个 key
+   在 `values-ja`、`values-zh-rTW` 都有对应条目且占位符一致。为一个诊断界面新加几十条 key，
+   就得同时补日文与繁中译文；这批文案还会随实测继续改，翻译债只会越滚越大。
+
+副作用（明说）：本界面不跟随 App 的语言设置，任何语言环境下都是简体中文；
+其余界面仍走原来的多语言资源，行为不变。
+
+**未改动的部分**（仍为英文）：日志行（含本界面自己 `appendLog` 的那些，如 `Pairing reset:`）、
+导出的报告文本（`HiCarLogReport`，字段名 `connection code:` 等被 `HiCarExportUiTest` 断言）、
+`HiCarDeviceAudit` 的体检块、蓝牙设备名 `HiCar receiver`（这是发给手机的名字，不是界面文案）。

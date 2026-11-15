@@ -61,9 +61,14 @@ import java.util.Locale
  * adb shell am start -n com.shihab.diplay/com.shilapi.xcertplay.HiCarHostActivity
  * ```
  *
- * Copy is not localized yet: every string here is a bring-up label, and adding it to the resource
- * files would require the twelve locale variants the Settings tests enforce. See the TODO in
- * `docs/HICAR_MIGRATION.md`.
+ * Copy is Simplified Chinese on purpose, and hardcoded rather than taken from `strings.xml`: this is
+ * a bring-up surface for the person holding the head unit, and the labels must read the same no matter
+ * which locale the ROM is set to (a head unit that boots in English must not hide the one screen that
+ * explains why pairing failed). Moving them into resources would also mean translating every new label
+ * into the locale folders `JapaneseTranslationsTest` and `TraditionalChineseTranslationsTest` enforce.
+ *
+ * The log lines stay English: they are protocol evidence, quoted verbatim in
+ * `docs/HICAR_MIGRATION.md`, and read by whoever parses the exported report.
  */
 class HiCarHostActivity : ComponentActivity() {
     private var status by mutableStateOf<HiCarStatus>(HiCarStatus.Idle)
@@ -146,12 +151,11 @@ class HiCarHostActivity : ComponentActivity() {
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Text("HiCar receiver (experimental)", style = MaterialTheme.typography.headlineSmall)
+            Text("HiCar 接收端（实验）", style = MaterialTheme.typography.headlineSmall)
             Text(
-                "Connection chain: access point, insecure RFCOMM records, 0xFDEE advertisement, " +
-                    "channel negotiation, HiChain authentication, DMSDP control channel. " +
-                    "Video, audio, steering-wheel and HUD are not implemented, and no HiChain exchange " +
-                    "has been verified against a real phone yet.",
+                "连接链路：热点 → RFCOMM 记录 → 0xFDEE 广播 → 通道协商 → HiChain 认证 → " +
+                    "DMSDP 控制通道。视频、音频、方向盘按键和 HUD 尚未实现，" +
+                    "HiChain 交换也还没有在真机上验证过。",
                 style = MaterialTheme.typography.bodyMedium,
             )
             OutlinedTextField(
@@ -162,7 +166,7 @@ class HiCarHostActivity : ComponentActivity() {
                     // restart, or the next run silently advertises a different device.
                     if (MODEL_PATTERN.matches(model)) rememberModel(model)
                 },
-                label = { Text("Advertised model (8 hex digits)") },
+                label = { Text("广播机型码（8 位十六进制）") },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
@@ -178,66 +182,65 @@ class HiCarHostActivity : ComponentActivity() {
             ) {
                 Text(
                     if (model == TEST_MODEL) {
-                        "Use this install's own id ${experimentalModel()}"
+                        "改用本次安装自己的机型码 ${experimentalModel()}"
                     } else {
-                        "Use test model $TEST_MODEL"
+                        "改用测试机型码 $TEST_MODEL"
                     },
                 )
             }
             Text(
-                "Connection code: $pin",
+                "连接码：$pin",
                 style = MaterialTheme.typography.headlineSmall,
                 fontFamily = FontFamily.Monospace,
             )
             // The code is the only shared secret in the handshake, and it changes whenever the trust
             // store is wiped. Saying so next to the digits is cheaper than a failed pairing run.
             Text(
-                "The phone asks for these six digits the first time. This code changes every time " +
-                    "Reset pairing is pressed, so read it from the screen when the prompt appears.",
+                "手机首次连接时会要求输入这 6 位数字。每按一次「重置配对」，连接码就会变，" +
+                    "弹窗出现时以这里显示的为准。",
                 style = MaterialTheme.typography.bodySmall,
             )
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Button(onClick = ::toggle, enabled = model.length == 8) {
-                    Text(if (running) "Stop" else "Start")
+                    Text(if (running) "停止" else "开始")
                 }
-                Button(onClick = ::clearLog) { Text("Clear log") }
-                Button(onClick = ::resetPairing) { Text("Reset pairing") }
-                Button(onClick = ::requestDiscoverable) { Text("Make discoverable") }
+                Button(onClick = ::clearLog) { Text("清空日志") }
+                Button(onClick = ::resetPairing) { Text("重置配对") }
+                Button(onClick = ::requestDiscoverable) { Text("允许被发现") }
                 // The key store is what the bind exchange signs with, and a broken one is invisible
                 // until a phone is present. This runs the same calls without a phone.
-                Button(onClick = ::cryptoSelfTest) { Text("Crypto self-test") }
+                Button(onClick = ::cryptoSelfTest) { Text("加密自检") }
             }
             // Drivers keep pressing this before every attempt. It is the one control that invalidates
             // a working pairing, so the cost belongs next to it rather than in a comment.
             Text(
-                "Only press Reset pairing to clear a pairing that went wrong: it wipes the stored " +
-                    "trust and issues a new code, so a phone that had finished pairing would have to " +
-                    "be paired again. The code itself survives restarts.",
+                "只有配对出错时才按「重置配对」：它会清掉已保存的信任关系并换发一个新的连接码，" +
+                    "之前已经配对成功的手机需要重新配对。连接码本身重启后仍保留。",
                 style = MaterialTheme.typography.bodySmall,
             )
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 // The export survives the session: a failed attempt is usually over by the time the
                 // driver decides to report it, and a screenshot loses the part above the fold.
                 Button(onClick = ::exportLog, enabled = !exporting) {
-                    Text(if (exporting) "Exporting…" else "Export log")
+                    Text(if (exporting) "导出中…" else "导出日志")
                 }
-                Button(onClick = ::shareLog, enabled = exportUri != null) { Text("Share") }
+                Button(onClick = ::shareLog, enabled = exportUri != null) { Text("分享") }
                 // One press, sixty seconds, no advertisement of our own: the only way to read what a
                 // real head unit actually puts on the air.
-                Button(onClick = ::sniff) { Text("Sniff 0xFDEE (60s)") }
+                Button(onClick = ::sniff) { Text("嗅探 0xFDEE（60 秒）") }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 // The same block the export carries, printed on screen: on a head unit without a
                 // file manager, reading it here and photographing it is faster than exporting.
-                Button(onClick = ::showAudit) { Text("Device audit") }
+                Button(onClick = ::showAudit) { Text("设备体检") }
                 // Explicitly triggered, read-only, and it says so: reading bt_config.conf needs su.
-                Button(onClick = ::rootProbe) { Text("Root probe") }
+                Button(onClick = ::rootProbe) { Text("root 探针") }
             }
             if (exportNotice.isNotEmpty()) {
                 Text(exportNotice, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
             }
-            Text("Status: ${describe(status)}", style = MaterialTheme.typography.titleSmall)
-            Text("Identity: ${identity()}", style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
+            Text("状态：${describe(status)}", style = MaterialTheme.typography.titleSmall)
+            Text("本机标识：${identity()}", style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
             // A plain column, not a lazy list: this screen already scrolls as a whole, and a nested
             // lazy list inside a vertical scroll would be measured with an infinite height.
             Column(modifier = Modifier.fillMaxWidth()) {
@@ -412,7 +415,9 @@ class HiCarHostActivity : ComponentActivity() {
         ) {
             appendLog(
                 "Not discoverable yet: the advertisement will be visible but a phone cannot reach " +
-                    "this device over BR/EDR. Press 'Make discoverable' first (the grant lasts 120 s).",
+                    // The button is named in Chinese because that is the label on screen now; the
+                    // rest of the line stays English like every other log line.
+                    "this device over BR/EDR. Press 「允许被发现」 first (the grant lasts 120 s).",
             )
         }
         val config = HiCarRuntimeConfig(
@@ -483,7 +488,7 @@ class HiCarHostActivity : ComponentActivity() {
         if (exporting) return
         exporting = true
         exportUri = null
-        exportNotice = "saving…"
+        exportNotice = "保存中…"
         val report = buildReportText()
         val fileName = logFileName()
         val context = applicationContext
@@ -496,14 +501,14 @@ class HiCarHostActivity : ComponentActivity() {
                     onSuccess = { saved ->
                         exportUri = saved.uri
                         exportNotice = when {
-                            saved.savedInApp -> "saved in app storage; use Share to retrieve it"
-                            saved.savedPath != null -> "saved to ${saved.savedPath}"
-                            else -> "saved to Downloads/DiPlay/$fileName"
+                            saved.savedInApp -> "已保存到应用私有目录，点「分享」取出"
+                            saved.savedPath != null -> "已保存到 ${saved.savedPath}"
+                            else -> "已保存到 Downloads/DiPlay/$fileName"
                         }
                         appendLog("Log exported: $exportNotice")
                     },
                     onFailure = { failure ->
-                        exportNotice = "export failed: ${failure.javaClass.simpleName}"
+                        exportNotice = "导出失败：${failure.javaClass.simpleName}"
                         appendLog("Log export failed: ${failure.message ?: failure.javaClass.simpleName}")
                     },
                 )
@@ -519,10 +524,10 @@ class HiCarHostActivity : ComponentActivity() {
             clipData = ClipData.newRawUri("HiCar log", uri)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
-        runCatching { startActivity(Intent.createChooser(intent, "Share HiCar log")) }
+        runCatching { startActivity(Intent.createChooser(intent, "分享 HiCar 日志")) }
             .onFailure {
                 // Head units often have no share target; the file is already saved either way.
-                exportNotice = "no app accepted the share; the file stays where it was saved"
+                exportNotice = "没有应用接受这次分享；文件仍在保存位置"
             }
     }
 
@@ -655,18 +660,18 @@ class HiCarHostActivity : ComponentActivity() {
         identity().take(8).uppercase().padEnd(8, '0')
 
     private fun describe(status: HiCarStatus): String = when (status) {
-        is HiCarStatus.Idle -> "idle"
-        is HiCarStatus.PreparingNetwork -> "preparing the access point"
-        is HiCarStatus.NetworkReady -> "access point ${status.ssid} at ${status.address} (${status.backend})"
-        is HiCarStatus.Advertising -> "starting the 0xFDEE advertisement"
-        is HiCarStatus.WaitingForPhone -> "waiting for the phone"
-        is HiCarStatus.ChannelNegotiated -> "business channel announced, waiting for authentication"
-        is HiCarStatus.Authenticating -> "authenticating"
-        is HiCarStatus.Authenticated -> "authenticated, opening the control channel"
-        is HiCarStatus.ControlChannelReady -> "control channel ready; the media stage is not implemented"
-        is HiCarStatus.Blocked -> "blocked: ${status.blocker.message}"
-        is HiCarStatus.Failed -> "failed: ${status.reason}"
-        is HiCarStatus.Stopped -> "stopped"
+        is HiCarStatus.Idle -> "空闲"
+        is HiCarStatus.PreparingNetwork -> "正在准备热点"
+        is HiCarStatus.NetworkReady -> "热点 ${status.ssid}，地址 ${status.address}（${status.backend}）"
+        is HiCarStatus.Advertising -> "正在发出 0xFDEE 广播"
+        is HiCarStatus.WaitingForPhone -> "等待手机接入"
+        is HiCarStatus.ChannelNegotiated -> "业务通道已通告，等待认证"
+        is HiCarStatus.Authenticating -> "正在认证"
+        is HiCarStatus.Authenticated -> "认证通过，正在打开控制通道"
+        is HiCarStatus.ControlChannelReady -> "控制通道已就绪；媒体阶段尚未实现"
+        is HiCarStatus.Blocked -> "受阻：${status.blocker.message}"
+        is HiCarStatus.Failed -> "失败：${status.reason}"
+        is HiCarStatus.Stopped -> "已停止"
     }
 
     private companion object {
