@@ -25,6 +25,7 @@ internal class HiChainAuthenticator(
     private var started = false
     private var stepIndex = 0
     private var operationDone = false
+    private var failed = false
 
     override var sessionKey: ByteArray? = null
         private set
@@ -56,6 +57,7 @@ internal class HiChainAuthenticator(
         started = true
         stepIndex = 0
         operationDone = false
+        failed = false
         // The code the engine will authenticate with, masked. A run where this does not match the
         // code on the screen has one obvious explanation, and the log should be able to show it
         // without anyone having to reproduce the screen.
@@ -67,6 +69,12 @@ internal class HiChainAuthenticator(
 
     override fun step(chunk: ByteArray, keyLength: Int): List<ByteArray> {
         if (!started || handle == 0L) throw HiCarAuthException(HiCarAuthBlocker.NATIVE_HICHAIN_LIBRARY_MISSING)
+        if (failed) {
+            // Past END_FAILED the engine has nothing left to say; feeding it further messages only
+            // produces more informs and buries the one that carries the reason.
+            onLog("HiChain step: session already failed, ${chunk.size} bytes ignored")
+            return emptyList()
+        }
         val step = HiChainNative.stepDecoded(handle, chunk, keyLength)
             ?: throw HiCarAuthException(HiCarAuthBlocker.NATIVE_HICHAIN_LIBRARY_MISSING)
         stepIndex++
@@ -86,6 +94,17 @@ internal class HiChainAuthenticator(
                     "a wrong code on the phone is the most likely cause, but the number is what decides",
             )
             throw HiCarAuthException(HiCarAuthBlocker.PIN_NOT_TRUSTED)
+        }
+        if (step.failedResult) {
+            // The engine answers a failed request with an inform message that carries its own error
+            // code. That packet is the only place the reason exists, so it is printed rather than the
+            // bare word END_FAILED. The session is over at this point; further packets are ignored.
+            failed = true
+            onLog("HiChain step $stepIndex: engine reported END_FAILED; its own report follows")
+            step.packets.forEachIndexed { index, packet ->
+                onLog("  engine reply ${index + 1}: ${describePacket(packet)}")
+            }
+            return emptyList()
         }
         if (step.finished) {
             val key = HiChainNative.sessionKey(handle)
@@ -111,6 +130,22 @@ internal class HiChainAuthenticator(
             )
         }
         return step.packets
+    }
+
+    /**
+     * The engine's own packets are JSON text; this trims one to a log line.
+     *
+     * Printing them is what turns "END_FAILED" into a numeric reason, which is the difference
+     * between guessing at the failure and reading it. The inform message carries a bare int32
+     * payload, so the number is translated here rather than looked up by hand afterwards.
+     */
+    private fun describePacket(packet: ByteArray): String {
+        val text = packet.map { byte -> if (byte.toInt() in 32..126) byte.toInt().toChar() else ' ' }
+            .joinToString("")
+        val trimmed = if (text.length <= 300) text else text.take(300) + "…"
+        val code = PAYLOAD_INT.find(text)?.groupValues?.getOrNull(1)?.toIntOrNull()
+        val name = code?.let { ERROR_NAMES[it] ?: "code $it" }
+        return if (name == null) trimmed else "$trimmed  [$name]"
     }
 
     override fun close() {
@@ -146,5 +181,31 @@ internal class HiChainAuthenticator(
     private companion object {
         const val ROLE_ACCESSORY = 2
         val PIN_PATTERN = Regex("[0-9]{6}")
+
+        /** The inform message carries its error as a bare int32 payload. */
+        val PAYLOAD_INT = Regex("\"payload\"\\s*:\\s*(-?\\d+)")
+
+        /**
+         * `hc_result`/`hc_error` names from `hichain.h`, so the log says which failure it was.
+         *
+         * Only the codes the exchange phase can plausibly return are listed; an unlisted number is
+         * still printed, just without a name.
+         */
+        val ERROR_NAMES = mapOf(
+            2 to "HC_INNER_ERROR",
+            3 to "HC_STATE_ERROR",
+            9 to "HC_BUILD_OBJECT_FAILED",
+            12 to "HC_VERSION_UNSUPPORT",
+            16 to "HC_IMPORT_AUTH_DATA_FAILED",
+            26 to "HC_DECRYPT_FAILED",
+            29 to "HC_VERIFY_EXCHANGE_FAILED",
+            30 to "HC_SIGN_EXCHANGE_FAILED",
+            31 to "HC_SAVE_LTPK_FAILED",
+            33 to "HC_GET_LTPK_FAILED",
+            34 to "HC_GEN_ALIAS_FAILED",
+            37 to "HC_UNSUPPORT",
+            38 to "HC_MESSAGE_INCONSISTENCY",
+            39 to "HC_OPERATION_CODE_ERROR",
+        )
     }
 }

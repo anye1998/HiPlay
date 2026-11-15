@@ -1229,3 +1229,44 @@ the last failed attempt; then Start again — the code has not changed, Reset pa
 
 **这轮同时确认的操作事实**：`Reset pairing` 换码后**手机不会因为新码而来拨**——是否拨号完全由手机侧
 发起。所以正确顺序始终是"先在手机上进 HiCar 连接界面，再在车机上 Start"，而不是先 Start 等手机。
+
+### 7.26 exchange 阶段被引擎判为 END_FAILED：先把引擎自己的错误码读出来
+
+`hicar-log-20261115-120850.txt`（12:08）。7.23 的改动生效了——`message 3` 终于被喂进引擎——但引擎直接判失败：
+
+```
+HiChain step 2: phase=KEY_AGREEMENT_END, key=32B                       <- PAKE 正常
+HiChain step 3: phase=END_FAILED, key=32B, error=0, out=1              <- exchange 被拒
+HiChain step 4/5/6: phase=END_FAILED ...                               <- 手机继续重试，全部 END_FAILED
+HiChain ended after 6 step(s) with a key but before the operation finished
+```
+
+手机因此弹"密码错误"——**这个文案在 exchange 失败时也会出现**，不只是码错。
+
+`exchange_auth_info.c` 里 `send_exchange_response()` 只有三处能返回错误，每处都会把
+`send->msg_code` 改成 `INFORM_MESSAGE`，而 inform 的 payload 是一个**裸 int32 错误码**
+（`encap_inform_message`：`*err = error_code; send->payload = err;`）：
+
+| 步骤 | 失败会得到什么 |
+| --- | --- |
+| `parse_exchange_request_data`（用 PAKE 会话密钥解密、验签、比对 auth id） | `HC_DECRYPT_FAILED`(26) / `HC_VERIFY_EXCHANGE_FAILED`(29) / `HC_SIGN_EXCHANGE_FAILED`(30) |
+| `build_exchange_response_data` | `HC_GET_LTPK_FAILED`(33) / `HC_GEN_ALIAS_FAILED`(34) |
+| `save_auth_info(..., HC_PAIR_TYPE_BIND, &cache)` | `HC_SAVE_LTPK_FAILED`(31) / `HC_IMPORT_AUTH_DATA_FAILED`(16) |
+
+`get_instance()` 里还有一步 `build_self_lt_key_pair(hichain)`（返回值被 `(void)` 丢弃）：
+若本机长期密钥对建不出来，exchange 阶段必然在验签或取 LTPK 处失败。这是当前最可疑的一条。
+
+此前日志只有 `END_FAILED` 四个字母，没有码。本轮把引擎自己产出的 inform 包**原样解出来**并翻译：
+
+```
+HiChain step 3: engine reported END_FAILED; its own report follows
+  engine reply 1: {"message":900,"payload":26}  [HC_DECRYPT_FAILED]
+```
+
+（`ERROR_NAMES` 按 `hichain.h` 的枚举翻译，未列出的码原样打印。）同时：
+
+- 每步日志加上手机的消息号：`HiChain step: 1 packet(s) for message 3`，一眼看出当前是哪个阶段；
+- 判为 `END_FAILED` 后**停止继续喂引擎**：手机后续的重复消息只回一行
+  `session already failed, N bytes ignored`，避免把真正的原因淹没在六条一样的失败里。
+
+（注：`message 900` 是 `INFORM_MESSAGE` 的枚举值，不是错误码；错误码在 payload 里。）

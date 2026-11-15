@@ -216,7 +216,9 @@ internal class HiCarIdentityExchange(
                     }
                 }
                 val packets = engine.step(dataText.toByteArray(StandardCharsets.UTF_8), keyLength)
-                onLog("HiChain step: ${packets.size} packet(s)")
+                // The phone's own message number names the phase (17 announces the key length, 3 is
+                // the bind exchange); without it a step count says nothing about where we are.
+                onLog("HiChain step: ${packets.size} packet(s) for message ${data.optInt("message", -1)}")
                 packets.map { packet ->
                     envelope(OPER_AUTH, JSONObject(String(packet, StandardCharsets.UTF_8)))
                 }

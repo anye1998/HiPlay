@@ -89,6 +89,9 @@ class HiChainNative private constructor() {
              */
             val completed: Boolean get() = error == 0 && result == RESULT_END_SUCCESS
 
+            /** True when the engine itself declares the exchange failed (`END_FAILED`). */
+            val failedResult: Boolean get() = error == 0 && result == RESULT_END_FAILED
+
             /** The phase names above, so a log line says "KEY_AGREEMENT_END" and not "3". */
             fun describe(): String = when (result) {
                 0 -> "END_SUCCESS"
