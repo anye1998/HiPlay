@@ -297,7 +297,8 @@ Java_com_shilapi_xcertplay_hicarauth_HiChainNative_selfTest(JNIEnv *env, jclass 
     static const uint8_t PEER_ID[] = "peer-test";
     static const char MESSAGE[] = "hicar huks self test";
 
-    char report[1024];
+    /* Fourteen lines plus a verdict; sized so a longer status string can never truncate the report. */
+    char report[2048];
     uint32_t used = 0;
     uint32_t failures = 0;
 
@@ -393,6 +394,29 @@ Java_com_shilapi_xcertplay_hicarauth_HiChainNative_selfTest(JNIEnv *env, jclass 
 
     status = hks_is_key_exist(&peer_alias);
     ST_LINE(status == HKS_SUCCESS, "hks_is_key_exist (peer, after import): status=%d", status);
+
+    /*
+     * Reload the store from disk and read the same key back.
+     *
+     * Everything above can pass while the keystore only ever held the key in memory: a write that
+     * silently fails, or one that is encrypted under a root key that changes when the store is
+     * reopened, would still sign and verify perfectly until the next session. That failure would
+     * then surface on the car as a phone rejecting a key it had already accepted, so it is checked
+     * here in one run rather than discovered across two.
+     */
+    status = hks_init();
+    ST_LINE(status == HKS_SUCCESS, "hks_init (reload after writes): status=%d", status);
+
+    status = hks_is_key_exist(&self_alias);
+    ST_LINE(status == HKS_SUCCESS, "hks_is_key_exist (self, after reload): status=%d", status);
+
+    uint8_t reread_key[HKS_PUBLIC_BYTES_ED25519];
+    struct hks_blob reread_blob = { HKS_BLOB_TYPE_KEY, reread_key, sizeof(reread_key) };
+    status = hks_export_public_key(&self_alias, &reread_blob);
+    int same_key = (status == HKS_SUCCESS) && (reread_blob.size == sizeof(public_key)) &&
+        (memcmp(reread_key, public_key, sizeof(public_key)) == 0);
+    ST_LINE(same_key, "public key identical after reload: status=%d, equal=%s", status,
+        same_key ? "yes" : "no");
 
     status = hks_delete_key(&peer_alias);
     ST_LINE(status == HKS_SUCCESS, "hks_delete_key (peer): status=%d", status);
