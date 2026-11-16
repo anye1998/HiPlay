@@ -280,7 +280,10 @@ class HiCarController(
         setup.shutdownNow()
         accept.shutdownNow()
         report(HiCarStatus.Stopped)
-        onLog("HiCar receiver stopped")
+        // The count belongs on the stop line as well: a session shorter than one heartbeat ends
+        // without ever printing "waiting for the phone", and then an exported log cannot tell a
+        // phone that never dialled from one that connected and hung up.
+        onLog("HiCar receiver stopped; connections=$connections")
     }
 
     private fun startChain() {

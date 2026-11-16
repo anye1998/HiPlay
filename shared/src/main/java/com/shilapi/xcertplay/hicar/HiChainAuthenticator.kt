@@ -144,7 +144,7 @@ internal class HiChainAuthenticator(
             .joinToString("")
         val trimmed = if (text.length <= 300) text else text.take(300) + "…"
         val code = PAYLOAD_INT.find(text)?.groupValues?.getOrNull(1)?.toIntOrNull()
-        val name = code?.let { ERROR_NAMES[it] ?: "code $it" }
+        val name = code?.let { HiChainCodes.errorName(it) ?: "code $it" }
         return if (name == null) trimmed else "$trimmed  [$name]"
     }
 
@@ -184,28 +184,5 @@ internal class HiChainAuthenticator(
 
         /** The inform message carries its error as a bare int32 payload. */
         val PAYLOAD_INT = Regex("\"payload\"\\s*:\\s*(-?\\d+)")
-
-        /**
-         * `hc_result`/`hc_error` names from `hichain.h`, so the log says which failure it was.
-         *
-         * Only the codes the exchange phase can plausibly return are listed; an unlisted number is
-         * still printed, just without a name.
-         */
-        val ERROR_NAMES = mapOf(
-            2 to "HC_INNER_ERROR",
-            3 to "HC_STATE_ERROR",
-            9 to "HC_BUILD_OBJECT_FAILED",
-            12 to "HC_VERSION_UNSUPPORT",
-            16 to "HC_IMPORT_AUTH_DATA_FAILED",
-            26 to "HC_DECRYPT_FAILED",
-            29 to "HC_VERIFY_EXCHANGE_FAILED",
-            30 to "HC_SIGN_EXCHANGE_FAILED",
-            31 to "HC_SAVE_LTPK_FAILED",
-            33 to "HC_GET_LTPK_FAILED",
-            34 to "HC_GEN_ALIAS_FAILED",
-            37 to "HC_UNSUPPORT",
-            38 to "HC_MESSAGE_INCONSISTENCY",
-            39 to "HC_OPERATION_CODE_ERROR",
-        )
     }
 }

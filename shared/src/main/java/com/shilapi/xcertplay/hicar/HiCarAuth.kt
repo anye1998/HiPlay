@@ -166,29 +166,34 @@ internal class HiCarIdentityExchange(
         } catch (failure: JSONException) {
             throw HiCarWireException("data JSON", failure)
         }
+        // Every envelope the phone sends, in its own words. A run that ends in an engine inform says
+        // only *that* something was rejected; the phone's message number and payload are the only
+        // place its reason exists, and without this line a log can show a failed step and no cause.
+        onLog(
+            "HiCar in: oper_type=$operType message=${data.optInt("message", -1)}" +
+                "${messageName(data.optInt("message", -1))} keys=${keysOf(data)} " +
+                "${dataText.length}B${errorSuffix(dataText)} ${brief(dataText)}",
+        )
         return when (operType) {
             OPER_IDENTITY -> {
-                if (identityExchanged || data.optBoolean("usb_connection", false)) {
-                    throw HiCarWireException("identity state")
-                }
+                if (data.optBoolean("usb_connection", false)) throw HiCarWireException("usb connection")
                 val peer = data.optString("deviceId", "")
                 if (peer.toByteArray(StandardCharsets.UTF_8).size !in 1..64) throw HiCarWireException("identity length")
+                // A repeat of the same identity is not an error: the phone re-sends it when its own
+                // attempt timed out or its dialog was reopened, and refusing it closed a channel the
+                // phone was still willing to use (twice at 04:05, logged as "identity state").
+                // Answering again with the same identity is idempotent and costs nothing. A *different*
+                // identity mid-session is a real violation and still ends the channel.
+                if (identityExchanged) {
+                    if (peer != peerIdentity) throw HiCarWireException("identity changed mid-session")
+                    onLog("HiCar identity repeated by the phone; answering with the same identity")
+                    return listOf(identityReply())
+                }
                 peerIdentity = peer
                 identityExchanged = true
                 authenticator?.begin(peer)
                 onLog("HiCar identity exchanged")
-                listOf(
-                    envelope(
-                        OPER_IDENTITY,
-                        JSONObject()
-                            .put("deviceId", localIdentity)
-                            .put("devicename", deviceName)
-                            .put("has_pin", pinConfigured)
-                            .put("usb_connection", false)
-                            .put("CONNECT_ABILITY_KEY", "1")
-                            .put("CAR_MODE_ID", model),
-                    ),
-                )
+                listOf(identityReply())
             }
 
             OPER_AUTH -> {
@@ -206,9 +211,25 @@ internal class HiCarIdentityExchange(
                     )
                     return emptyList()
                 }
+                // A peer inform is the phone saying "I am giving up, here is why". The engine has no
+                // parser for it (`build_struct_by_receive_data` in hichain.c lists requests and
+                // responses only), so feeding it in answers HC_UNKNOW_MESSAGE — our own error, sent
+                // back as a second inform, which buries the phone's reason and invites it to close.
+                // The run at 04:05 did exactly that twice. Reading it here keeps the reason.
+                val messageCode = data.optInt("message", -1)
+                if (messageCode == MESSAGE_INFORM) {
+                    val reason = data.optJSONObject("payload")?.optString("errorCode", "") ?: ""
+                    val named = reason.toIntOrNull()?.let { HiChainCodes.errorName(it) ?: "code $it" }
+                    onLog(
+                        "HiCar: the phone ended the operation itself (inform, errorCode=$reason" +
+                            (named?.let { " $it" } ?: "") + "); that code is the phone's own reason, " +
+                            "and the step lines above say how far it had got",
+                    )
+                    throw HiCarWireException("peer ended the operation (inform $reason)")
+                }
                 // Message 17 announces the key length the phone will accept; every other message
                 // keeps the current value, which starts at the engine's 32-byte default.
-                if (data.optInt("message", 0) == MESSAGE_STS_REQUEST) {
+                if (messageCode == MESSAGE_STS_REQUEST) {
                     val requested = data.optJSONObject("payload")?.optInt("keyLength", 0) ?: 0
                     if (requested != 0) {
                         if (requested != 16 && requested != 32) throw HiCarWireException("key length")
@@ -219,6 +240,10 @@ internal class HiCarIdentityExchange(
                 // The phone's own message number names the phase (17 announces the key length, 3 is
                 // the bind exchange); without it a step count says nothing about where we are.
                 onLog("HiChain step: ${packets.size} packet(s) for message ${data.optInt("message", -1)}")
+                // What we answered with matters as much as what arrived: a peer that gives up right
+                // after our reply has judged that reply, so its message number and fields belong in
+                // the log next to the step that produced it.
+                packets.forEach { packet -> onLog("HiChain out: ${brief(String(packet, StandardCharsets.UTF_8))}") }
                 packets.map { packet ->
                     envelope(OPER_AUTH, JSONObject(String(packet, StandardCharsets.UTF_8)))
                 }
@@ -239,6 +264,51 @@ internal class HiCarIdentityExchange(
     private fun keysOf(data: JSONObject): String =
         runCatching { data.keys().asSequence().sorted().joinToString(",") }.getOrDefault("unreadable")
 
+    /**
+     * The identity reply, built in one place.
+     *
+     * It is sent once per connection and again if the phone repeats its own identity, and the second
+     * copy has to be byte-identical: a phone that compares the two would see a difference it cannot
+     * explain, and `has_pin` in particular decides whether it asks for the code at all.
+     */
+    private fun identityReply(): ByteArray = envelope(
+        OPER_IDENTITY,
+        JSONObject()
+            .put("deviceId", localIdentity)
+            .put("devicename", deviceName)
+            .put("has_pin", pinConfigured)
+            .put("usb_connection", false)
+            .put("CONNECT_ABILITY_KEY", "1")
+            .put("CAR_MODE_ID", model),
+    )
+
+    /**
+     * One JSON object squeezed onto one log line.
+     *
+     * The line has to survive being read on a head unit and pasted into a report, so it is cut at a
+     * fixed length: a PAKE or exchange payload can be kilobytes of hex, and the part that explains a
+     * refusal (`message`, `errorCode`, `authId`, `keyLength`) is always near the front.
+     */
+    private fun brief(text: String, limit: Int = BRIEF_CHARS): String {
+        val compact = text.replace(Regex("\\s+"), " ")
+        return if (compact.length <= limit) compact else compact.take(limit) + "…"
+    }
+
+    /** Message numbers from `base.h`, so a log line does not need the header open beside it. */
+    private fun messageName(code: Int): String = HiChainCodes.messageName(code)
+
+    /**
+     * A field the phone only fills in when it is complaining.
+     *
+     * `INFORM_MESSAGE` carries `payload.errorCode`, and that number is the whole reason a run died:
+     * printed as a bare 5 it looks like a step count, so it is translated here into the `hc_error`
+     * name the engine itself uses.
+     */
+    private fun errorSuffix(payload: String): String {
+        val code = ERROR_CODE.find(payload)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: return ""
+        return " errorCode=$code${HiChainCodes.errorName(code)?.let { " $it" } ?: ""}"
+    }
+
     private fun envelope(operType: Int, data: JSONObject): ByteArray =
         JSONObject()
             .put("version", "A_0")
@@ -255,8 +325,17 @@ internal class HiCarIdentityExchange(
 
         /** STS start: the only message that announces the key length. */
         const val MESSAGE_STS_REQUEST = 17
+
+        /** `INFORM_MESSAGE`: a peer's own "I am ending this, with this error code". */
+        const val MESSAGE_INFORM = 0x8080
         const val MAX_MESSAGE_BYTES = 65_536
         const val MAX_DEPTH = 32
+
+        /** Enough of a payload to name the phase; the hex bodies are far longer and say nothing here. */
+        const val BRIEF_CHARS = 240
+
+        /** An `errorCode` inside an inform payload; the only field that explains a refusal. */
+        val ERROR_CODE = Regex("\"errorCode\"\\s*:\\s*(-?\\d+)")
     }
 }
 

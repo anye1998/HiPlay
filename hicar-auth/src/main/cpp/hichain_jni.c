@@ -29,6 +29,7 @@
 
 #include <jni.h>
 #include <mbedtls/sha256.h>
+#include <android/log.h>
 
 #include "hichain.h"
 /* The Ed25519 shim's entry points; see openssl_shim/ec_local.h and hicar_ed25519.c. */
@@ -53,6 +54,68 @@ static const char SERVICE_TYPE[] = "CarDevice";
 
 static int g_root_fd = -1;
 static uint8_t g_udid[32];
+
+/*
+ * The engine's own log calls, routed to logcat.
+ *
+ * `registe_log` exists for exactly this and was never called, so every LOGE inside deviceauth_lite —
+ * "Unsupport parse 0x%04x message", "Called send_start_response failed, error code is %d", and the
+ * rest — was delivered to a stub that discarded it. What reached the app was a bare inform message
+ * carrying one integer, which is the engine's summary of a reason it had already written down.
+ *
+ * The tag is "HiChain" so the first thing to try on a head unit is `adb logcat -s HiCar HiChain`:
+ * "HiCar" is the app's own line-by-line mirror, "HiChain" is the engine underneath it.
+ */
+static void engine_log(int priority, const char *func, const char *format, va_list args)
+{
+    char body[512];
+    vsnprintf(body, sizeof(body), format, args);
+    __android_log_print(priority, "HiChain", "%s: %s", func != NULL ? func : "?", body);
+}
+
+static void engine_log_debug(const char *tag, const char *func, const char *format, ...)
+{
+    (void)tag;
+    (void)func;
+    (void)format;
+    /* DEBUG is where the engine narrates every field it parsed; a single pairing produces hundreds
+     * of those lines and they bury the INFO/ERROR ones that say what went wrong. To see them, send
+     * this one through `engine_log(ANDROID_LOG_DEBUG, ...)` again. */
+}
+
+static void engine_log_info(const char *tag, const char *func, const char *format, ...)
+{
+    (void)tag;
+    va_list args;
+    va_start(args, format);
+    engine_log(ANDROID_LOG_INFO, func, format, args);
+    va_end(args);
+}
+
+static void engine_log_warn(const char *tag, const char *func, const char *format, ...)
+{
+    (void)tag;
+    va_list args;
+    va_start(args, format);
+    engine_log(ANDROID_LOG_WARN, func, format, args);
+    va_end(args);
+}
+
+static void engine_log_error(const char *tag, const char *func, const char *format, ...)
+{
+    (void)tag;
+    va_list args;
+    va_start(args, format);
+    engine_log(ANDROID_LOG_ERROR, func, format, args);
+    va_end(args);
+}
+
+/* The header declares this as `struct log_func_group` and log.c defines it with `struct
+ * log_f_group`; both are four function pointers in the same order, and C does not mangle the name,
+ * so the call below is the one the engine expects. */
+static struct log_func_group g_engine_log = {
+    engine_log_debug, engine_log_info, engine_log_warn, engine_log_error,
+};
 
 /* hks_init's own status. Kept rather than only returned, because a key-store failure must not stop
  * the beacon: discovery and key agreement work without it, and the self-test has to be able to say
@@ -266,6 +329,9 @@ Java_com_shilapi_xcertplay_hicarauth_HiChainNative_init(JNIEnv *env, jclass claz
         return -3;
     }
     g_root_fd = fd;
+    /* Before any engine call, so a failure inside hks_init is also visible: registered once per
+     * process because the functions are static and the engine keeps them for its lifetime. */
+    registe_log(&g_engine_log);
     int32_t result = hks_register_file_callbacks(&g_files);
     if (result == 0) {
         result = hks_register_get_hardware_udid_callback(hardware_udid);

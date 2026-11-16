@@ -407,7 +407,14 @@ class HiCarHostActivity : ComponentActivity() {
         // The screen starts empty for a new attempt, but the export keeps earlier attempts: a retry
         // usually follows a failure, and the failure is the part worth reporting.
         log.clear()
-        appendLog("--- receiver started ${SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())} ---")
+        // The code goes on the start line, not only in the report header: the header is written at
+        // export time, so a reset between the attempt and the export would relabel the attempt with a
+        // code that was never on screen. With this line every session says which code it offered, and
+        // a "code refused" report can be checked against what the phone was actually asked for.
+        appendLog(
+            "--- receiver started ${SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())} " +
+                "with code $pin ---",
+        )
         // This ROM grants discoverability for 120 s per request, so starting in a not-discoverable
         // state wastes the whole window: the advertisement is on air but nothing can page the car.
         if (runCatching { bluetoothAdapter?.scanMode }.getOrNull() !=

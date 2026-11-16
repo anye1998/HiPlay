@@ -74,8 +74,12 @@ target_include_directories(hicarauth PRIVATE
     "${HUKS}/soft_service"
     "${THIRD}/cjson")
 
-# _CUT_LOG_: the upstream logging writes through a hiview logger that does not exist on Android.
-# Without it the engine still builds but every protocol step prints to a missing backend.
+# _CUT_LOG_ is deliberately NOT defined. It compiles every LOG* call in the engine to nothing, and
+# that is what made a refusal look like a bare number: the engine writes its reason down, then the
+# macro deletes it, and all the app receives is an inform message carrying one int32. The engine's
+# logger has no Android backend of its own, so `hichain_jni.c` registers one with `registe_log` and
+# those lines appear under the `HiChain` logcat tag. `_HC_DEBUG_` stays undefined: defining it would
+# empty log.c and leave `registe_log` without a definition.
 #
 # _CUT_AUTHENTICATE_ is deliberately NOT defined. It is upstream's switch for the scaled-down HUKS
 # build, and it cuts far more than the x25519 helpers: the key store, hks_asymmetric_sign/verify,
@@ -85,7 +89,6 @@ target_include_directories(hicarauth PRIVATE
 # hks_service.c, which exists solely to see three ED25519_* declarations; openssl_shim/ provides
 # them, and huks_lite references no other OpenSSL symbol.
 target_compile_definitions(hicarauth PRIVATE
-    _CUT_LOG_
     _GNU_SOURCE
     _POSIX_C_SOURCE=200809L)
 

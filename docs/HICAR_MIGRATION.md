@@ -1555,3 +1555,68 @@ HiChain loopback: trust cleanup car=0 phone=0 (0 = removed)
 **未改动的部分**（仍为英文）：日志行（含本界面自己 `appendLog` 的那些，如 `Pairing reset:`）、
 导出的报告文本（`HiCarLogReport`，字段名 `connection code:` 等被 `HiCarExportUiTest` 断言）、
 `HiCarDeviceAudit` 的体检块、蓝牙设备名 `HiCar receiver`（这是发给手机的名字，不是界面文案）。
+
+### 7.33 手机连上来了，但它在 AUTH_START 之后自己中止（信息被我们吞掉了）
+
+这一轮（04:05）与前几轮不同的第一件事：**手机真的连上来了**，日志里有 6 次
+`HiCar control/business channel connected (peer F8:3B:7E:3E:DD:06)`。用户看到的现象是
+"来不及输密码弹窗就消失了，然后再次要求输密码，最后弹出连接失败"——和日志完全对得上：
+
+```
+HiChain begin: role=accessory peer=01CF…017E pin=61…08
+HiCar identity exchanged
+HiChain step 1: engine=0, phase=KEY_AGREEMENT_PROCESSING, key=0B, error=0, out=1
+HiChain step: 1 packet(s) for message 17
+HiChain step 2: engine=0, phase=END_FAILED, key=0B, error=0, out=1
+  engine reply 1: {"message":32896, "payload":{"errorCode":5}}
+HiChain step: 0 packet(s) for message 32896
+```
+
+读法：手机先发 `message 17`（`AUTH_START_REQUEST`，带 `keyLength`），我们答了一条
+（此时引擎认为还在 `KEY_AGREEMENT_PROCESSING`），**然后手机发来的是 `0x8080 INFORM`**——
+也就是说，是手机在说"我不干了，这是我的原因"，PAKE 根本没开始，所以弹窗连输入的时间都没有。
+
+**为什么看不到手机的原因**：我们自己的引擎不认识 inform。
+`hichain.c` 的 `build_struct_by_receive_data()` 表里只有请求/响应，没有 `INFORM_MESSAGE`，
+于是它把手机的 inform 判成"未知消息"，回了一条 `errorCode=5`（`HC_UNKNOW_MESSAGE`）的 inform。
+两份互不理解的通知撞在一起，留下的只有我们的 5，把手机的理由盖掉了。
+
+三处改动：
+
+1. **主动识别手机的 inform**（`HiCarAuth`）：遇到 `message == 0x8080` 就记下它的
+   `payload.errorCode` 并用 `HiChainCodes` 翻译成人名，然后按协议结束会话，不再回一条 inform
+   去对撞。这样"手机为什么不干"第一次会出现在导出日志里。
+2. **同一条连接上重复的身份不再断开**：04:05 的日志里 `HiCar protocol stopped: identity state`
+   出现两次，就是手机重发 identity（它自己的尝试超时后重来）被我们当成错误关掉的。现在同一个
+   `deviceId` 重发时幂等地再答一遍身份；只有 `deviceId` 变了才仍然判为违约。
+3. **引擎自己的日志接出来了**。以前看不到引擎说话有两个原因：`CMakeLists.txt` 里定义了
+   `_CUT_LOG_`（把每个 `LOG*` 编译成空），而 `registe_log` 从来没被调用（默认实现是空函数）。
+   现在两者都改掉：删掉 `_CUT_LOG_`，在 `init` 里 `registe_log` 注册一组写 logcat 的函数，
+   tag `HiChain`。DEBUG 级别丢弃（一次配对能刷几百行，会把有用的 INFO/ERROR 埋掉）。
+
+   ```bash
+   adb logcat -s HiCar HiChain     # HiCar=界面逐行镜像，HiChain=底下的引擎
+   ```
+
+   这条通路在模拟器上验证过：完成一次 loopback 后 tag `HiChain` 有 80 行 INFO，
+   `D HiChain` 0 行（DEBUG 已按设计丢弃）。
+
+新增的诊断行（都在导出日志里）：
+
+- `HiCar in: oper_type=… message=17 (0x0011 AUTH_START_REQUEST) keys=… 123B {…}`：手机发来的每一条，
+  带消息名、字段名、长度和前 240 字符。
+- `HiChain out: {…}`：我们回给手机的那条原文（这是下一个要看的重点：手机是在判我们的
+  `0x8011` 内容）。
+- `HiCar: the phone ended the operation itself (inform, errorCode=N NAME)`：手机的失败原因。
+- 开始/停止行带上本次会话的连接码与连接数（7.33 之前的 `receiver started` 行没有码，
+  中途重置会把某次尝试标成它没用过的码）。
+
+**还没证明的**：手机为什么在 `0x8011` 之后立刻放弃。本地 loopback（7.31）证明两侧引擎自洽，
+但那是我们自己的引擎当客户端；对方是华为的实现，差异只可能在我们那条 `0x8011` 的内容上
+（字段编码、`authId`、或它期望的某种 `authForm`）。下一步要的是：手机 inform 里的那个
+`errorCode`，以及同一行下面打印的我们 `0x8011` 原文。
+
+一个构建注意：`:hicar-auth:externalNativeBuildDebug` 之后单独跑 `:mobile:assembleDebug`
+有时不会重打包 .so（Gradle 认为 up-to-date），删掉
+`mobile/build/outputs/apk/debug/mobile-debug.apk` 再打包即可；验证方法是装到设备上数
+`adb logcat -s HiChain | grep -c ' D HiChain'`，改过 DEBUG 策略后应为 0。
