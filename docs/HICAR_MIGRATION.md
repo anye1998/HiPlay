@@ -1620,3 +1620,53 @@ HiChain step: 0 packet(s) for message 32896
 有时不会重打包 .so（Gradle 认为 up-to-date），删掉
 `mobile/build/outputs/apk/debug/mobile-debug.apk` 再打包即可；验证方法是装到设备上数
 `adb logcat -s HiChain | grep -c ' D HiChain'`，改过 DEBUG 策略后应为 0。
+
+### 7.34 手机说 HC_VERIFY_PROOF_FAILED，而且它要的是"认证"不是"配对"
+
+7.33 加的三行诊断立刻给出了答案。04:22 这一轮，手机连上来之后的第一条业务消息是：
+
+```
+HiCar in: oper_type=3 message=17 (0x0011 AUTH_START_REQUEST) …
+  {"authForm":0,"message":17,"payload":{"challenge":"1083…0A7D","epk":"1042…C92B",
+   "operationCode":2,"version":{"currentVersion":"1.0.0","minVersion":"1.0.0"},"pkgNa…
+
+HiChain out: {"authForm":0,"message":32785,"payload":{"authData":"60A4…485F",…
+
+HiCar in: … message=32896 (0x8080 INFORM_MESSAGE) … errorCode=17 HC_VERIFY_PROOF_FAILED
+```
+
+三个字段放在一起，指向同一件事：
+
+1. **`operationCode: 2`**。`hichain.h` 的枚举是 `NO_OPERATION_CODE=0, BIND=1, AUTHENTICATE=2, …`。
+   手机请求的是 **AUTHENTICATE**，不是 BIND——它自认为和这台车已经配对过。
+2. **`auto_connect_state: true`**（它 oper_type 1 的身份报文里）。这是一次"自动重连"，不是首次连接。
+3. **全程没有 `PAKE_REQUEST`**。整个会话只有 identity → AUTH_START → inform。PAKE 是唯一会用
+   6 位连接码的环节，它没发生，所以"来不及输密码"不是错觉：**手机根本没打算问**。
+
+于是 `errorCode=17 HC_VERIFY_PROOF_FAILED` 的含义很具体：手机用它保存的材料校验我们给出的
+`authData`（证明），校验不过——因为我们这边的信任早就被「重置配对」清空了。两边各有一半，
+它那一半还在，我们这一半没了，任何重试都不可能对上。
+
+**这是"重置配对"造成的不对称**：那个按钮清的是我们库里的 `hicar-huks`，
+清不掉手机里那条记录。之前每一轮按一次，手机那条记录就变成孤儿，直到它开始按
+"已配对" 流程来认证，然后永远失败。
+
+处理（按顺序）：
+
+1. **手机上删掉这条记录**：设置 → 更多连接 → HiCar → 已连接的车/我的车 → 删除；
+   蓝牙里把 `宋Plus` 也取消配对（车机侧 `bonds` 里就有 Mate 80）。之后车机上直接「开始」，
+   **不要再按重置配对**，手机上会停下来问码，输入屏幕上的 6 位即可。
+2. 如果手机上找不到可删的条目（配对从未完成时它可能不出现在列表里），用 7.34 新增的
+   **「换一个本机标识」**：把 `deviceId` 换掉，手机就会把这台车当成一台它没记录的新车，
+   流程回到首次 BIND。实现是 `HiCarHostActivity.rotateIdentity()`——随机 16 位十六进制，
+   写进 `hicar-receiver` 的 `local_identity`，重启保留；`identity()` 优先读它。
+   已在模拟器上验证：`c404cddd…` → `c6664573…`，界面上的「本机标识」与派生的机型码同步变化。
+
+日志侧也补了一句：`errorCode=17` 的 inform 现在会附上这个解释和该做什么，不必再回头读文档。
+
+**这一轮确认没问题的部分**（都不再是怀疑对象）：5 GHz 热点（channel 36 / 5220 MHz，verified）、
+RFCOMM 两个通道、identity 交换、广播 payload（`… 04 10 20`，末字节每轮递增）、手机侧 BLE 可见。
+链路上唯一断掉的地方就是上面那一步认证。
+
+**教训写在这里**：`重置配对` 是"让车机忘记手机"，它不能"让手机忘记车机"。
+排查期间反复按它，只会把两边的状态越推越远。

@@ -235,7 +235,15 @@ class HiCarHostActivity : ComponentActivity() {
                 Button(onClick = ::showAudit) { Text("设备体检") }
                 // Explicitly triggered, read-only, and it says so: reading bt_config.conf needs su.
                 Button(onClick = ::rootProbe) { Text("root 探针") }
+                // The escape hatch for a phone that still believes it is paired with us: a new
+                // identity is a car it has no record of, so the next attempt binds from scratch.
+                Button(onClick = ::rotateIdentity) { Text("换一个本机标识") }
             }
+            Text(
+                "只有手机反复报「认证失败」、而车机这边已经重置过配对时，才用「换一个本机标识」：" +
+                    "手机认的就是这个标识，换了它，手机就会把这台车当成一台没连过的新车，重新问你一次连接码。",
+                style = MaterialTheme.typography.bodySmall,
+            )
             if (exportNotice.isNotEmpty()) {
                 Text(exportNotice, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
             }
@@ -655,11 +663,43 @@ class HiCarHostActivity : ComponentActivity() {
         getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit().putString(KEY_MODEL, value).apply()
     }
 
-    /** The identity the phone sees; derived from this installation, not a Huawei credential. */
+    /**
+     * The identity the phone sees; derived from this installation, not a Huawei credential.
+     *
+     * An override wins once [rotateIdentity] has been pressed: the peer stores its trust against
+     * this string, so a car that presents a different one is a car the phone has never paired with —
+     * which is the only way to get back to a first-time bind when the phone's record is stale and
+     * ours is gone. See 7.34 in `docs/HICAR_MIGRATION.md`.
+     */
     private fun identity(): String {
+        getSharedPreferences(PREFERENCES, MODE_PRIVATE)
+            .getString(KEY_IDENTITY, null)
+            ?.takeIf { IDENTITY_PATTERN.matches(it) }
+            ?.let { return it }
+        return derivedIdentity()
+    }
+
+    private fun derivedIdentity(): String {
         val seed = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID).orEmpty()
         val digest = MessageDigest.getInstance("SHA-256").digest(seed.toByteArray())
         return digest.copyOf(8).joinToString("") { "%02x".format(it) }
+    }
+
+    /**
+     * Presents this install as a different car.
+     *
+     * The phone proved it still holds trust for the identity we used before (it asked to
+     * authenticate, not to bind, and rejected our proof), while Reset pairing had already wiped our
+     * half. Neither side can rebuild the other's, so the cheaper way out is to stop being that peer:
+     * a new identity is a car the phone has no record of, and the next attempt is a plain first-time
+     * bind that asks for the code on screen.
+     */
+    private fun rotateIdentity() {
+        if (running) stopReceiver()
+        val next = ByteArray(8).also { java.security.SecureRandom().nextBytes(it) }
+            .joinToString("") { "%02x".format(it) }
+        getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit().putString(KEY_IDENTITY, next).apply()
+        appendLog("Identity rotated: $next (this car looks new to the phone; press Start, then pair once)")
     }
 
     /** Eight hexadecimal digits for the 0xFDEE payload; an experiment id, not a certified model. */
@@ -699,8 +739,12 @@ class HiCarHostActivity : ComponentActivity() {
         const val PREFERENCES = "hicar-receiver"
         const val KEY_PIN = "connection_code"
         const val KEY_MODEL = "advertised_model"
+        const val KEY_IDENTITY = "local_identity"
         val PIN_PATTERN = Regex("[0-9]{6}")
         val MODEL_PATTERN = Regex("[0-9A-F]{8}")
+
+        /** Sixteen lowercase hex digits: what the phone keys its stored trust against. */
+        val IDENTITY_PATTERN = Regex("[0-9a-f]{16}")
 
         /** The longest value the system accepts; bring-up sessions are short anyway. */
         const val DISCOVERABLE_SECONDS = 300

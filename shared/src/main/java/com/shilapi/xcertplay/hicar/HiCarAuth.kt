@@ -223,7 +223,18 @@ internal class HiCarIdentityExchange(
                     onLog(
                         "HiCar: the phone ended the operation itself (inform, errorCode=$reason" +
                             (named?.let { " $it" } ?: "") + "); that code is the phone's own reason, " +
-                            "and the step lines above say how far it had got",
+                            "and the step lines above say how far it had got" +
+                            // HC_VERIFY_PROOF_FAILED is the one integer this chain can explain better
+                            // than the phone can: it is the phone checking a proof against material it
+                            // kept, and the usual reason ours differs is that this install was wiped.
+                            (if (reason == VERIFY_PROOF_FAILED) {
+                                " — it verified a proof we cannot produce: the phone still holds trust " +
+                                    "for this car from an earlier attempt, while Reset pairing has " +
+                                    "wiped ours. Delete the car's HiCar and Bluetooth records on the " +
+                                    "phone, then pair again and leave the code alone"
+                            } else {
+                                ""
+                            }),
                     )
                     throw HiCarWireException("peer ended the operation (inform $reason)")
                 }
@@ -328,6 +339,9 @@ internal class HiCarIdentityExchange(
 
         /** `INFORM_MESSAGE`: a peer's own "I am ending this, with this error code". */
         const val MESSAGE_INFORM = 0x8080
+
+        /** `HC_VERIFY_PROOF_FAILED`, the code the phone sends when our proof does not match its store. */
+        const val VERIFY_PROOF_FAILED = "17"
         const val MAX_MESSAGE_BYTES = 65_536
         const val MAX_DEPTH = 32
 
