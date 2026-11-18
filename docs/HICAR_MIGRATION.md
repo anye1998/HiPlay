@@ -1885,3 +1885,71 @@ HiSight: ANNOUNCE sent …
 若停在 `network capability accepted` 之后没有下一步，说明手机没接受 5 GHz 通道或我们的端口号；
 若出现 `credentials sent` 但一直没有 TCP，那边就是手机加入热点失败（BSSID/密码），
 心跳行会显示 `credentials=true`。
+
+### 7.38 手机终于连上 TCP：卡在我们自己的 RTSP 头语法上
+
+11:11 这轮是第一次真正走通到媒体层，日志按顺序：
+
+```
+HiCar control frame kind=4 … → network capability accepted: 5180 MHz
+HiCar control frame kind=4 … reply 0, queued 1 → network selected; asking for station address
+station address 56:ad:33:84:1f:0d accepted; credentials sent for 'DIRECT-…-SFaH' on 5180 MHz, port 4005
+DMSDP: network connection accepted from 192.168.49.2
+DMSDP entry: module 1 → control port 4007
+DMSDP: control connection accepted from 192.168.49.2
+DMSDP AES-CTR negotiated
+DMSDP device info: answered with HiCarLab, model 00040A04, 192.168.49.1 ↔ 192.168.49.2
+DMSDP service request: mask 0x31f wants display speaker microphone …
+DMSDP display service announced: 800×480
+DMSDP speaker service announced: AAC 48 kHz
+DMSDP media endpoint: the phone serves video on 192.168.49.2:41129
+HiSight: ANNOUNCE sent … → response 200 → ANNOUNCE → RTSP encryption negotiated
+HiSight: OPTIONS, 34-byte body
+HiSight rejected: rtsp header
+```
+
+也就是说 7.37 的修复是对的：凭据发出去了、手机加入了热点（192.168.49.2）、三个端口都拨了、
+设备信息交换成功、服务宣布成功、视频端口也拿到了。**断点只剩一个：手机发来的 `OPTIONS`
+被我们自己的头语法拒绝。**
+
+原因很具体：我们的解析器要求每个头名匹配 `[a-z][a-z0-9-]{0,63}`，下划线不在里面。
+手机这条 `OPTIONS` 里有带下划线的头（`his_*` 一类），于是 `parse` 抛 `rtsp header`，
+整条视频会话在第二个消息就结束了——参考实现里同样的正则只是因为它没在这台手机上跑到这一步。
+
+改动：
+
+1. **头解析改成容忍式**：行先 `trim`，空行跳过，缺冒号的行记一行日志后跳过，
+   名字不在常见语法内**只记日志、照样收**（语法放宽到 `[a-z][a-z0-9._-]*`）。
+   真正的协议错误（重复头、超长、非 ASCII）仍然拒绝。
+2. **每条 RTSP 消息记下方法名与头名列表**（`HiSight: OPTIONS headers=[cseq,…]`），
+   只记名字不记值——下次不用再为"它到底发了什么头"跑一趟。
+3. **解析失败时打印那一条报文的可打印文本**（≤400 字符，控制字符转义）。只在已经失败时打印，
+   且是协议文本、不含凭据。
+4. **顺带修一个重连 bug**：`HiCarDeviceBusiness` 的状态（`exchanged`、三个 `announced`）
+   原来跨控制连接共享。手机重连后会重新问身份、重新要服务，而我们会回"repeated; ignoring"，
+   等于让它等一个我们决定不再给的回答。现在每条新的控制连接都 `resetForNewSession()`，
+   并记一行 `DMSDP: control session opened; device and service state reset`。
+
+回归测试：`a header whose name uses an underscore is still read`、
+`a blank header row is skipped rather than rejected`。
+
+**关于"第一次要开关飞行模式"**：那一次是手机侧的 Wi-Fi 没关联上（上一轮遗留的直连状态），
+第二次同一台车、同一份凭据就正常加入了（`192.168.49.2`，DHCP 与 `client##` 一致），
+不是车机侧的问题。真机上如果又出现，先看心跳行是不是 `credentials=true`：是就说明凭据给过了，
+问题在手机加入热点那一步。
+
+**下一次该看到**：
+
+```
+HiSight: OPTIONS headers=[cseq,…]                 ← 头名列表会告诉我们它到底要什么
+HiSight: GET_PARAMETER headers=[…]                ← 我们会按它问的字段回能力
+HiSight: SET_PARAMETER headers=[…]                ← 带 his_presentation_url + trigger SETUP
+HiSight: SETUP sent, waiting for the phone to name the video port
+HiSight: video port negotiated; input port also offered
+HiSight: video socket connected …; PLAY follows
+HiSight: waiting for encrypted H.264 data
+HiSight: 1 H.264 access unit(s), 0 dropped, N bytes last
+audio: AAC 48000 Hz, 2 channel(s); playback started
+```
+
+若 `OPTIONS` 之后仍缺某一步，新加的头名列表和失败转储会直接指出是哪一条、哪个头。

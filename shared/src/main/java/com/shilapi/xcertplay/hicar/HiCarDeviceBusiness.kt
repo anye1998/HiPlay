@@ -44,6 +44,22 @@ internal class HiCarDeviceBusiness(
     /** True after the phone has confirmed our identity, which earlier steps require. */
     val ready: Boolean get() = exchanged
 
+    /**
+     * Forgets what a previous control connection negotiated.
+     *
+     * The phone keeps none of this state across a reconnect: it sends its identity again and expects
+     * the services to be announced again. Sharing the flags would make the second attempt look like
+     * a repeat — "device info repeated; ignoring" — and the phone would wait for an answer that this
+     * side decided it had already given.
+     */
+    fun resetForNewSession() {
+        peer = null
+        exchanged = false
+        displayAnnounced = false
+        speakerAnnounced = false
+        microphoneAnnounced = false
+    }
+
     fun handle(module: Long, type: Long, body: ByteArray): List<ByteArray> {
         if (module == HiCarCodes.DMSDP_MODULE_MEDIA.toLong() && type == HiCarCodes.DMSDP_TYPE_WILDCARD) {
             return mediaEndpoint(body)

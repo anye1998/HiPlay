@@ -107,6 +107,31 @@ class HiCarHiSightWireTest {
     }
 
     @Test
+    fun `a header whose name uses an underscore is still read`() {
+        // 11:11 ended an entire session here: `his_heartbeat` did not match the strict header
+        // grammar and the parser threw instead of carrying on.
+        val wire = opened()
+        val replies = wire.feed(
+            record(
+                "OPTIONS * RTSP/1.0\r\nCSeq: 2\r\nhis_heartbeat: 60\r\nContent-Length: 0\r\n\r\n",
+                encrypted = true,
+            ),
+        )
+        assertEquals(2, replies.size)
+        assertTrue(decrypt(replies[0]).startsWith("RTSP/1.0 200 OK"))
+    }
+
+    @Test
+    fun `a blank header row is skipped rather than rejected`() {
+        val wire = opened()
+        val replies = wire.feed(
+            record("OPTIONS * RTSP/1.0\r\nCSeq: 2\r\n\r\nContent-Length: 0\r\n\r\n", encrypted = true),
+        )
+        // The first block ends at the blank row, so this is a valid OPTIONS with a stray body.
+        assertTrue(replies.isNotEmpty())
+    }
+
+    @Test
     fun `a record with the wrong cipher offer is rejected`() {
         val wire = opened()
         val failure = runCatching {

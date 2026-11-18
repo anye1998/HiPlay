@@ -81,6 +81,7 @@ internal class HiCarHiSightWire(
             throw HiCarWireException("rtsp buffer")
         }
         val replies = ArrayList<ByteArray>()
+        var current: ByteArray? = null
         try {
             buffer = join(buffer, data.copyOf(count))
             while (buffer.size >= LENGTH_BYTES) {
@@ -91,6 +92,7 @@ internal class HiCarHiSightWire(
                 var payload = buffer.copyOfRange(LENGTH_BYTES, (size + LENGTH_BYTES).toInt())
                 buffer = buffer.copyOfRange((size + LENGTH_BYTES).toInt(), buffer.size)
                 if (encrypted) payload = cipher.decrypt(payload)
+                current = payload
                 try {
                     parse(payload, replies)
                 } finally {
@@ -103,6 +105,9 @@ internal class HiCarHiSightWire(
             if (failure.message?.matches(ERROR_CATEGORY) == true) {
                 onLog("HiSight rejected: ${failure.message} (fixed category, no message contents)")
             }
+            // One bounded, printable dump: protocol text only, and only when the session has already
+            // failed. Without it a rejection costs another car session to identify.
+            current?.let { onLog("HiSight: the record that failed was >> ${printable(String(it, StandardCharsets.US_ASCII))} <<") }
             throw failure
         } catch (failure: RuntimeException) {
             failed = true
@@ -132,16 +137,33 @@ internal class HiCarHiSightWire(
         if (!START_LINE.matches(start)) throw HiCarWireException("rtsp start")
         val headers = LinkedHashMap<String, String>()
         for (row in rows.drop(1)) {
-            val colon = row.indexOf(':')
-            if (colon < 1) throw HiCarWireException("rtsp header")
-            val name = row.substring(0, colon).lowercase(Locale.ROOT)
-            if (!HEADER_NAME.matches(name)) throw HiCarWireException("rtsp header")
-            if (headers.put(name, row.substring(colon + 1).trim()) != null) throw HiCarWireException("rtsp duplicate header")
+            val line = row.trim()
+            // A blank row inside the block is harmless; rejecting it only makes the parser fail on
+            // formatting the phone is entitled to use.
+            if (line.isEmpty()) continue
+            val colon = line.indexOf(':')
+            if (colon < 1) {
+                onLog("HiSight: header line without a name ignored (${printable(line)})")
+                continue
+            }
+            val name = line.substring(0, colon).trim().lowercase(Locale.ROOT)
+            // Header names are lowercased and then used as keys, never validated against a strict
+            // grammar: 11:11 lost a whole session because `his_heartbeat` (an underscore) did not
+            // match `[a-z][a-z0-9-]*` and the parser threw instead of reading the value.
+            if (!HEADER_NAME.matches(name)) {
+                onLog("HiSight: header name '${printable(name)}' is outside the usual grammar; kept")
+            }
+            if (headers.put(name, line.substring(colon + 1).trim()) != null) {
+                throw HiCarWireException("rtsp duplicate header")
+            }
             if (headers.size > MAX_HEADERS) throw HiCarWireException("rtsp duplicate header")
         }
         val seq = headers["cseq"] ?: throw HiCarWireException("rtsp sequence")
         if (!CSEQ.matches(seq)) throw HiCarWireException("rtsp sequence")
         val method = start.substringBefore(' ')
+        // Names only, never values: this is what tells the next run which headers the phone sends
+        // without another dedicated trip.
+        onLog("HiSight: $method headers=[${headers.keys.take(8).joinToString(",")}]")
         if (method == "RTSP/1.0") {
             onLog("HiSight: response ${start.split(" ").getOrNull(1) ?: "?"} for sequence $seq")
         }
@@ -273,6 +295,21 @@ internal class HiCarHiSightWire(
         return out.toString().toByteArray(StandardCharsets.US_ASCII)
     }
 
+    /** Printable form of protocol text for the log: control characters escaped, length bounded. */
+    private fun printable(text: String): String {
+        val out = StringBuilder()
+        for (character in text) {
+            when {
+                character == '\r' -> out.append("\\r")
+                character == '\n' -> out.append("\\n")
+                character.code in 32..126 -> out.append(character)
+                else -> out.append('?')
+            }
+            if (out.length >= MAX_DUMP_CHARS) break
+        }
+        return out.toString()
+    }
+
     private fun pack(plain: ByteArray, forcePlain: Boolean = false): ByteArray {
         val payload = if (encrypted && !forcePlain) cipher.encrypt(plain) else plain
         if (payload.isEmpty() || payload.size > MAX_RECORD_BYTES) throw HiCarWireException("rtsp record")
@@ -294,11 +331,12 @@ internal class HiCarHiSightWire(
         const val MAX_HEADER_CHARS = 8_192
         const val MAX_BODY_CHARS = 56_000
         const val MAX_HEADERS = 64
+        const val MAX_DUMP_CHARS = 400
         const val DISPLAY_WIDTH = 800
         const val DISPLAY_HEIGHT = 480
 
         val START_LINE = Regex("[A-Z_]+ \\S+ RTSP/1\\.0|RTSP/1\\.0 [1-5][0-9]{2}( [ -~]+)?")
-        val HEADER_NAME = Regex("[a-z][a-z0-9-]{0,63}")
+        val HEADER_NAME = Regex("[a-z][a-z0-9._-]{0,63}")
         val CSEQ = Regex("[0-9]{1,9}")
         val PRESENTATION_URL = Regex("rtsp://[A-Za-z0-9.:/_?=&%=-]{1,256}")
         val TRANSPORT_PORT = Regex("(?:^|;)server_port=([0-9]+)")

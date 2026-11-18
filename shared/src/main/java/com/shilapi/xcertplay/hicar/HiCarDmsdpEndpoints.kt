@@ -210,6 +210,10 @@ internal class HiCarDmsdpEndpoints(
             null
         }
         val cipher = HiCarRecordCipher(key, maxRecordBytes = CONTROL_RECORD_BYTES)
+        // A new control connection is a new session for the phone: it will ask who we are and which
+        // services we have all over again.
+        business.resetForNewSession()
+        onLog("DMSDP: control session opened; device and service state reset")
         var lastHeartbeat = System.nanoTime()
         var lastPeer = lastHeartbeat
         val handlers = media?.textHandlers().orEmpty()
