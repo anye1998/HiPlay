@@ -17,3 +17,16 @@ Only two mechanical changes were made, both marked in the files:
 
 No behaviour was changed. They are test sources: they are not compiled into the APK, and nothing in
 `src/main` refers to them.
+
+## Byte vectors
+
+`shared/src/test/resources/hicar/` holds three more verbatim upstream files from
+`native-auth/`: `wire-vectors.txt`, `dmsdp-vectors.txt`, `network-vectors.txt`. They were produced
+from the Python wire implementation the upstream's working device sessions were built on, and its
+`scripts/test-host.py` runs `WireTest`, `DmsdpTest` and `NetworkTest` against them. The same vectors
+are the acceptance criteria in `HiCarReferenceVectorsTest`, so "matches the flow that works" is a
+byte comparison rather than a claim in a document.
+
+Upstream `README.md` also records a device-side prerequisite that no unit test can prove: on some
+devices the first connection requires a normal Bluetooth pairing in the two devices' system settings
+before starting the receiver. That is now stated on the receiver screen.

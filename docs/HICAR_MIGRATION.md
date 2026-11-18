@@ -2053,3 +2053,75 @@ video: window attached to the decoder (decoder=ready, …)
 下一次上车，**即使仍然失败，失败原因会直接写在日志里**，不需要再靠推测。
 
 测试：`:shared` 的 hicar 包 111 个用例 0 失败（新增 4 个差分用例），`HiCarExportUiTest` 与两个翻译测试通过。
+
+### 7.40 工作区被回滚、APK 是旧包；以及把参考向量接成逐字节验收
+
+用户重复了那句批评："不要自个儿盲猜，之前给你的参考项目里面已经有能够跑通的流程了。"
+这一轮先处理一个会让人白跑一趟的现场问题，再把"照参考流程"做到字节级。
+
+#### 一、先说会坑到上车的一件事：上一轮的包不是修复版
+
+7.39 的提交 `fb76006` 本身是完整的（11 个文件、792 行新增，含差分测试与三个修复），
+但上一轮回复被 429 限流打断后，**磁盘工作区被回退到了提交前的状态**：
+`git status` 显示 11 个文件 `M/D`，`HiCarHiSightReferenceParityTest.kt` 不见了，
+`docs/HICAR_MIGRATION.md` 里连 7.39 都没有。
+
+更关键的是 11:49 构建出来的 `mobile-debug.apk`：解包检查 dex 发现只有 7.38 的
+`control session opened`，**新修复的 `releasing this round` / `record ignored as` /
+`answering that` 全部 MISSING** —— 也就是说那个包是旧代码，装上车等于白跑一次。
+
+处理：把回退差异备份到 `/tmp/hicar-worktree-rollback.patch`（1120 行）后 `git restore .`
+恢复到 `fb76006`；重跑测试（111 个 0 失败）；删掉旧 APK 强制重建；再解包确认
+`releasing this round` / `record ignored as` / `answering that` / `5002` 全部 found。
+**上车请用本轮重新构建的 `mobile-debug.apk`（md5 `6fa4a0c4975b29a3f75cb348fbb6b483`，含 7.39 全部修复与 7.40 的界面引导）。**
+
+#### 二、之前漏读的参考资料，这一轮补完
+
+7.39 只读了 `app/src/local/hicarlab/*.java`。这一轮把 `README.md`、`CHANGELOG.md`、
+`docs/KNOWN_ISSUES.md`、`docs/VALIDATION.md`、`scripts/test-host.py`、`app/tests/*.java`（19 个）、
+`native-auth/*-vectors.txt` 全部读完，逐项对照见 `docs/HICAR_REFERENCE_MAP.md` 第六节。
+
+直接改变做法的两条：
+
+1. 参考 README 的"首次使用"第 2 步写着：**先在两台设备的系统蓝牙设置完成普通配对**，
+   部分测试设备上这是连接成功所需的操作。而我们界面一直在讲"删记录 / 换标识 / 别重置"，
+   方向正好相反。现在界面在链路说明下面直接写了这一步，并说明为什么不要反复重置。
+2. 参考 `CHANGELOG` 0.10.6 专门修过"发送端锁屏暂停视频时 15 秒媒体读取超时误关整轮连接"。
+   核对 `HiCarHiSightClient.readFully`：保留部分字节、超时只记 `video paused` 不断线、数据回来记
+   `video data resumed`，与参考一致；`CONTROL_IDLE_NANOS` 只在视频端口还没连上时生效，也与参考一致。
+
+#### 三、把"能跑通的流程"变成可执行的字节验收
+
+`shared/src/test/resources/hicar/` 新增三份**原样复制**的向量文件（MIT，来源与许可写在
+`reference/README.md`）：`wire-vectors.txt`（42 个 nearby 帧）、`dmsdp-vectors.txt`（4006 入口握手）、
+`network-vectors.txt`（完整 Wi-Fi 协商，含凭据串）。它们是参考项目从 Python 线协议实现生成、
+并由 `scripts/test-host.py` 的 `WireTest` / `DmsdpTest` / `NetworkTest` 验收的基准。
+
+新增 `HiCarReferenceVectorsTest`（3 个用例），结果：
+
+| 组 | 检查 | 结果 |
+| --- | --- | --- |
+| nearby 帧 | 42 行 `pack(kind, payload)` 逐字节相同；每行遍历**所有切分点**验证增量解码；末字节翻转必被 CRC 拒绝 | 通过 |
+| DMSDP 入口 | 请求解码 → `hiCarDmsdpEntryReply(..., 4007)` 与参考应答逐字节相同；遍历切分点；坏 CRC 拒绝 | 通过 |
+| Wi-Fi 协商 | 按参考 `NetworkTest` 顺序喂 6 行：能力应答、选网后的队列命令（kind 33 tag 1）、station 地址→凭据串、后续两步；未认证拒绝、加密帧拒绝 | 通过 |
+
+因此**广播帧、DMSDP 入口、网络凭据这三段与参考实现字节级一致**，不再依赖"读代码觉得一样"。
+加上 7.39 的 HiSight RTSP 差分（初始 ANNOUNCE 逐字节、握手每条回复、PLAY/TEARDOWN、坏记录处理），
+协议层能对照的部分已经全部对照完。
+
+#### 四、这一轮没有改协议实现
+
+对照没发现新的字节级偏差，所以没有为了"看起来在做事"去动协议代码。
+只改了界面的一处引导（首次系统蓝牙普通配对）与两份文档。这是有意的：
+前面几轮的教训就是没证据先改解析器，结果改错了方向（7.38 vs 7.39）。
+
+#### 五、仍未验证 / 不能承诺
+
+- 向量与单元测试不能替代真机画面、声音、触控；参考项目自己也在 KNOWN_ISSUES 里把
+  "编译通过 / 解码器初始化"与"完整可用"分开写。
+- 参考 README 的实测范围是 Android 17 / Android 14 手机 + Mate 40 Pro / HarmonyOS 4，
+  **安卓车机与 HarmonyOS 5/6 发送端写着"尚未实测"**；我们的高通 trinket / Android 10 /
+  Mate 80 Pro Max 同样在未知范围里。参考项目的"重启后自动回连"也仍标注未解决。
+- 11:11 那条让视频会话断掉的 RTSP 记录内容依旧没有抓到。新包会把它打印成
+  `HiSight: record ignored as <category>; session continues >> … <<`，并给可辨认的请求回 200，
+  下一次上车才能定论。

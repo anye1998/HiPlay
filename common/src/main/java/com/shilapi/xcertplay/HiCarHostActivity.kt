@@ -186,6 +186,15 @@ class HiCarHostActivity : ComponentActivity() {
                     "画面与声音在真车上的效果仍待验证。",
                 style = MaterialTheme.typography.bodyMedium,
             )
+            // The reference receiver's README makes this a prerequisite on some devices, and it is
+            // the opposite of the advice we had been giving (delete the phone's record / rotate the
+            // identity). Put it above every button so a first-run driver cannot miss it.
+            Text(
+                "首次使用：先在车机和手机的「系统蓝牙设置」里完成一次普通配对，再回来点「开始」。\n" +
+                    "手机弹出 HiCar 提示后连接，输入上面这 6 位即可。配好之后不要反复删配对记录或按「重置配对」——" +
+                    "重置只清车机，清不掉手机里的记录，两边状态不一致会一直报认证失败。",
+                style = MaterialTheme.typography.bodySmall,
+            )
             OutlinedTextField(
                 value = model,
                 onValueChange = { value ->
