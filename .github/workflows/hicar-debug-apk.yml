@@ -1,0 +1,87 @@
+name: HiCar debug APK
+
+# Builds the experimental receiver on GitHub Actions so a low-powered workstation only has to
+# edit and push. Every push to the migration branch produces a car-installable debug APK.
+on:
+  push:
+    branches: [feat/hicar-migration]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hicar-debug-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reject credential files in public source
+        run: python3 scripts/check_public_tree.py
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools platforms;android-37.0 build-tools;36.0.0 ndk;28.2.13676358 cmake;3.22.1
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # The HiChain C engine is third-party source and deliberately not committed. Without this
+      # step the APK still builds with ENGINE_BUILT=false and authentication can never finish.
+      - name: Cache the pinned HiChain engine sources
+        uses: actions/cache@v4
+        with:
+          path: hicar-auth/src/main/cpp/third_party
+          key: hichain-${{ hashFiles('scripts/fetch-hichain-sources.py') }}
+
+      - name: Fetch the pinned HiChain engine sources
+        run: |
+          python3 scripts/fetch-hichain-sources.py
+          python3 scripts/fetch-hichain-sources.py --verify
+
+      - name: HiCar protocol tests
+        run: ./gradlew :shared:testDebugUnitTest --tests "com.shilapi.xcertplay.hicar.*" --console=plain
+
+      - name: Build the debug APK
+        run: |
+          set -o pipefail
+          ./gradlew --no-configuration-cache --console=plain \
+            :hicar-auth:externalNativeBuildDebug :mobile:assembleDebug 2>&1 | tee "$RUNNER_TEMP/hicar-build.log"
+
+      # A green build is worthless if the native library is missing from the APK.
+      - name: Assert the native engine is inside the APK
+        run: |
+          unzip -l mobile/build/outputs/apk/debug/*.apk | grep -q "lib/arm64-v8a/libhicarauth.so"
+          unzip -l mobile/build/outputs/apk/debug/*.apk | grep -q "lib/armeabi-v7a/libhicarauth.so"
+          unzip -l mobile/build/outputs/apk/debug/*.apk | grep -q "lib/arm64-v8a/libnetiface.so"
+          unzip -l mobile/build/outputs/apk/debug/*.apk | grep -q "lib/armeabi-v7a/libnetiface.so"
+          echo "libhicarauth.so and libnetiface.so present for both ABIs"
+
+      - name: Name the failing build stage
+        if: failure()
+        run: python3 scripts/build_stage_report.py "$RUNNER_TEMP/hicar-build.log"
+
+      - name: Upload debug APK
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hicar-debug-apk
+          path: mobile/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hicar-test-reports
+          path: shared/build/reports/tests/
+          if-no-files-found: warn

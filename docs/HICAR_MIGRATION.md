@@ -2125,3 +2125,61 @@ video: window attached to the decoder (decoder=ready, …)
 - 11:11 那条让视频会话断掉的 RTSP 记录内容依旧没有抓到。新包会把它打印成
   `HiSight: record ignored as <category>; session continues >> … <<`，并给可辨认的请求回 200，
   下一次上车才能定论。
+
+### 7.41 换电脑后改用 GitHub Actions 编译上车包
+
+用户换了一台配置较低的电脑继续任务，并提出"能不能考虑使用 github 进行编译"。可以，而且
+仓库本来就有这套能力，只是没有覆盖到我们这条分支。
+
+#### 一、新电脑的本地环境（已配好，但不再承担重构建）
+
+从零重建的内容写在 `D:/work/HICAR_ENV_SETUP.md`：仓库从 GitHub 重新 clone 到 `D:/work/HiPlay`
+（HEAD `af8e593`），JDK Temurin 25.0.5+8、Android SDK / NDK 28.2.13676358 / CMake 3.22.1
+全部装到 D 盘（C 盘只剩 11 GB），环境变量与 `local.properties` 已持久化，
+`scripts/fetch-hichain-sources.py` 已把五个固定版本的引擎源码拉齐（`--verify` 输出 ok）。
+
+本地全量验证跑了 12 分钟仍未完成，且日志里出现一个**这台机器特有的问题**：
+
+```
+shared/build/generated/aidl_source_output_dir/debug/out/.../IInputManager.java:3:
+  错误: 编码 UTF-8 的不可映射字符 (0xE7)
+ * Using: ... -dC:/Users/缪建勇/AppData/Local/Temp/aidl...d ...
+```
+
+Windows 用户名含中文，AIDL 把临时路径以系统码页写进生成 Java 文件的注释，javac 按 UTF-8
+读取就报错。旧电脑用户名是纯 ASCII，从未遇到。`hicar-env.sh` 已把 `TEMP`/`TMP` 指到
+`D:/gradle-tmp` 来消除它，但这台机器性能有限，本地不再作为主要构建手段。
+
+GitHub 的 `ubuntu-latest` runner 路径全 ASCII，这个问题天然不存在。
+
+#### 二、仓库里原本就有的工作流
+
+- `android.yml`：push `main` / PR / 手动触发，跑单元测试与 lint，注释写明是
+  **source-only debug build**（不 fetch 引擎），且只上传测试报告，不上传 APK。
+- `android-release.yml`：push `main` / tag / 手动触发，**会** `fetch-hichain-sources.py`、
+  构建 debug+release、断言 `libhicarauth.so` / `libnetiface.so` 两种 ABI 都在 APK 里、
+  上传 `debug-apk` 与 `release-apk` artifact。
+
+问题只有一个：两者的 push 触发分支都是 `main`，我们在 `feat/hicar-migration` 上 push
+不会触发任何构建。
+
+#### 三、本轮新增 `.github/workflows/hicar-debug-apk.yml`
+
+专门服务实验分支，push 到 `feat/hicar-migration` 或手动 `workflow_dispatch` 触发：
+
+1. JDK 25 + SDK（android-37.0 / build-tools 36.0.0 / NDK 28.2.13676358 / CMake 3.22.1），
+   与 CI 其它工作流完全一致；
+2. 缓存并按固定版本拉取 HiChain 引擎源码（不 fetch 的包是残废包）；
+3. 跑 `:shared:testDebugUnitTest --tests "com.shilapi.xcertplay.hicar.*"`；
+4. `:hicar-auth:externalNativeBuildDebug` + `:mobile:assembleDebug`；
+5. **断言四个 `.so` 都在 APK 里**（两种 ABI × libhicarauth / libnetiface），防止"构建绿但引擎没进包"；
+6. 上传 `hicar-debug-apk` artifact 与测试报告；失败时用 `build_stage_report.py` 命名失败阶段。
+
+#### 四、以后的工作流
+
+改代码 → `git push origin feat/hicar-migration` → GitHub Actions 自动编译 →
+到 `https://github.com/anye1998/HiPlay/actions` 找 **HiCar debug APK** 这次 run →
+下载 `hicar-debug-apk` → 装到车机。本地只做编辑、日志分析与轻量单元测试。
+
+**尚未验证**：本工作流第一次在 GitHub 上实际运行的结果；推送成功后要看它的
+"Assert the native engine is inside the APK" 与 artifact 是否生成。
