@@ -1953,3 +1953,103 @@ audio: AAC 48000 Hz, 2 channel(s); playback started
 ```
 
 若 `OPTIONS` 之后仍缺某一步，新加的头名列表和失败转储会直接指出是哪一条、哪个头。
+
+### 7.39 不再猜：把参考实现放进测试当基准，顺手修掉三个确定的缺陷
+
+用户的批评很直接："不要自个儿盲猜，我之前给你的参考项目里面已经有能够跑通的流程了。"
+这一轮换做法：**先读完全部参考源码（3192 行），再把它搬进测试做逐字节对照**，然后只改有证据的地方。
+
+#### 一、11:11 那次失败的重新判读（上一轮的结论是错的）
+
+旧结论说"手机发来的 `OPTIONS` 被我们的头语法拒绝"。日志的真实顺序是：
+
+```
+121: HiSight: ANNOUNCE, 108-byte body
+122: HiSight: RTSP encryption negotiated (aes128ctr)
+123: HiSight: OPTIONS, 34-byte body          ← 这条已经解析成功
+124: HiSight rejected: rtsp header           ← 失败的是紧接着的下一条记录
+```
+
+`OPTIONS, 34-byte body` 这行是在头解析**之后**打印的（`parse` 里 `onLog` 的位置在 header 循环之后），
+所以 OPTIONS 本身没有问题。**失败的是它后面那条记录**——那条记录连一行日志都没留下，因为它在头解析阶段
+就抛了。上一轮我改的"放宽头名/跳过缺冒号行"虽然没错，但并不是这次失败的原因。
+
+#### 二、把参考实现放进测试：`HiCarHiSightReferenceParityTest`
+
+`shared/src/test/java/com/shilapi/xcertplay/hicar/reference/` 下是参考项目的
+`HiSightWire.java`、`NearbyWire.java`、`SessionCipher.java` **原样副本**（MIT，只改了 package 和可见性，
+每处改动都有注释说明仅用于测试）。测试做四件事：
+
+1. **`initial()` 逐字节相同**：两边发出的明文 `ANNOUNCE` 完全一致。
+2. **完整握手的每条回复相同**：脚本按 11:11 的真实顺序走一遍
+   （明文 200 → 手机 ANNOUNCE → OPTIONS → GET_PARAMETER → SET_PARAMETER 触发 SETUP → 200 带端口），
+   逐条比较解密后的文本、条数、`mediaPort`/`inputPort`。
+3. **`PLAY`/`TEARDOWN` 相同**。
+4. **坏记录不再杀会话**：一条没有 CSeq 的记录被跳过并写日志，后续仍能协商出 41129/41234。
+
+手机侧的记录是用**我们的 cipher 加密**后喂给参考实现的——参考能解开，本身就证明了两个 cipher 等价
+（AES-128-CTR、key 取会话密钥前 16 字节、每条记录前置 16 字节随机 IV）。
+
+这四条约等于"我的移植不是我以为的移植"，而是可执行的等价性证明。
+
+#### 三、据此修掉的三处
+
+1. **单条记录失败不再结束视频会话**。RTSP 有 4 字节长度分帧，下一条记录仍然可定位。现在只有三种
+   会破坏分帧的失败才终止：`rtsp size`、`rtsp buffer`、`rtsp cipher selection`（ANNOUNCE 没选中加密，
+   之后全解不开）。其余记录被跳过，把可打印文本写进日志（≤400 字符），会话继续。
+2. **跳过之后还要回 200**。手机在等那条报文的 200，不回它就会自己把会话关掉。所以只要报文的第一行
+   是一个请求方法、且能找出 `CSeq: N`，就回一条 `RTSP/1.0 200 OK`。日志里会写
+   `answering that <METHOD> with 200 so the phone does not wait for it`。
+3. **`his_presentation_url` 的字符集放宽**到 `rtsp://[!-~]{1,256}`（可打印 ASCII、不含空格）。
+   参考是 `[A-Za-z0-9.:/_?=&%-]`，URL 里只要有一个 `~`、`+`、`@`、`;` 就会整条会话失败——
+   为一个字符丢掉整个画面不值得。空格仍然禁止，因为这个值会被原样拼进请求行。
+
+顺带补了参考有而我们缺的一处：设备信息里的 `properties["5002"] = true`（有可用麦克风时），
+没有它手机不会发起 `mic1` 协商。
+
+#### 四、自动重连：一轮结束就重新等待，不用再按一次"开始"
+
+参考实现的 `requestReconnect` 在每条会话结束时整轮重启（`stopInternal` → `video.restart()` → 1.5 秒后
+`start(...)`），我们之前没有：手机一断开，广播和监听就都没了，每次重试都要人手动点一次。
+
+现在 `HiCarController` 有"轮次"概念：
+
+- `generation` 每轮加一。accept 循环、心跳、`serve` 都用 `generation == round` 判断自己是否过期，
+  过期就退出——这比中断每个线程可靠，也是参考实现的做法。
+- `releaseChain(keepVideo)` 把清理抽出来：`close()` 用它并把 `keepVideo=false`（用户主动停止）；
+  重连用它并保留解码器与窗口（`HiCarVideoSink.restart()`，参考的 `VideoSink.restart` 等价物）。
+- `scheduleReconnect` 只在**本轮**通道关闭时触发，且用一把锁保证一轮只重启一次（控制与业务通道
+  通常同时关闭）。等 1.5 秒、重建线程池、重新走 `startChain()`，连接码与已配对信任都不动。
+- 用户主动"停止"时 `running` 已是 false，`scheduleReconnect` 直接返回——模拟器上已确认停止日志之后
+  没有出现 `releasing this round`。
+
+#### 五、模拟器上抓到的真 bug：第二次启动解码器起不来
+
+连着按两次"开始"，第二次出现 `HiSight: video start failed (CodecException)`。
+
+原因在 `HiCarVideoSink`：它把 `SurfaceTexture` 当自己的资源，`closeDecoder()`/`close()` 里无条件
+`texture.release()`。可一旦 `attach()` 采用过 `TextureView` 自己的纹理，被释放的就是**视图的**纹理，
+那个视图之后再也产不出帧。参考实现的 `detach` 返回 `false` 正是为了说"这个纹理不是我的，你（视图）自己释放"。
+
+改法：新增 `ownedTexture`，只有 sink 自己 `SurfaceTexture(false)` 创建的才允许释放；
+`closeDecoder()` 只 release `Surface`、把纹理引用置空；`detach()` 只在 `ownedTexture === value` 时返回 true。
+
+验证（MuMu，Android 12 x86_64）：
+
+```
+--- receiver started 11:29:13 with code 340978 ---
+HiSight: H.264 decoder ready (800×480)
+video: window attached to the decoder (decoder=ready, …)
+HiCar receiver stopped; connections=0
+--- receiver started 11:29:22 with code 340978 ---
+HiSight: H.264 decoder ready (800×480)          ← 第二次也正常，CodecException 消失
+video: window attached to the decoder (decoder=ready, …)
+```
+
+#### 六、还在猜的部分（明确标出，不假装）
+
+`OPTIONS` 之后那条记录到底是什么内容，现有日志里没有——那一轮还没有记录转储。现在有了：
+任何被跳过的记录都会打印 `record ignored as <category>; session continues >> … <<`。
+下一次上车，**即使仍然失败，失败原因会直接写在日志里**，不需要再靠推测。
+
+测试：`:shared` 的 hicar 包 111 个用例 0 失败（新增 4 个差分用例），`HiCarExportUiTest` 与两个翻译测试通过。

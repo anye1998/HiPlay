@@ -121,6 +121,9 @@ internal class HiCarDeviceBusiness(
             .put("port", 0)
             .put("properties", JSONObject().put("2003", model))
             .put("businessId", businessId)
+        // `5002` is how the reference tells the phone an uplink microphone exists; without it the
+        // phone never offers `mic1` even when the mask below includes it.
+        if (microphoneReady()) own.getJSONObject("properties").put("5002", true)
         val reply = packet(HiCarCodes.DMSDP_COMMAND_DEVICE_INFO, own)
         peer = identity
         exchanged = true

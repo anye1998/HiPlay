@@ -87,10 +87,25 @@ class HiCarController(
 ) : Closeable {
     private val appContext = context.applicationContext
     private val running = AtomicBoolean(false)
-    private val setup = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "hicar-setup") }
-    private val accept = Executors.newCachedThreadPool { runnable -> Thread(runnable, "hicar-accept") }
+    private var setup = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "hicar-setup") }
+    private var accept = Executors.newCachedThreadPool { runnable -> Thread(runnable, "hicar-accept") }
     private val sockets = CopyOnWriteArrayList<Closeable>()
     private val workers = CopyOnWriteArrayList<Thread>()
+
+    /**
+     * Identifies one "round": one access point, one advertisement, one pair of listeners.
+     *
+     * A round ends either when the driver stops the receiver or when the phone goes away. In the
+     * second case the same controller starts a new round, and everything that belongs to the old one
+     * — accept loops, heartbeat, connections — has to notice that it is stale and stop touching
+     * shared state. A generation counter is cheaper and more reliable than trying to interrupt each
+     * of them, and it is what the reference receiver does.
+     */
+    @Volatile private var generation = 0
+
+    /** One restart per round: the control and business channels usually close together. */
+    private var reconnectPending = false
+    private val reconnectLock = Any()
 
     /** How many RFCOMM connections arrived; the waiting heartbeat reports it. */
     private val connections = AtomicInteger(0)
@@ -328,13 +343,35 @@ class HiCarController(
 
     override fun close() {
         if (!running.compareAndSet(true, false)) return
+        releaseChain(keepVideo = false)
+        setup.shutdownNow()
+        accept.shutdownNow()
+        report(HiCarStatus.Stopped)
+        // The count belongs on the stop line as well: a session shorter than one heartbeat ends
+        // without ever printing "waiting for the phone", and then an exported log cannot tell a
+        // phone that never dialled from one that connected and hung up.
+        onLog("HiCar receiver stopped; connections=$connections")
+    }
+
+    /**
+     * Lets go of everything one round owns, without deciding whether another round follows.
+     *
+     * [keepVideo] is what separates "the driver stopped" from "the phone went away": the reference
+     * receiver keeps its decoder and window across a reconnect, so the next attempt can put a picture
+     * on screen without the activity having to recreate its view. When the decoder cannot be
+     * restarted it is dropped, because a sink that will never decode is worse than none: the display
+     * service would be announced and then stay black.
+     */
+    private fun releaseChain(keepVideo: Boolean) {
+        // Anything captured with the old generation stops at its next check.
+        generation++
         input.cancel()
         hisight?.close()
         hisight = null
         mediaBusy.set(false)
         dmsdp?.close()
         dmsdp = null
-        // The key outlives the RFCOMM channel by design; it stops existing here.
+        // The key outlives the RFCOMM channel by design; it stops existing with the round.
         liveKey?.fill(0)
         liveKey = null
         advertiser?.close()
@@ -345,24 +382,75 @@ class HiCarController(
         services = null
         for (closeable in sockets) closeQuietly(closeable)
         sockets.clear()
-        for (worker in workers) worker.interrupt()
+        val self = Thread.currentThread()
+        for (worker in workers) if (worker !== self) worker.interrupt()
         workers.clear()
-        video?.close()
-        video = null
+        if (keepVideo) {
+            val sink = video
+            if (sink != null && !sink.restart()) {
+                sink.close()
+                video = null
+            }
+        } else {
+            video?.close()
+            video = null
+        }
         audioReady = false
         microphoneReady = false
         runCatching { hotspot?.close() }
         hotspot = null
-        setup.shutdownNow()
-        accept.shutdownNow()
-        report(HiCarStatus.Stopped)
-        // The count belongs on the stop line as well: a session shorter than one heartbeat ends
-        // without ever printing "waiting for the phone", and then an exported log cannot tell a
-        // phone that never dialled from one that connected and hung up.
-        onLog("HiCar receiver stopped; connections=$connections")
+        liveNetwork?.authenticated = false
+        liveNetwork = null
+        liveOffer = null
+        runCatching { setup.shutdownNow() }
+        runCatching { accept.shutdownNow() }
+    }
+
+    /**
+     * Ends this round because the phone left, then waits for it again.
+     *
+     * This is the difference between one attempt per "Start" press and a receiver that behaves like
+     * the car's own: the phone drops both RFCOMM channels as soon as it decides to retry, and without
+     * this the advertisement and listeners were gone by then, so every retry needed a human. The code
+     * is not touched, the stored trust is not touched, and the delay keeps a phone that is bouncing
+     * between attempts from turning this into a restart loop.
+     */
+    private fun scheduleReconnect(reason: String) {
+        if (!running.get()) return
+        synchronized(reconnectLock) {
+            if (reconnectPending) return
+            reconnectPending = true
+        }
+        onLog(
+            "HiCar: $reason; releasing this round and waiting for the phone again in " +
+                "${RECONNECT_DELAY_MILLIS / 1000}s (the code and the pairing are unchanged)",
+        )
+        Thread({
+            try {
+                Thread.sleep(RECONNECT_DELAY_MILLIS)
+                if (!running.get()) return@Thread
+                releaseChain(keepVideo = true)
+                if (!running.get()) return@Thread
+                setup = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "hicar-setup") }
+                accept = Executors.newCachedThreadPool { runnable -> Thread(runnable, "hicar-accept") }
+                report(HiCarStatus.Advertising)
+                startChain()
+                if (running.get()) onLog("HiCar: listening again; the phone may reconnect on its own")
+            } catch (interrupted: InterruptedException) {
+                Thread.currentThread().interrupt()
+            } catch (failure: Exception) {
+                report(HiCarStatus.Failed(failure.javaClass.simpleName))
+                onLog("HiCar restart failed: ${failure.javaClass.simpleName}")
+            } finally {
+                synchronized(reconnectLock) { reconnectPending = false }
+            }
+        }, "hicar-reconnect").apply { isDaemon = true }.start()
     }
 
     private fun startChain() {
+        // Everything this round starts (accept loops, heartbeat, connections) is tagged with it, so a
+        // loop from a previous round can tell that it is stale instead of competing for the socket.
+        val round = ++generation
         if (!hasPermissions()) {
             report(HiCarStatus.Failed("permission"))
             val missing = missingPermissions()
@@ -403,7 +491,7 @@ class HiCarController(
         // "never transmitted", which look identical from the phone's silence.
         probe = HiCarAdvertisementProbe(appContext, onLog).also { it.start(serviceData) }
         report(HiCarStatus.WaitingForPhone)
-        startAcceptLoops(rfcomm)
+        startAcceptLoops(rfcomm, round)
     }
 
     /**
@@ -658,11 +746,11 @@ class HiCarController(
         }
     }
 
-    private fun startAcceptLoops(rfcomm: HiCarRfcommServices) {
-        val control = thread("hicar-control") { acceptLoop(rfcomm::acceptControl, control = true) }
-        val business = thread("hicar-business") { acceptLoop(rfcomm::acceptBusiness, control = false) }
+    private fun startAcceptLoops(rfcomm: HiCarRfcommServices, round: Int) {
+        val control = thread("hicar-control") { acceptLoop(rfcomm::acceptControl, control = true, round) }
+        val business = thread("hicar-business") { acceptLoop(rfcomm::acceptBusiness, control = false, round) }
         onLog("HiCar listeners started: ${control.name}, ${business.name}")
-        startWaitingHeartbeat()
+        startWaitingHeartbeat(round)
     }
 
     /**
@@ -672,18 +760,18 @@ class HiCarController(
      * never tried, tried and failed before RFCOMM, or the receiver had already died. Those need
      * different next steps, so the log has to tell them apart.
      */
-    private fun startWaitingHeartbeat() {
+    private fun startWaitingHeartbeat(round: Int) {
         thread("hicar-wait") {
             val startedAt = System.nanoTime()
             var hinted = false
-            while (running.get()) {
+            while (running.get() && generation == round) {
                 try {
                     Thread.sleep(WAIT_HEARTBEAT_MILLIS)
                 } catch (interrupted: InterruptedException) {
                     Thread.currentThread().interrupt()
                     return@thread
                 }
-                if (!running.get()) return@thread
+                if (!running.get() || generation != round) return@thread
                 val seconds = (System.nanoTime() - startedAt) / 1_000_000_000
                 onLog(
                     "HiCar waiting for the phone: ${seconds}s, connections=$connections, " +
@@ -737,24 +825,38 @@ class HiCarController(
         }
     }
 
-    private fun acceptLoop(acceptSocket: () -> android.bluetooth.BluetoothSocket, control: Boolean) {
-        while (running.get()) {
+    private fun acceptLoop(acceptSocket: () -> android.bluetooth.BluetoothSocket, control: Boolean, round: Int) {
+        while (running.get() && generation == round) {
             val socket = try {
                 acceptSocket()
             } catch (closed: IOException) {
-                if (running.get()) onLog("HiCar ${if (control) "control" else "business"} listener closed")
+                if (running.get() && generation == round) {
+                    onLog("HiCar ${if (control) "control" else "business"} listener closed")
+                }
                 return
             } catch (denied: SecurityException) {
                 onLog("HiCar listener needs the nearby-devices permission")
                 return
             }
+            // The listener may have been released while this thread was blocked in accept().
+            if (generation != round) {
+                closeQuietly(socket)
+                return
+            }
             sockets.add(socket)
             connections.incrementAndGet()
-            accept.execute { serve(socket, control) }
+            try {
+                accept.execute { serve(socket, control, round) }
+            } catch (rejected: java.util.concurrent.RejectedExecutionException) {
+                // The round ended between the accept and the hand-off; the listener is already closed.
+                sockets.remove(socket)
+                closeQuietly(socket)
+                return
+            }
         }
     }
 
-    private fun serve(socket: android.bluetooth.BluetoothSocket, control: Boolean) {
+    private fun serve(socket: android.bluetooth.BluetoothSocket, control: Boolean, round: Int) {
         // The peer address makes a connection attempt identifiable in a report: a phone that dials is
         // the first hard evidence the discovery stage worked, and which phone it was matters when the
         // car is bonded to more than one.
@@ -793,7 +895,7 @@ class HiCarController(
             val input: InputStream = socket.inputStream
             val output: OutputStream = socket.outputStream
             val buffer = ByteArray(4096)
-            while (running.get()) {
+            while (running.get() && generation == round) {
                 val read = input.read(buffer)
                 if (read < 0) break
                 if (!control) {
@@ -896,6 +998,11 @@ class HiCarController(
             authenticator.close()
             closeQuietly(socket)
             sockets.remove(socket)
+            // Only this round may ask for a restart: a stale channel closing after a new round has
+            // begun must not tear that round down again.
+            if (generation == round) {
+                scheduleReconnect(if (control) "the control channel closed" else "the business channel closed")
+            }
         }
     }
 
@@ -1007,6 +1114,15 @@ class HiCarController(
 
         /** Two heartbeats with no dial at all: the silence is on the phone's side. */
         const val SILENT_PHONE_MILLIS = 60_000L
+
+        /**
+         * How long to wait before opening a fresh round.
+         *
+         * The phone closes its channels and immediately dials again when it is retrying, so this only
+         * has to be longer than the teardown, and short enough that a retry finds the advertisement
+         * already up. The reference receiver uses the same figure.
+         */
+        const val RECONNECT_DELAY_MILLIS = 1_500L
 
         /** The phone usually takes the next address after the access point itself. */
         fun clientAddressFor(owner: String): String? {

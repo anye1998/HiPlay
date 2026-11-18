@@ -38,7 +38,7 @@
 | `AudioMedia`/`AudioSink`/`AudioReceiver` | 加密 UDP → RTP → ADTS → AAC → AudioTrack；`SpeakerControl` 处理扬声器指令 | `HiCarAudioWire`/`HiCarAudioSink`/`HiCarAudioReceiver`/`HiCarSpeakerControl` | **本轮移植** |
 | `MicrophoneSender`/`MicrophoneWire`/`MicrophoneControl` | 语音上行（需录音权限，默认关闭） | `HiCarMicrophone`/`HiCarMicrophoneControl` | **本轮移植**，默认关闭，需手动打开 |
 | `InputChannel`/`InputRouter`/`UiInput` | 触控/返回/主页（UIBC） | `HiCarUiInput`（编码器 + 路由 + 发送通道） | **本轮移植** |
-| `ReconnectGate` | 断线后重连门控，避免误判断开 | `HiCarController` 的重入保护 | 部分：控制连接结束即释放媒体，监听仍在，手机可重连；不做整轮重启 |
+| `ReconnectGate` | 断线后重连门控，避免误判断开 | `HiCarController` 的 `generation` + `reconnectPending` | **本轮移植**：一轮一次、延迟 1.5 s、保留解码器与窗口（`HiCarVideoSink.restart`） |
 | `WireIdentity` | **用本机蓝牙地址派生 deviceId**，让手机的记忆键稳定 | `HiCarHostActivity.rotateIdentity`（随机 16 位） | 部分：我们可换标识，但不是从 BT 地址派生 |
 | `P2pHotspot`/`LocalHotspot`/`LocalApInfo`/`OwnApScan` | 5GHz 热点与地址读取 | `WifiP2pGroupManager`/`LocalOnlyHotspotManager`/`HiCarAccessPoints`/`HiCarAccessPointBssid` | 已有（且我们补了 BSSID 三源取证） |
 | `RfcommPort`/`ClientPreflight` | 反射取 RFCOMM 动态通道号、前置检查 | `HiCarRfcommServices` | 已有 |
@@ -84,7 +84,9 @@ body 以 varint 指令号开头，101=身份、102=服务宣布、104=服务请�
 ## 五、下一阶段
 
 1. 上车验证这一轮：`service request` → 显示服务宣布 → `SETUP` 拿到端口 → 首帧。
+   若某条 RTSP 记录被跳过，日志会直接写出它的文本（`record ignored as … >> … <<`）。
 2. 若首帧不出：按日志分层定位——`HiSight: ANNOUNCE sent` / `SETUP sent` / `video socket connected` /
    `H.264 access unit`，哪一层没有就补哪一层。
 3. 画面正常后再看音频与触控（`speaker: SETUP sent`、`UIBC: … event(s) sent`）。
-4. 最后才评估重连门控与身份派生。
+4. 身份派生（`WireIdentity` 的蓝牙地址派生）仍未改：现在用 `ANDROID_ID` 派生且可轮换，
+   改掉会让已配对的手机把车当成新车、又要输一次码，等链路稳定后再评估。

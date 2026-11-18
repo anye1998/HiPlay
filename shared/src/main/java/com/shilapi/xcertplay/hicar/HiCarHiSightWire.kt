@@ -75,13 +75,21 @@ internal class HiCarHiSightWire(
         return pack(message("TEARDOWN $target RTSP/1.0", (++sequence).toString(), ""))
     }
 
-    /** Consumes socket bytes and returns the records to write back, in order. */
+    /**
+     * Consumes socket bytes and returns the records to write back, in order.
+     *
+     * A record whose contents this build does not understand is skipped, not fatal. The stream is
+     * length-prefixed, so the next record is still addressable; killing the whole video session over
+     * one unrecognised message is how a recoverable surprise turns into "the picture never appeared".
+     * Only the three failures that destroy framing end the session: an impossible length, an
+     * over-long buffer, and an ANNOUNCE that does not select the cipher (after which nothing can be
+     * decrypted, so continuing would only produce garbage).
+     */
     fun feed(data: ByteArray, count: Int = data.size): List<ByteArray> {
         if (failed || count < 0 || count > data.size || buffer.size + count > MAX_WIRE_BYTES) {
             throw HiCarWireException("rtsp buffer")
         }
         val replies = ArrayList<ByteArray>()
-        var current: ByteArray? = null
         try {
             buffer = join(buffer, data.copyOf(count))
             while (buffer.size >= LENGTH_BYTES) {
@@ -91,10 +99,37 @@ internal class HiCarHiSightWire(
                 if (buffer.size < size + LENGTH_BYTES) break
                 var payload = buffer.copyOfRange(LENGTH_BYTES, (size + LENGTH_BYTES).toInt())
                 buffer = buffer.copyOfRange((size + LENGTH_BYTES).toInt(), buffer.size)
-                if (encrypted) payload = cipher.decrypt(payload)
-                current = payload
+                if (encrypted) {
+                    val plain = try {
+                        cipher.decrypt(payload)
+                    } catch (failure: Exception) {
+                        onLog("HiSight: record skipped, it could not be decrypted (${failure.javaClass.simpleName})")
+                        payload.fill(0)
+                        continue
+                    }
+                    payload.fill(0)
+                    payload = plain
+                }
                 try {
                     parse(payload, replies)
+                } catch (failure: IOException) {
+                    val category = failure.message ?: ""
+                    if (category in FATAL_CATEGORIES) {
+                        onLog("HiSight: $category (framing lost, the session ends here)")
+                        throw failure
+                    }
+                    // Bounded, printable protocol text only, and only for a record this side refused:
+                    // without it a skipped message costs another car session to identify.
+                    val text = String(payload, StandardCharsets.US_ASCII)
+                    onLog(
+                        "HiSight: record ignored as ${category.ifEmpty { "unreadable" }}; session continues >> " +
+                            printable(text) + " <<",
+                    )
+                    // Skipping the record is not enough: the phone is waiting for a 200 and would end
+                    // the session from its side. Anything that is recognisably a request and has a
+                    // CSeq gets that answer, so a message this build merely does not understand costs
+                    // one step instead of the whole picture.
+                    acknowledgement(text)?.let { replies.add(it) }
                 } finally {
                     payload.fill(0)
                 }
@@ -105,9 +140,6 @@ internal class HiCarHiSightWire(
             if (failure.message?.matches(ERROR_CATEGORY) == true) {
                 onLog("HiSight rejected: ${failure.message} (fixed category, no message contents)")
             }
-            // One bounded, printable dump: protocol text only, and only when the session has already
-            // failed. Without it a rejection costs another car session to identify.
-            current?.let { onLog("HiSight: the record that failed was >> ${printable(String(it, StandardCharsets.US_ASCII))} <<") }
             throw failure
         } catch (failure: RuntimeException) {
             failed = true
@@ -295,6 +327,21 @@ internal class HiCarHiSightWire(
         return out.toString().toByteArray(StandardCharsets.US_ASCII)
     }
 
+    /**
+     * A `200 OK` for a request whose contents this build could not read.
+     *
+     * Returns null for anything that is not a request or has no usable CSeq, in which case there is
+     * nothing to acknowledge and the record is only skipped.
+     */
+    private fun acknowledgement(text: String): ByteArray? {
+        val firstLine = text.substringBefore("\r\n").trim()
+        val method = firstLine.substringBefore(' ')
+        if (!REQUEST_METHOD.matches(method)) return null
+        val cseq = CSEQ_LINE.find(text)?.groupValues?.getOrNull(1) ?: return null
+        onLog("HiSight: answering that $method with 200 so the phone does not wait for it")
+        return pack(message("RTSP/1.0 200 OK", cseq, ""))
+    }
+
     /** Printable form of protocol text for the log: control characters escaped, length bounded. */
     private fun printable(text: String): String {
         val out = StringBuilder()
@@ -338,9 +385,28 @@ internal class HiCarHiSightWire(
         val START_LINE = Regex("[A-Z_]+ \\S+ RTSP/1\\.0|RTSP/1\\.0 [1-5][0-9]{2}( [ -~]+)?")
         val HEADER_NAME = Regex("[a-z][a-z0-9._-]{0,63}")
         val CSEQ = Regex("[0-9]{1,9}")
-        val PRESENTATION_URL = Regex("rtsp://[A-Za-z0-9.:/_?=&%=-]{1,256}")
+        val REQUEST_METHOD = Regex("[A-Z]{3,20}")
+        val CSEQ_LINE = Regex("\r\nCSeq:\\s*([0-9]{1,9})", RegexOption.IGNORE_CASE)
+
+        /**
+         * Any printable ASCII after the scheme.
+         *
+         * The reference restricts this to `[A-Za-z0-9.:/_?=&%-]`, and a URL carrying one character
+         * outside that set would be refused — which costs the whole picture over a character in a
+         * path. Spaces stay forbidden because this value is copied into a request line, and a space
+         * there would change the request itself.
+         */
+        val PRESENTATION_URL = Regex("rtsp://[!-~]{1,256}")
         val TRANSPORT_PORT = Regex("(?:^|;)server_port=([0-9]+)")
         val TRANSPORT_INPUT_PORT = Regex("(?:^|;)remotectl_port=([0-9]+)")
         val ERROR_CATEGORY = Regex("rtsp [a-z ]{1,40}")
+
+        /**
+         * The only failures that are allowed to end a video session.
+         *
+         * Everything else is one bad record: the length prefix still frames the next one, so the
+         * session continues and the record is reported instead.
+         */
+        val FATAL_CATEGORIES = setOf("rtsp size", "rtsp buffer", "rtsp cipher selection")
     }
 }

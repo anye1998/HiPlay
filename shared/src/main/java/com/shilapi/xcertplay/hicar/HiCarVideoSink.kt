@@ -31,6 +31,16 @@ class HiCarVideoSink(private val onLog: (String) -> Unit) : AutoCloseable {
     private var surface: Surface? = null
     private var texture: SurfaceTexture? = null
 
+    /**
+     * The texture this sink created itself, if any.
+     *
+     * Only this one may be released by this class. A `SurfaceTexture` handed over by a `TextureView`
+     * belongs to that view: releasing it leaves the view permanently unable to produce frames, which
+     * is how a second Start on the same screen ended in `CodecException` — the first teardown had
+     * already released the view's own texture.
+     */
+    private var ownedTexture: SurfaceTexture? = null
+
     @Volatile private var running = false
 
     @Volatile var ready: Boolean = false
@@ -63,9 +73,14 @@ class HiCarVideoSink(private val onLog: (String) -> Unit) : AutoCloseable {
         if (ready) return true
         surface?.let { if (it.isValid) { startDecoder(); return ready } }
         closeDecoder()
+        // A previous texture of our own is finished with: prepare() is only reached when there is no
+        // usable surface left, so leaving it alive would leak one texture per failed start.
+        ownedTexture?.let { runCatching { it.release() } }
+        ownedTexture = null
         return try {
             val created = SurfaceTexture(false)
             created.setDefaultBufferSize(DISPLAY_WIDTH, DISPLAY_HEIGHT)
+            ownedTexture = created
             texture = created
             surface = Surface(created)
             visible = false
@@ -99,7 +114,12 @@ class HiCarVideoSink(private val onLog: (String) -> Unit) : AutoCloseable {
             if (!ready) startDecoder()
             return
         }
+        // The decoder's own texture (if any) is not the one the window just offered, and it is no
+        // longer usable: release that one and adopt the view's.
+        val ours = ownedTexture
         closeDecoder()
+        if (ours != null && ours !== available) runCatching { ours.release() }
+        ownedTexture = null
         texture = available
         available.setDefaultBufferSize(DISPLAY_WIDTH, DISPLAY_HEIGHT)
         surface = Surface(available)
@@ -107,13 +127,30 @@ class HiCarVideoSink(private val onLog: (String) -> Unit) : AutoCloseable {
         startDecoder()
     }
 
-    /** The window is gone: keep decoding, stop presenting. Returns true when the texture is ours. */
+    /** The window is gone: keep decoding, stop presenting. Returns true only for a texture we own. */
     @Synchronized
     fun detach(value: SurfaceTexture): Boolean {
         if (value !== texture) return false
         visible = false
         rendered = 0
-        return true
+        // `false` tells the view to release its own texture, which is what should happen to it.
+        return ownedTexture === value
+    }
+
+    /**
+     * Restarts the decoder on the surface it already owns, keeping the window.
+     *
+     * A reconnect must not cost the driver the picture window: the activity's `TextureView` still
+     * points at this texture, so restarting the codec is enough. Returns false when the surface has
+     * gone away, which means the caller should drop this sink instead of announcing a display that
+     * can never show anything.
+     */
+    @Synchronized
+    fun restart(): Boolean {
+        val current = surface ?: return false
+        if (!current.isValid) return false
+        startDecoder()
+        return ready
     }
 
     @Synchronized
@@ -140,9 +177,9 @@ class HiCarVideoSink(private val onLog: (String) -> Unit) : AutoCloseable {
     override fun close() {
         visible = false
         closeDecoder()
-        runCatching { surface?.release() }
-        surface = null
-        runCatching { texture?.release() }
+        // Only the texture this sink created may be released here; a view's texture is the view's.
+        ownedTexture?.let { runCatching { it.release() } }
+        ownedTexture = null
         texture = null
     }
 
@@ -233,8 +270,9 @@ class HiCarVideoSink(private val onLog: (String) -> Unit) : AutoCloseable {
     private fun closeDecoder() {
         releaseCodec()
         runCatching { surface?.release() }
-        if (surface != null) surface = null
-        runCatching { texture?.release() }
+        surface = null
+        // The texture is deliberately left alive and only forgotten: `ownedTexture` decides whether
+        // it is ever released, and a window that is mid-reconnect keeps pointing at it.
         texture = null
     }
 
