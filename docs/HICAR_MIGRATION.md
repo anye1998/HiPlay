@@ -1670,3 +1670,54 @@ RFCOMM 两个通道、identity 交换、广播 payload（`… 04 10 20`，末字
 
 **教训写在这里**：`重置配对` 是"让车机忘记手机"，它不能"让手机忘记车机"。
 排查期间反复按它，只会把两边的状态越推越远。
+
+### 7.35 认证之后：把手机真正要连的三个 TCP 端口开出来（照参考实现补齐）
+
+7.34 之后，10:01 那一轮 HiChain 全通了（PAKE → 32 字节密钥 → exchange → `END_SUCCESS`），
+但日志结尾仍是三十秒沉默后 `HiCar channel closed: IOException` ×2。原因写在我们自己的代码里：
+`openListener()` 的注释是 "Nothing calls this yet"——**三个 TCP 端口一个都没开**。
+
+对照参考实现（`docs/HICAR_REFERENCE_MAP.md`）后，缺的就是这一段：
+
+| 端口 | 分帧 | 作用 |
+| --- | --- | --- |
+| 4005 `controlPort` | nearby wire（`0x7F`+kind） | 加入热点后的补做：能力/数据端口/选网/凭据 |
+| 4006 `+1` | DMSDP 模块（`0x7F`+module+len+CRC） | 入口握手，回 16 字节，第 1、2 字节 = 4007 |
+| 4007 `+2` | DMSDP 记录（`marker`+len） | 明文 `OPTIONS` → `CryptoSwitch 222` → AES-CTR → 心跳 → `$` 业务包 |
+
+本轮新增三个文件：
+
+- `HiCarDmsdpTransport.kt`：模块帧与增量解码器、入口应答（端口写进应答的第 1、2 字节）。
+- `HiCarDeviceBusiness.kt`：模块 3 的 101（身份）与 104（服务目录），`$` + 11 字节头 + varint 指令。
+- `HiCarDmsdpEndpoints.kt`：三个监听。每条连接两次校验——**只接受本轮发过凭据的那个手机地址**，
+  且**必须已认证**；控制通道 1 秒心跳、30 秒空闲断开、同一时刻只允许一条。
+
+`HiCarController` 的两处接线：
+
+- 热点就绪就开监听（早于认证）。端口先绑着，拒绝时能说清"是没开"还是"被拒"。
+- 认证成功时把会话密钥**复制**给 TCP 侧：RFCOMM 关闭时 `HiChainAuthenticator.close()` 会把它的副本清零，
+  而手机这时候通常已经在连 TCP 了。
+
+故意没开的一处：**显示服务不宣布**（`displayReady = { false }`）。宣布了却放不出画面，
+手机只会报"连接失败"，比"没这功能"更难查；等 HiSight 与解码器接上再打开这一位。
+
+新增测试 `HiCarDmsdpTransportTest`（6 个）：入口应答的端口字节、CRC 损坏必须拒绝、
+101 回包的身份/地址/businessId、解码器不存在时不宣布、存在时只宣布一次、104 早于 101 必须拒绝。
+
+**下一次上车应该看到的新行**（按顺序）：
+
+```
+DMSDP: listening on <ip> ports 4005, 4006, 4007 (network, entry, control)
+HiChain finished: 32-byte session key; TCP endpoints are serving this key, so DMSDP can start on the access point
+DMSDP: network connection accepted from 192.168.x.y
+DMSDP entry: module 1 → control port 4007
+DMSDP: control connection accepted from 192.168.x.y
+DMSDP: control OPTIONS greeting sent
+DMSDP: DMSDP AES-CTR negotiated
+DMSDP: DMSDP control message: SET_PARAMETER ...
+DMSDP device info: answered with HiCarLab, model …
+DMSDP service request: mask 0x… wants display …; display ready=false, announced=false
+```
+
+看到 `service request: mask` 就说明手机已经认可这条连接并开始要服务了——下一步（HiSight 视频）
+才有意义；如果卡在更前面，那一行自己会说卡在哪。

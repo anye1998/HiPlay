@@ -38,4 +38,23 @@ internal object HiCarCodes {
 
     /** The control port the phone dials on the car's access point; +1 is the data port. */
     const val DEFAULT_CONTROL_PORT = 4005
+
+    /**
+     * DMSDP module numbers.
+     *
+     * The phone dials [DEFAULT_CONTROL_PORT] (planning/entry), `+1` (the DMSDP entry handshake) and
+     * `+2` (the control channel). Inside the control channel a `$` payload names its module in four
+     * big-endian bytes; these are the two that appear before any media is negotiated.
+     */
+    const val DMSDP_MODULE_ENTRY = 1
+    const val DMSDP_MODULE_DEVICE = 3
+    const val DMSDP_MODULE_MEDIA = 5
+
+    /** The device module always addresses the wildcard type. */
+    const val DMSDP_TYPE_WILDCARD = 0xFFFF_FFFFL
+
+    /** Device-module commands, as the phone numbers them. */
+    const val DMSDP_COMMAND_DEVICE_INFO = 101
+    const val DMSDP_COMMAND_SERVICE_ANNOUNCE = 102
+    const val DMSDP_COMMAND_SERVICE_REQUEST = 104
 }

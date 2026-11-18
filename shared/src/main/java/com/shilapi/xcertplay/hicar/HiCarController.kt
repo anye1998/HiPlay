@@ -96,6 +96,18 @@ class HiCarController(
     /** Created only after the access point is up, so it can never answer with a placeholder offer. */
     private var liveNetwork: HiCarNetworkNegotiator? = null
 
+    /** The three TCP endpoints the phone dials after authentication; null until the AP is ready. */
+    private var dmsdp: HiCarDmsdpEndpoints? = null
+
+    /**
+     * A copy of the authenticated session key, for the TCP side.
+     *
+     * The authenticator's own copy is cleared with its session, which happens on the RFCOMM thread as
+     * soon as that channel closes — and by then the phone is usually already talking DMSDP. The copy
+     * is wiped in [close].
+     */
+    private var liveKey: ByteArray? = null
+
     /**
      * Runs the key store's self-test and writes every line to the log.
      *
@@ -265,6 +277,11 @@ class HiCarController(
 
     override fun close() {
         if (!running.compareAndSet(true, false)) return
+        dmsdp?.close()
+        dmsdp = null
+        // The key outlives the RFCOMM channel by design; it stops existing here.
+        liveKey?.fill(0)
+        liveKey = null
         advertiser?.close()
         advertiser = null
         probe?.close()
@@ -304,6 +321,7 @@ class HiCarController(
         }
         val networkOffer = prepareNetwork() ?: return
         liveNetwork = HiCarNetworkNegotiator(networkOffer).also { it.authenticated = false }
+        startDmsdpEndpoints(networkOffer)
         val rfcomm = HiCarRfcommServices.open(adapter, onLog)
         if (rfcomm == null) {
             report(HiCarStatus.Failed("rfcomm"))
@@ -413,6 +431,40 @@ class HiCarController(
         report(HiCarStatus.NetworkReady(info.ssid, owner, info.backend.label))
         onLog("HiCar access point ready on ${info.bandLabel}, control port ${networkOffer.controlPort}")
         return networkOffer
+    }
+
+    /**
+     * Binds the three TCP endpoints as soon as the access point is up.
+     *
+     * They listen from the start even though nothing is served before authentication: the phone
+     * dials them the moment it joins, and a refused connect on a closed port is indistinguishable
+     * from a port that was never ours. Binding early means the log can say which of the two happened.
+     */
+    private fun startDmsdpEndpoints(offer: HiCarNetworkOffer) {
+        val network = liveNetwork ?: return
+        val business = HiCarDeviceBusiness(
+            deviceId = config.localIdentity,
+            model = config.model,
+            ownerAddress = offer.ownerAddress,
+            clientAddress = offer.clientAddress,
+            onLog = onLog,
+            // The HiSight client and a decoder are the next stage. Until they exist the display
+            // service stays unannounced: the phone would open a video connection, receive nothing
+            // and report the car as broken, which is a worse failure than a missing feature.
+            displayReady = { false },
+            onMediaEndpoint = { port -> onLog("HiCar media: the phone serves video on port $port; HiSight not implemented yet") },
+        )
+        val endpoints = HiCarDmsdpEndpoints(
+            offer = offer,
+            summary = config.localIdentity.toByteArray(Charsets.US_ASCII),
+            network = network,
+            business = business,
+            sessionKey = { liveKey },
+            active = { running.get() },
+            onLog = onLog,
+        )
+        dmsdp = endpoints
+        endpoints.start()
     }
 
     private fun startAcceptLoops(rfcomm: HiCarRfcommServices) {
@@ -575,11 +627,15 @@ class HiCarController(
                         if (key != null && !announced) {
                             announced = true
                             report(HiCarStatus.Authenticated)
-                            onLog(
-                                "HiChain finished: ${key.size}-byte session key; the phone keeps the " +
-                                    "envelope channel for now, DMSDP starts when it switches",
-                            )
+                            // The TCP side needs the key after this channel is gone: the phone closes
+                            // both RFCOMM sockets once it has somewhere else to go, and the
+                            // authenticator wipes its copy with the session.
+                            liveKey = key.copyOf()
                             liveNetwork?.authenticated = true
+                            onLog(
+                                "HiChain finished: ${key.size}-byte session key; TCP endpoints are " +
+                                    "serving this key, so DMSDP can start on the access point",
+                            )
                         }
                         continue
                     }
