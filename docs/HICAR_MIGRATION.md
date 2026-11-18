@@ -1795,3 +1795,93 @@ UIBC: 1 encrypted input event(s) sent                         ← 手指碰到�
 判定：出现 `H.264 access unit` 但画面是黑的 → 问题在解码/显示（把 `video: decoder output W×H` 一并发我）；
 停在 `ANNOUNCE sent` → 手机的视频端口不接受我们的 RTSP，需要看它的 `response` 序列号；
 停在 `service request` 之前 → 手机没有进入服务目录，那是控制通道的事，不是媒体的事。
+
+### 7.37 认证两次都成功，手机却一次没拨 TCP：凭据命令根本没发出去
+
+11:02 这轮日志有两个事实放在一起，指向同一个结论：
+
+```
+HiChain step 3: engine=0, phase=END_SUCCESS, key=32B, error=0, out=1   ← 第一次，成功
+HiChain step 3 completed the operation (phase=END_SUCCESS), out=1
+HiCar waiting for the phone: 30s, connections=2, advertising=on …
+HiCar channel closed: IOException ×2
+…（第二次重连，同样到 END_SUCCESS）…
+HiCar waiting for the phone: 60s, connections=4
+```
+
+**认证完全成功，会话密钥 32 字节，两次都是；但 4005/4006/4007 一次都没有被连过**
+（既没有 `DMSDP: network connection accepted`，也没有任何"拒绝"行——不是被拒，是没来过）。
+同时，**0xFE35 控制通道上一条帧日志都没有**，因为那条路径压根不打印帧。
+
+对照参考实现的 `ReceiverEngine` 才看出问题：手机在认证后会在 0xFE35 上跑一段 Wi-Fi 协商
+（kind 4 能力 → kind 4 数据端口 → kind 4 选网 → kind 33 要凭据）。其中"选网"那一步，
+车机要回的不是普通应答，而是**队列里的一条命令**（kind 33 tag 1，"把你的 station 地址给我"）：
+
+```java
+// 参考实现
+if (frame.kind == 4 || frame.kind == 33) replyNetwork(frame, session.network, out);
+
+private void replyNetwork(...) {
+    byte[] reply = resource.respond(frame);
+    if (reply != null) { out.write(reply); out.flush(); }
+    for (byte[] pending : resource.takePending()) { out.write(pending); out.flush(); }   // ← 关键
+}
+```
+
+我们的 `HiCarNetworkNegotiator` 完全一样地把这条命令放进了 `pending`，但是**冲刷队列的代码只写在
+TCP 的 network 端口（`HiCarDmsdpEndpoints.serveNetwork`）里**，0xFE35 那条分支只写了即时应答：
+
+```kotlin
+val reply = when { … liveNetwork?.respond(frame) … }
+if (reply != null) { output.write(reply); output.flush() }   // pending 从未写出
+```
+
+于是手机停在"等车机告诉我可以给了"的姿势上，30 秒后自己关掉两条通道——这正是日志里
+`channel closed` 出现的位置，也解释了为什么 TCP 端口一次都没被拨。**凭据串（SSID/密码/hicarApIp）
+从来没有离开过车机。**
+
+三处改动：
+
+1. **0xFE35 分支冲刷 `takePending()`**，与参考实现对齐；每条帧顺带记录
+   `HiCar control frame kind=…, N bytes, reply M, queued K`，以后这条路径不再是黑盒。
+2. **网络协商加步骤日志**（`HiCarNetworkNegotiator` 接受 `onLog`）：
+   `network capability accepted: 5220 MHz`、`data endpoint answered: TCP 4006`、
+   `network selected; asking the phone for its station address`、
+   `station address AA:BB:… accepted; credentials sent for '…' on 5220 MHz, control port 4005`。
+   密码本身不打印（它在凭据串里）。
+3. **30 秒心跳带上协商状态**：`credentials=true/false, network=asked/silent`。
+   下次看一行就知道是"手机没问"还是"问了、给了凭据、还是没连上"。
+
+另外顺手把"网络帧在密钥可见之前到达"从静默丢弃改成明确报错行：
+`HiCar network frame kind=4 arrived before the session key was visible; not answered`。
+这条以前只会表现为"手机不说话"，现在它会自己说出来。
+
+回归测试：`HiCarNetworkTest.theSelectionCommandIsWrittenBackOnTheSameChannel` —— 用一个只做
+"即时应答 + 冲刷队列"的 `MiniChannel` 走完两步，断言那条 kind 33 命令确实被写出。
+之前的测试是手工调 `takePending()` 的，所以**测试全绿但控制器漏了冲刷**；现在测的是控制器的契约。
+
+**下一次上车要看到的顺序**（这次应该能走到 TCP）：
+
+```
+HiCar control frame kind=4, … reply … , queued 0        ← 手机来问能力
+network capability accepted: 5200 MHz
+HiCar control frame kind=4, … reply … , queued 0        ← 手机要数据端口
+data endpoint answered: TCP 4006
+HiCar control frame kind=4, … reply 0, queued 1         ← 选网，车机给出命令
+network selected; asking the phone for its station address
+HiCar control frame kind=33, …                          ← 手机报 station 地址
+station address … accepted; credentials sent for '…' on 5200 MHz, control port 4005
+DMSDP: network connection accepted from 192.168.x.2
+DMSDP entry: module 1 → control port 4007
+DMSDP: control connection accepted from 192.168.x.2
+DMSDP AES-CTR negotiated
+DMSDP device info: answered with HiCarLab, model 00040A04
+DMSDP service request: mask 0x… wants display …; display ready=true
+DMSDP display service announced: 800×480
+DMSDP media endpoint: the phone serves video on 192.168.x.y:<port>
+HiSight: ANNOUNCE sent …
+```
+
+若停在 `network capability accepted` 之后没有下一步，说明手机没接受 5 GHz 通道或我们的端口号；
+若出现 `credentials sent` 但一直没有 TCP，那边就是手机加入热点失败（BSSID/密码），
+心跳行会显示 `credentials=true`。

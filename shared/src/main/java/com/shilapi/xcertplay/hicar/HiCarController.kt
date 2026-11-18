@@ -380,7 +380,7 @@ class HiCarController(
         }
         val networkOffer = prepareNetwork() ?: return
         liveOffer = networkOffer
-        liveNetwork = HiCarNetworkNegotiator(networkOffer).also { it.authenticated = false }
+        liveNetwork = HiCarNetworkNegotiator(networkOffer, onLog = onLog).also { it.authenticated = false }
         startDmsdpEndpoints(networkOffer)
         if (config.withVideo) prepareVideo()
         val rfcomm = HiCarRfcommServices.open(adapter, onLog)
@@ -689,7 +689,11 @@ class HiCarController(
                     "HiCar waiting for the phone: ${seconds}s, connections=$connections, " +
                         "advertising=${if (advertiser != null) "on" else "off"}, " +
                         "listeners=${if (services != null) "open" else "closed"}, " +
-                        "discoverable=${discoverableState()}",
+                        "discoverable=${discoverableState()}, " +
+                        // Whether the car ever handed out the access point separates "the phone never
+                        // asked" from "it asked, got credentials and still could not join".
+                        "credentials=${liveNetwork?.credentialsSent == true}, " +
+                        "network=${liveNetwork?.let { if (it.negotiable) "asked" else "silent" }}",
                 )
                 // A minute with the beacon up and not one dial is not a receiver fault, and saying so
                 // here saves a round trip through the log: the advertisement, listeners and access
@@ -843,16 +847,40 @@ class HiCarController(
                     continue
                 }
                 for (frame in decoder.feed(buffer, read)) {
+                    val network = liveNetwork
+                    val isNetwork = frame.kind == KIND_NETWORK || frame.kind == KIND_NETWORK_COMMAND
+                    if (isNetwork && network != null && !network.authenticated) {
+                        // The phone only runs this exchange after it has a session key. Arriving
+                        // earlier means our key is not visible yet, and answering would leak the
+                        // access point to a peer that has not authenticated — so it is dropped,
+                        // but loudly: a silent drop here looks exactly like a phone that gave up.
+                        onLog(
+                            "HiCar network frame kind=${frame.kind} arrived before the session key was " +
+                                "visible; not answered",
+                        )
+                    }
                     val reply = when {
-                        frame.kind == KIND_NETWORK || frame.kind == KIND_NETWORK_COMMAND ->
-                            liveNetwork?.respond(frame)
-
+                        isNetwork -> network?.respond(frame)
                         else -> negotiator.respond(frame)
                     }
                     if (reply != null) {
                         output.write(reply)
                         output.flush()
                     }
+                    // The negotiator answers most steps immediately but queues one command (kind 33
+                    // tag 1) when it wants the phone's station address. That queue used to be
+                    // flushed only on the TCP network port, so on this channel the phone waited for
+                    // a message that was never written and closed both channels thirty seconds
+                    // later — see docs/HICAR_MIGRATION.md 7.37.
+                    val queued = network?.takePending().orEmpty()
+                    for (command in queued) {
+                        output.write(command)
+                        output.flush()
+                    }
+                    onLog(
+                        "HiCar control frame kind=${frame.kind}, ${frame.payload.size} bytes, " +
+                            "reply ${reply?.size ?: 0}, queued ${queued.size}",
+                    )
                     if (negotiator.businessAnnounced) report(HiCarStatus.ChannelNegotiated)
                 }
             }

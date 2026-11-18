@@ -191,6 +191,37 @@ class HiCarNetworkTest {
         assertFalse(negotiator.credentialsSent)
     }
 
+    @Test
+    fun theSelectionCommandIsWrittenBackOnTheSameChannel() {
+        // 7.37: the controller wrote only the immediate reply and forgot the queue, so the phone
+        // waited for a "give me your station address" command that never left the car and closed
+        // both channels thirty seconds later. This walks the same two-step contract the controller
+        // has to honour: reply first, then everything the negotiator queued.
+        val negotiator = HiCarNetworkNegotiator(offer).also { it.authenticated = true }
+        val channel = MiniChannel(negotiator)
+        assertTrue(channel.deliver(HiCarFrame(4, 0, HiCarTlv.encode(1, networkRequest()))).isNotEmpty())
+        val selection = join(
+            HiCarVarint.encode(HiCarCodes.NETWORK_CHANNEL),
+            HiCarVarint.encode(1),
+            HiCarTlv.encode(3, join(byteArrayOf(2), HiCarVarint.encode(offer.frequencyMhz))),
+        )
+        val written = channel.deliver(HiCarFrame(4, 0, HiCarTlv.encode(7, selection)))
+        assertEquals(1, written.size)
+        val command = HiCarFrameDecoder().feed(written.single()).single()
+        assertEquals(33, command.kind)
+        assertEquals(1, HiCarTlv.fields(command.payload).single().tag)
+    }
+
+    /** The write path of one channel: the immediate reply, then the queue. */
+    private class MiniChannel(private val negotiator: HiCarNetworkNegotiator) {
+        fun deliver(frame: HiCarFrame): List<ByteArray> {
+            val out = ArrayList<ByteArray>()
+            negotiator.respond(frame)?.let(out::add)
+            out.addAll(negotiator.takePending())
+            return out
+        }
+    }
+
     private fun networkRequest(): ByteArray = join(
         HiCarVarint.encode(HiCarCodes.NETWORK_CHANNEL),
         HiCarTlv.encode(

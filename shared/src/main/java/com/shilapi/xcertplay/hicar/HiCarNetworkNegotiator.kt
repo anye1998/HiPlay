@@ -90,7 +90,13 @@ class HiCarNetworkOffer(
 internal class HiCarNetworkNegotiator(
     private val offer: HiCarNetworkOffer,
     private val dataPort: () -> Int = { offer.dataPort },
+    /** Says which step of the Wi-Fi exchange happened; never carries the passphrase. */
+    private val onLog: (String) -> Unit = {},
 ) {
+    /** The phone asked for the access point at least once; used by the waiting heartbeat. */
+    var negotiable: Boolean = false
+        private set
+
     var authenticated: Boolean = false
 
     var negotiated: Boolean = false
@@ -109,6 +115,7 @@ internal class HiCarNetworkNegotiator(
 
     fun respond(frame: HiCarFrame): ByteArray? {
         if (!authenticated || frame.encrypted) return null
+        negotiable = true
         val replies = ByteArrayOutputStream()
         for (field in HiCarTlv.fields(frame.payload)) {
             val reader = HiCarReader(field.value)
@@ -134,6 +141,13 @@ internal class HiCarNetworkNegotiator(
                         )
                     }
                     negotiated = accepted
+                    onLog(
+                        if (accepted) {
+                            "network capability accepted: ${offer.frequencyMhz} MHz"
+                        } else {
+                            "network capability refused: the phone does not accept ${offer.frequencyMhz} MHz"
+                        },
+                    )
                     HiCarTlv.encode(2, result)
                 }
 
@@ -154,6 +168,7 @@ internal class HiCarNetworkNegotiator(
                     ) {
                         throw HiCarWireException("data socket request")
                     }
+                    onLog("data endpoint answered: TCP $port")
                     HiCarTlv.encode(4, join(HiCarVarint.encode(0), HiCarVarint.encode(port), field.value))
                 }
 
@@ -177,6 +192,7 @@ internal class HiCarNetworkNegotiator(
                     }
                     if (pending.size >= MAX_PENDING_COMMANDS) throw HiCarWireException("network command limit")
                     pending.add(HiCarWire.encode(HiCarFrame(KIND_NETWORK_COMMAND, 0, HiCarTlv.encode(1, ByteArray(0)))))
+                    onLog("network selected; asking the phone for its station address")
                     null
                 }
 
@@ -190,6 +206,12 @@ internal class HiCarNetworkNegotiator(
                             val mac = String(field.value, StandardCharsets.US_ASCII)
                             if (!CLIENT_MAC.matches(mac)) throw HiCarWireException("client address")
                             credentialsSent = true
+                            // The passphrase is inside the credential string and is deliberately not
+                            // logged; SSID, band and port are what a failed join needs.
+                            onLog(
+                                "station address $mac accepted; credentials sent for '${offer.ssid}' " +
+                                    "on ${offer.frequencyMhz} MHz, control port ${offer.controlPort}",
+                            )
                             HiCarTlv.encode(3, offer.credentials())
                         }
                     }
