@@ -1721,3 +1721,77 @@ DMSDP service request: mask 0x… wants display …; display ready=false, announ
 
 看到 `service request: mask` 就说明手机已经认可这条连接并开始要服务了——下一步（HiSight 视频）
 才有意义；如果卡在更前面，那一行自己会说卡在哪。
+
+### 7.36 媒体层一次性补齐：画面、声音、触控、麦克风
+
+用户的要求很直接："把后面要开工的参考已有的项目一次性做完，减少我要上车的次数。"
+所以这一轮不再按"先视频、再音频、再触控"分批，而是把 7.35 之后剩下的整段一次性移植完，
+让下次上车一次就能看到链路走到底。
+
+**移植清单**（逐文件对照见 `docs/HICAR_REFERENCE_MAP.md`）：
+
+| 新增文件 | 来源（MIT） | 作用 |
+| --- | --- | --- |
+| `HiCarHiSightWire.kt` | `HiSightWire` | 视频 RTSP：`ANNOUNCE`(aes128ctr) → `OPTIONS`/`GET_PARAMETER`/`SET_PARAMETER` → `SETUP` → `PLAY`/`TEARDOWN` |
+| `HiCarHiSightClient.kt` | `HiSightClient` | 控制 / 视频 / 输入三条 TCP，媒体线程、断流与暂停判定 |
+| `HiCarHiSightMedia.kt` | `HiSightMedia` | RTP → PES → 解密 → H.264 访问单元，序列跳变即丢弃半帧 |
+| `HiCarVideoSink.kt` | `VideoSink` | `MediaCodec`（H.264）解码到 `SurfaceTexture`，8 帧有界队列，窗口可分离 |
+| `HiCarAudioWire.kt` | `AudioMedia`/`MicrophoneWire` | 加密 UDP 记录、RTP/ADTS 拆帧、麦克风 RTP 打包 |
+| `HiCarAudioSink.kt` | `AudioSink` | AAC → PCM16 → `AudioTrack`，音频焦点，格式变化即重建 |
+| `HiCarAudioReceiver.kt` + `HiCarSpeakerControl` | `AudioReceiver`/`SpeakerControl` | UDP 接收（只认本轮协商的地址与端口）+ `speaker1` 文本协商 |
+| `HiCarMicrophone.kt` | `MicrophoneSender`/`MicrophoneControl` | `mic1` 协商 + `AudioRecord`→AAC→RTP→UDP，默认关闭 |
+| `HiCarUiInput.kt` | `UiInput`/`InputChannel`/`InputRouter` | UIBC 编码、按下/抬起配对、发送队列、800×480 坐标映射 |
+
+`HiCarControlSession` 增加了 `TextHandler`：带 `serviceid` 的文本先交给扬声器/麦克风处理，
+处理不了再落到通用分支；`HiCarDeviceBusiness` 的 104 服务目录现在按"显示 / 扬声器 / 麦克风"
+三项各自是否就绪分别宣布。
+
+**协议上两处容易搞错、这次按参考纠正的**：
+
+1. **视频走 TCP，不是 UDP**。手机在模块 5 的 101 里给一个端口，我们 dial 过去做 RTSP，
+   `SETUP` 的 `Transport` 里 `server_port` 才是收流的端口（仍是 TCP）。以前文档里写的"视频 UDP 收流"是错的。
+2. **加密只覆盖 PES 负载**：RTP 头是明文，`0x84` 那 14 字节 PES 头也明文，从第 14 字节起才是 AES-CTR 密文。
+   所以拆包必须先把整段 PES 重组完再解密，逐包解密会把 IV 用错。
+
+**保留的谨慎**（都是故意的）：
+
+- 显示服务只在 `video.ready == true` 时宣布；解码器起不来就不宣布，手机看到的是"没有这个功能"，
+  而不是"连上了但黑屏"。
+- 麦克风默认关闭：需要 `RECORD_AUDIO` 权限 + 界面上手动打开；关闭时对 `mic1` 回 403。
+- 界面上的按键只发 返回(4) / 主页(3)，方向盘按键码没有验证过，不宣布。
+- `deviceId` 仍然由 `ANDROID_ID` 派生（可轮换），没有改成参考实现的"蓝牙地址派生"：
+  改了之后已经配对成功的手机把车当成新车，又要输一次码，等链路稳定再评估。
+
+**界面新增**：标题下的黑色画面区（`TextureView`，800×480，可直接触控）、「返回 / 主页 / 麦克风」一行。
+
+**模拟器上已验证的部分**（没有手机、没有蓝牙，只能验证到这一层）：
+
+- 新包安装启动无崩溃；
+- `HiSight: H.264 decoder ready (800×480)` 与 `video: window attached to the decoder` 出现在同一轮启动里，
+  说明解码器与该窗口接的是同一块纹理；
+- 新增 19 个协议单元测试全绿（`HiCarHiSightWireTest` / `HiCarHiSightMediaTest` / `HiCarAudioAndInputTest`），
+  `:shared` 的 hicar 包累计 100 个测试 0 失败。
+
+**下一次上车要看的日志顺序**（任何一行断了，那一行就是结论）：
+
+```
+DMSDP: listening on <ip> ports 4005, 4006, 4007 (network, entry, control)
+HiSight: H.264 decoder ready (800×480)
+DMSDP service request: mask 0x… wants display speaker microphone; display ready=true …
+DMSDP display service announced: 800×480
+DMSDP media endpoint: the phone serves video on 192.168.x.y:<port>
+HiSight: ANNOUNCE sent to 192.168.x.y:<port>; waiting for the phone's video negotiation
+HiSight: response 200 for sequence N
+HiSight: SETUP sent, waiting for the phone to name the video port
+HiSight: video port negotiated; input port also offered
+HiSight: video socket connected to …; PLAY follows
+HiSight: waiting for encrypted H.264 data
+HiSight: 1 H.264 access unit(s), 0 dropped, N bytes last
+audio: AAC 48000 Hz, 2 channel(s); playback started          ← 有声音才会有
+speaker: SETUP sent (AAC over UDP, encrypted, RTCP off)
+UIBC: 1 encrypted input event(s) sent                         ← 手指碰到画面才会有
+```
+
+判定：出现 `H.264 access unit` 但画面是黑的 → 问题在解码/显示（把 `video: decoder output W×H` 一并发我）；
+停在 `ANNOUNCE sent` → 手机的视频端口不接受我们的 RTSP，需要看它的 `response` 序列号；
+停在 `service request` 之前 → 手机没有进入服务目录，那是控制通道的事，不是媒体的事。

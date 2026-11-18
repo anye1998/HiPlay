@@ -28,12 +28,18 @@ internal class HiCarDeviceBusiness(
     private val onLog: (String) -> Unit,
     /** True only when a decoder and a window are ready; until then the display service stays unannounced. */
     private val displayReady: () -> Boolean = { false },
+    /** True when an AAC decoder and audio focus are available. */
+    private val speakerReady: () -> Boolean = { false },
+    /** True when the microphone may actually record (permission granted and the driver enabled it). */
+    private val microphoneReady: () -> Boolean = { false },
     /** Called with the port the phone names for the video stream, before any RTSP happens. */
     private val onMediaEndpoint: (Int) -> Unit = {},
 ) {
     private var peer: String? = null
     private var exchanged = false
     private var displayAnnounced = false
+    private var speakerAnnounced = false
+    private var microphoneAnnounced = false
 
     /** True after the phone has confirmed our identity, which earlier steps require. */
     val ready: Boolean get() = exchanged
@@ -125,20 +131,52 @@ internal class HiCarDeviceBusiness(
         }.trim().ifEmpty { "none" }
         onLog(
             "DMSDP service request: mask 0x${bits.toString(16)} wants $wanted; " +
-                "display ready=${displayReady()}, announced=$displayAnnounced",
+                "display ready=${displayReady()} announced=$displayAnnounced, " +
+                "speaker ready=${speakerReady()} announced=$speakerAnnounced, " +
+                "microphone ready=${microphoneReady()} announced=$microphoneAnnounced",
         )
-        if (bits and MASK_DISPLAY == 0L || displayAnnounced || !displayReady()) return emptyList()
-        val service = JSONObject()
-            .put("deviceId", deviceId)
-            .put("deviceName", DEVICE_NAME)
-            .put("serviceId", DISPLAY_SERVICE_ID)
-            .put("serviceType", 8)
-            .put("properties", JSONObject().put("4001", 1.0).put("1009", DISPLAY_WIDTH).put("1010", DISPLAY_HEIGHT))
-            .put("status", JSONObject())
-        displayAnnounced = true
-        onLog("DMSDP display service announced: ${DISPLAY_WIDTH}×$DISPLAY_HEIGHT")
-        return listOf(packet(HiCarCodes.DMSDP_COMMAND_SERVICE_ANNOUNCE, service))
+        val replies = ArrayList<ByteArray>()
+        if (bits and MASK_DISPLAY != 0L && !displayAnnounced && displayReady()) {
+            replies.add(
+                packet(
+                    HiCarCodes.DMSDP_COMMAND_SERVICE_ANNOUNCE,
+                    service(DISPLAY_SERVICE_ID, 8, JSONObject().put("4001", 1.0).put("1009", DISPLAY_WIDTH).put("1010", DISPLAY_HEIGHT)),
+                ),
+            )
+            displayAnnounced = true
+            onLog("DMSDP display service announced: ${DISPLAY_WIDTH}×$DISPLAY_HEIGHT")
+        }
+        if (bits and MASK_SPEAKER != 0L && !speakerAnnounced && speakerReady()) {
+            replies.add(
+                packet(
+                    HiCarCodes.DMSDP_COMMAND_SERVICE_ANNOUNCE,
+                    service(SPEAKER_SERVICE_ID, 4, JSONObject().put("2003", "48000,44100").put("2004", "1").put("2005", "12")),
+                ),
+            )
+            speakerAnnounced = true
+            onLog("DMSDP speaker service announced: AAC 48 kHz")
+        }
+        if (bits and MASK_MICROPHONE != 0L && !microphoneAnnounced && microphoneReady()) {
+            replies.add(
+                packet(
+                    HiCarCodes.DMSDP_COMMAND_SERVICE_ANNOUNCE,
+                    service(MICROPHONE_SERVICE_ID, 2, JSONObject().put("2003", "48000").put("2004", "1").put("2005", "12")),
+                ),
+            )
+            microphoneAnnounced = true
+            onLog("DMSDP microphone service announced: AAC 48 kHz uplink")
+        }
+        return replies
     }
+
+    /** `deviceId` and `deviceName` are repeated per service; the phone matches them to the session. */
+    private fun service(serviceId: String, serviceType: Int, properties: JSONObject): JSONObject = JSONObject()
+        .put("deviceId", deviceId)
+        .put("deviceName", DEVICE_NAME)
+        .put("serviceId", serviceId)
+        .put("serviceType", serviceType)
+        .put("properties", properties)
+        .put("status", JSONObject())
 
     /**
      * The phone names the port it will serve video on, then waits for this side to dial it.
@@ -155,7 +193,7 @@ internal class HiCarDeviceBusiness(
         }
         if (port !in 1..65535) throw HiCarWireException("unexpected media endpoint")
         if (!displayAnnounced) throw HiCarWireException("unexpected media endpoint")
-        onLog("DMSDP media endpoint: the phone serves video on $clientAddress:$port (HiSight not implemented yet)")
+        onLog("DMSDP media endpoint: the phone serves video on $clientAddress:$port")
         onMediaEndpoint(port)
         return emptyList()
     }
@@ -181,6 +219,8 @@ internal class HiCarDeviceBusiness(
     private companion object {
         const val DEVICE_NAME = "HiCarLab"
         const val DISPLAY_SERVICE_ID = "display1"
+        const val SPEAKER_SERVICE_ID = "speaker1"
+        const val MICROPHONE_SERVICE_ID = "mic1"
         const val DISPLAY_WIDTH = 800
         const val DISPLAY_HEIGHT = 480
         const val MAX_BODY_BYTES = 4096

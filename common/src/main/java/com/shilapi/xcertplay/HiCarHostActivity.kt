@@ -10,14 +10,20 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.graphics.SurfaceTexture
 import android.provider.Settings
 import android.util.Log
+import android.view.MotionEvent
+import android.view.TextureView
+import android.view.View
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -35,7 +41,9 @@ import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.core.content.pm.PackageInfoCompat
@@ -43,6 +51,7 @@ import com.shilapi.xcertplay.hicar.HiCarAdvertisementProbe
 import com.shilapi.xcertplay.hicar.HiCarController
 import com.shilapi.xcertplay.hicar.HiCarPermissions
 import com.shilapi.xcertplay.hicar.HiCarRuntimeConfig
+import com.shilapi.xcertplay.hicar.HiCarVideoSink
 import com.shilapi.xcertplay.hicar.HiCarStatus
 import java.security.MessageDigest
 import java.text.SimpleDateFormat
@@ -81,6 +90,13 @@ class HiCarHostActivity : ComponentActivity() {
     /** A scan that only listens, used to read a real head unit's beacon. See [sniff]. */
     private var sniffer: HiCarAdvertisementProbe? = null
 
+    /** The window the picture lands in; kept so a restart can attach it again without recomposition. */
+    private var videoView: TextureView? = null
+    private var videoTexture: SurfaceTexture? = null
+
+    /** Whether the car's microphone is offered; off unless the driver turns it on. */
+    private var microphoneEnabled by mutableStateOf(false)
+
     /** Longer than [log]: the screen keeps a readable tail, the export keeps the whole attempt. */
     private val history = ArrayList<String>()
     private var droppedFromHistory = 0
@@ -97,6 +113,17 @@ class HiCarHostActivity : ComponentActivity() {
             // Name them: the access point needs Wi-Fi Direct, which fails without these, and a bare
             // "permissions were not granted" hides which step is about to fail.
             appendLog("Permissions refused: ${refused.joinToString()}")
+        }
+    }
+
+    /** Recording is a separate grant, asked for only when the microphone is switched on. */
+    private val recordPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) {
+            microphoneEnabled = true
+            rememberMicrophone(true)
+            appendLog("microphone: enabled; the phone can ask for the car's voice on the next connection")
+        } else {
+            appendLog("microphone: permission refused; the car stays without an uplink microphone")
         }
     }
 
@@ -125,6 +152,7 @@ class HiCarHostActivity : ComponentActivity() {
         }
         model = storedModel()
         pin = storedPin()
+        microphoneEnabled = storedMicrophone()
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
@@ -154,8 +182,8 @@ class HiCarHostActivity : ComponentActivity() {
             Text("HiCar 接收端（实验）", style = MaterialTheme.typography.headlineSmall)
             Text(
                 "连接链路：热点 → RFCOMM 记录 → 0xFDEE 广播 → 通道协商 → HiChain 认证 → " +
-                    "DMSDP 控制通道。视频、音频、方向盘按键和 HUD 尚未实现，" +
-                    "HiChain 交换也还没有在真机上验证过。",
+                    "DMSDP 控制通道 → 画面、声音与触控。方向盘按键和 HUD 尚未实现；" +
+                    "画面与声音在真车上的效果仍待验证。",
                 style = MaterialTheme.typography.bodyMedium,
             )
             OutlinedTextField(
@@ -248,6 +276,23 @@ class HiCarHostActivity : ComponentActivity() {
                 Text(exportNotice, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
             }
             Text("状态：${describe(status)}", style = MaterialTheme.typography.titleSmall)
+            // The picture sits directly under the status line: it is the one thing the driver looks
+            // at, and on a head unit the log below is not worth scrolling past to find it.
+            VideoPanel()
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                // The two keys a phone screen cannot be driven without once it is mirrored: the
+                // system back and home. They go through the same encrypted UIBC channel as touches.
+                TextButton(onClick = { sendKey(KEY_BACK, "返回") }) { Text("返回") }
+                TextButton(onClick = { sendKey(KEY_HOME, "主页") }) { Text("主页") }
+                TextButton(onClick = ::toggleMicrophone) {
+                    Text(if (microphoneEnabled) "麦克风：开" else "麦克风：关")
+                }
+            }
+            Text(
+                "画面上的触控会发送给手机。麦克风默认关闭：打开后手机会把车里的声音当作语音输入，" +
+                    "并且每次连接都需要你在手机上允许一次。",
+                style = MaterialTheme.typography.bodySmall,
+            )
             Text("本机标识：${identity()}", style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
             // A plain column, not a lazy list: this screen already scrolls as a whole, and a nested
             // lazy list inside a vertical scroll would be measured with an infinite height.
@@ -440,6 +485,7 @@ class HiCarHostActivity : ComponentActivity() {
             localIdentity = identity(),
             deviceName = "HiCar receiver",
             pin = pin,
+            withMicrophone = microphoneEnabled,
         )
         val next = try {
             HiCarController(
@@ -457,6 +503,63 @@ class HiCarHostActivity : ComponentActivity() {
         }
         controller = next
         next.start()
+        // The view already exists on this screen; attach it so the first frame has somewhere to go.
+        attachVideo()
+    }
+
+    /**
+     * Points the decoder's texture at the on-screen window.
+     *
+     * Called both when the window appears and when the receiver starts, because either order can
+     * happen: the picture may begin before the activity has laid out, and the activity may be
+     * recreated while a session is still alive.
+     */
+    private fun attachVideo() {
+        val view = videoView ?: return
+        val texture = videoTexture ?: return
+        val sink: HiCarVideoSink = controller?.videoSink() ?: return
+        sink.attach(view, texture)
+        appendLog("video: window attached to the decoder (${sink.stats})")
+    }
+
+    /** Maps a touch on the window into the 800×480 space the display service advertised. */
+    private fun videoTouch(view: View, event: MotionEvent): Boolean {
+        val active = controller ?: return false
+        val action = when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> 0
+            MotionEvent.ACTION_MOVE -> 2
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> 1
+            else -> return false
+        }
+        active.sendTouchAt(event.x, event.y, view.width, view.height, action)
+        return true
+    }
+
+    private fun sendKey(key: Int, name: String) {
+        val active = controller
+        if (active == null) {
+            appendLog("$name: the receiver is not running")
+            return
+        }
+        if (!active.sendKey(key)) appendLog("$name: the phone has not offered an input channel")
+    }
+
+    private fun toggleMicrophone() {
+        if (microphoneEnabled) {
+            microphoneEnabled = false
+            rememberMicrophone(false)
+            appendLog("microphone: disabled; it stops with this connection")
+            return
+        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            recordPermission.launch(Manifest.permission.RECORD_AUDIO)
+            return
+        }
+        microphoneEnabled = true
+        rememberMicrophone(true)
+        appendLog("microphone: enabled; the phone can ask for the car's voice on the next connection")
     }
 
     private fun stopReceiver() {
@@ -652,6 +755,13 @@ class HiCarHostActivity : ComponentActivity() {
      * value and stays silent on this install's own random id, so defaulting to the random one meant
      * every fresh launch advertised a device no phone has ever seen.
      */
+    private fun storedMicrophone(): Boolean =
+        getSharedPreferences(PREFERENCES, MODE_PRIVATE).getBoolean(KEY_MICROPHONE, false)
+
+    private fun rememberMicrophone(enabled: Boolean) {
+        getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit().putBoolean(KEY_MICROPHONE, enabled).apply()
+    }
+
     private fun storedModel(): String {
         val preferences = getSharedPreferences(PREFERENCES, MODE_PRIVATE)
         preferences.getString(KEY_MODEL, null)?.takeIf { MODEL_PATTERN.matches(it) }?.let { return it }
@@ -706,6 +816,51 @@ class HiCarHostActivity : ComponentActivity() {
     private fun experimentalModel(): String =
         identity().take(8).uppercase().padEnd(8, '0')
 
+    /**
+     * The window the phone's picture lands in.
+     *
+     * `AndroidView` rather than a Compose canvas: the decoder writes into a `SurfaceTexture`, and a
+     * `TextureView` is the one way to show that texture without copying frames through the GPU
+     * pipeline. Touches are handled by the view itself so `MotionEvent` coordinates — not Compose
+     * pointer positions — are what gets mapped into the phone's 800×480 space.
+     */
+    @Composable
+    private fun VideoPanel() {
+        Text("手机画面（可直接触控）", style = MaterialTheme.typography.bodySmall)
+        AndroidView(
+            factory = { context ->
+                TextureView(context).apply {
+                    surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                        override fun onSurfaceTextureAvailable(texture: SurfaceTexture, width: Int, height: Int) {
+                            videoView = this@apply
+                            videoTexture = texture
+                            attachVideo()
+                        }
+
+                        override fun onSurfaceTextureSizeChanged(texture: SurfaceTexture, width: Int, height: Int) = Unit
+
+                        override fun onSurfaceTextureDestroyed(texture: SurfaceTexture): Boolean {
+                            // The decoder owns its texture: releasing it here would leave the next
+                            // frame with nowhere to go. Only a texture this side never took is
+                            // handed back to the view.
+                            val owned = controller?.videoSink()?.detach(texture) == true
+                            videoView = null
+                            videoTexture = null
+                            return !owned
+                        }
+
+                        override fun onSurfaceTextureUpdated(texture: SurfaceTexture) = Unit
+                    }
+                    setOnTouchListener { view, event -> videoTouch(view, event) }
+                }.also { videoView = it }
+            },
+            modifier = Modifier
+                .fillMaxWidth()
+                .aspectRatio(800f / 480f)
+                .background(Color.Black),
+        )
+    }
+
     private fun describe(status: HiCarStatus): String = when (status) {
         is HiCarStatus.Idle -> "空闲"
         is HiCarStatus.PreparingNetwork -> "正在准备热点"
@@ -715,7 +870,8 @@ class HiCarHostActivity : ComponentActivity() {
         is HiCarStatus.ChannelNegotiated -> "业务通道已通告，等待认证"
         is HiCarStatus.Authenticating -> "正在认证"
         is HiCarStatus.Authenticated -> "认证通过，正在打开控制通道"
-        is HiCarStatus.ControlChannelReady -> "控制通道已就绪；媒体阶段尚未实现"
+        is HiCarStatus.ControlChannelReady -> "控制通道已就绪，等待手机要画面"
+        is HiCarStatus.Streaming -> "画面通道已连接，正在接收手机视频"
         is HiCarStatus.Blocked -> "受阻：${status.blocker.message}"
         is HiCarStatus.Failed -> "失败：${status.reason}"
         is HiCarStatus.Stopped -> "已停止"
@@ -739,6 +895,11 @@ class HiCarHostActivity : ComponentActivity() {
         const val PREFERENCES = "hicar-receiver"
         const val KEY_PIN = "connection_code"
         const val KEY_MODEL = "advertised_model"
+        const val KEY_MICROPHONE = "microphone_enabled"
+
+        /** Android key codes sent over UIBC; the phone only accepts these two. */
+        const val KEY_HOME = 3
+        const val KEY_BACK = 4
         const val KEY_IDENTITY = "local_identity"
         val PIN_PATTERN = Regex("[0-9]{6}")
         val MODEL_PATTERN = Regex("[0-9A-F]{8}")

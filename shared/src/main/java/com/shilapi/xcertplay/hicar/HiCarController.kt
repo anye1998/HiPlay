@@ -37,6 +37,9 @@ sealed class HiCarStatus {
     /** The DMSDP control channel answered the crypto switch on the same socket. */
     data object ControlChannelReady : HiCarStatus()
 
+    /** The phone's video port answered and the picture path is running. */
+    data object Streaming : HiCarStatus()
+
     /** The phone asked for HiChain, which this build cannot answer; see [blocker]. */
     data class Blocked(val blocker: HiCarAuthBlocker) : HiCarStatus()
     data class Failed(val reason: String) : HiCarStatus()
@@ -59,6 +62,10 @@ data class HiCarRuntimeConfig(
     val pin: String = "",
     val pinConfigured: Boolean = pin.isNotEmpty(),
     val networkTimeoutMillis: Long = 30_000L,
+    /** Decode the phone's picture. Off is only useful for diagnosing the pre-media chain. */
+    val withVideo: Boolean = true,
+    /** Offer the car's microphone. The runtime permission is still checked separately. */
+    val withMicrophone: Boolean = false,
 )
 
 /**
@@ -98,6 +105,23 @@ class HiCarController(
 
     /** The three TCP endpoints the phone dials after authentication; null until the AP is ready. */
     private var dmsdp: HiCarDmsdpEndpoints? = null
+
+    /** What the phone was told about the access point; the media clients bind to [ownerAddress]. */
+    private var liveOffer: HiCarNetworkOffer? = null
+
+    /** The H.264 sink, created on first use so the phone can be offered the display service. */
+    private var video: HiCarVideoSink? = null
+
+    /** Touches and keys for the phone; only the current HiSight session ever attaches to it. */
+    private val input = HiCarInputRouter()
+
+    /** At most one video session at a time, however many control connections arrive. */
+    private val mediaBusy = AtomicBoolean(false)
+    private var hisight: HiCarHiSightClient? = null
+
+    @Volatile private var audioReady = false
+    @Volatile private var microphoneReady = false
+    @Volatile private var microphoneWanted = false
 
     /**
      * A copy of the authenticated session key, for the TCP side.
@@ -246,6 +270,33 @@ class HiCarController(
         }
     }
 
+    /** The sink the screen attaches its `TextureView` to; safe to call before [start]. */
+    fun videoSink(): HiCarVideoSink = synchronized(this) {
+        video ?: HiCarVideoSink(onLog).also { video = it }
+    }
+
+    /** Sends one touch in the 800×480 space the display service advertised. */
+    fun sendTouch(action: Int, x: Int, y: Int): Boolean = input.touch(action, x, y)
+
+    /**
+     * Maps a touch from a view of [width]×[height] onto the advertised display and sends it.
+     *
+     * A down outside the window is dropped; a move or an up is clamped, so a finger that slides off
+     * the edge still releases the one the phone believes is down.
+     */
+    fun sendTouchAt(x: Float, y: Float, width: Int, height: Int, action: Int): Boolean {
+        val mapped = HiCarInputRouter.map(x, y, width, height, action != 0) ?: return false
+        return input.touch(action, mapped[0], mapped[1])
+    }
+
+    /** Sends the home or back key (Android key codes 3 and 4). */
+    fun sendKey(key: Int): Boolean = input.key(key)
+
+    val touchesReady: Boolean get() = input.ready()
+
+    /** Whether the microphone may be offered at all; checked again when the phone asks for it. */
+    fun microphoneAllowed(): Boolean = config.withMicrophone && HiCarMicrophone.permitted(appContext)
+
     fun start() {        if (!running.compareAndSet(false, true)) {
             onLog("HiCar receiver is already running")
             return
@@ -277,6 +328,10 @@ class HiCarController(
 
     override fun close() {
         if (!running.compareAndSet(true, false)) return
+        input.cancel()
+        hisight?.close()
+        hisight = null
+        mediaBusy.set(false)
         dmsdp?.close()
         dmsdp = null
         // The key outlives the RFCOMM channel by design; it stops existing here.
@@ -292,6 +347,10 @@ class HiCarController(
         sockets.clear()
         for (worker in workers) worker.interrupt()
         workers.clear()
+        video?.close()
+        video = null
+        audioReady = false
+        microphoneReady = false
         runCatching { hotspot?.close() }
         hotspot = null
         setup.shutdownNow()
@@ -320,8 +379,10 @@ class HiCarController(
             return
         }
         val networkOffer = prepareNetwork() ?: return
+        liveOffer = networkOffer
         liveNetwork = HiCarNetworkNegotiator(networkOffer).also { it.authenticated = false }
         startDmsdpEndpoints(networkOffer)
+        if (config.withVideo) prepareVideo()
         val rfcomm = HiCarRfcommServices.open(adapter, onLog)
         if (rfcomm == null) {
             report(HiCarStatus.Failed("rfcomm"))
@@ -448,11 +509,12 @@ class HiCarController(
             ownerAddress = offer.ownerAddress,
             clientAddress = offer.clientAddress,
             onLog = onLog,
-            // The HiSight client and a decoder are the next stage. Until they exist the display
-            // service stays unannounced: the phone would open a video connection, receive nothing
-            // and report the car as broken, which is a worse failure than a missing feature.
-            displayReady = { false },
-            onMediaEndpoint = { port -> onLog("HiCar media: the phone serves video on port $port; HiSight not implemented yet") },
+            // Each service is announced only when it can actually be served: a display that never
+            // produces a frame reads as "this car is broken", which is worse than a missing feature.
+            displayReady = { video?.ready == true },
+            speakerReady = { audioReady },
+            microphoneReady = { microphoneReady },
+            onMediaEndpoint = { port -> startHiSight(port) },
         )
         val endpoints = HiCarDmsdpEndpoints(
             offer = offer,
@@ -462,9 +524,138 @@ class HiCarController(
             sessionKey = { liveKey },
             active = { running.get() },
             onLog = onLog,
+            mediaFactory = { key -> buildMedia(offer, key) },
         )
         dmsdp = endpoints
         endpoints.start()
+    }
+
+    /** Creates the decoder now so the display service can be announced before the phone asks. */
+    private fun prepareVideo() {
+        val sink = videoSink()
+        if (sink.prepare()) {
+            onLog("HiSight: H.264 decoder ready; the display service can be announced")
+        } else {
+            onLog("HiSight: no usable H.264 decoder on this device; the display service stays unannounced")
+        }
+    }
+
+    /**
+     * Everything the control connection needs that talks to the phone's media streams.
+     *
+     * Built when the control socket is accepted, because the speaker's UDP port has to exist before
+     * the phone can be told where to send audio. Each piece is optional: no AAC decoder means no
+     * speaker, no microphone permission means no microphone, and in both cases the control channel
+     * itself continues.
+     */
+    private fun buildMedia(offer: HiCarNetworkOffer, key: ByteArray): HiCarDmsdpEndpoints.Media? {
+        val handlers = ArrayList<HiCarControlSession.TextHandler>()
+        val sink = HiCarAudioSink(appContext, onLog)
+        var receiver: HiCarAudioReceiver? = null
+        if (sink.ready) {
+            sink.start()
+            try {
+                val created = HiCarAudioReceiver(
+                    owner = offer.ownerAddress,
+                    peer = offer.clientAddress,
+                    sessionKey = key,
+                    sink = sink,
+                    active = { running.get() },
+                    onLog = onLog,
+                )
+                receiver = created
+                handlers.add(HiCarSpeakerControl(created, onLog))
+                audioReady = true
+            } catch (failure: IOException) {
+                sink.close()
+                onLog("audio: UDP receiver could not open (${failure.javaClass.simpleName}); no speaker this session")
+            }
+        } else {
+            sink.close()
+        }
+        var microphone: HiCarMicrophone? = null
+        if (microphoneAllowed()) {
+            try {
+                val created = HiCarMicrophone(
+                    context = appContext,
+                    owner = offer.ownerAddress,
+                    peerAddress = offer.clientAddress,
+                    sessionKey = key,
+                    active = { running.get() },
+                    onLog = onLog,
+                )
+                microphone = created
+                handlers.add(HiCarMicrophoneControl(created))
+                microphoneReady = true
+            } catch (failure: IOException) {
+                onLog("microphone: uplink could not open (${failure.javaClass.simpleName}); the picture continues")
+            }
+        }
+        if (handlers.isEmpty()) return null
+        val audio = receiver
+        val mic = microphone
+        return object : HiCarDmsdpEndpoints.Media, HiCarDmsdpEndpoints.Clocked {
+            override fun textHandlers(): List<HiCarControlSession.TextHandler> = handlers
+
+            override fun onClock(high: Long, low: Long) {
+                mic?.clock(high, low)
+            }
+
+            override fun close() {
+                audioReady = false
+                microphoneReady = false
+                runCatching { audio?.close() }
+                runCatching { mic?.close() }
+            }
+        }
+    }
+
+    /**
+     * Dials the phone's video port and keeps the picture off the control thread.
+     *
+     * The session key is copied because the RFCOMM side wipes its own copy when that channel closes,
+     * which usually happens right after the phone moves to TCP.
+     */
+    private fun startHiSight(port: Int) {
+        val offer = liveOffer ?: return
+        val sink = video
+        if (sink == null || !sink.ready) {
+            onLog("HiSight: no decoder is ready, so the video port $port is left alone")
+            return
+        }
+        if (!mediaBusy.compareAndSet(false, true)) {
+            onLog("HiSight: a video session is already running; the second endpoint is ignored")
+            return
+        }
+        val key = liveKey?.copyOf()
+        if (key == null) {
+            mediaBusy.set(false)
+            onLog("HiSight: no session key; refusing to dial the phone's video port")
+            return
+        }
+        val client = HiCarHiSightClient(
+            owner = offer.ownerAddress,
+            peer = offer.clientAddress,
+            sessionKey = key,
+            video = sink,
+            input = input,
+            active = { running.get() },
+            onLog = onLog,
+            onVideoConnected = { report(HiCarStatus.Streaming) },
+        )
+        key.fill(0)
+        hisight = client
+        Thread({
+            try {
+                client.run(port)
+            } finally {
+                if (hisight === client) hisight = null
+                mediaBusy.set(false)
+            }
+        }, "hicar-hisight").also {
+            it.isDaemon = true
+            it.start()
+        }
     }
 
     private fun startAcceptLoops(rfcomm: HiCarRfcommServices) {

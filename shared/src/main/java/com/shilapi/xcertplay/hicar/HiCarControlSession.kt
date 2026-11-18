@@ -20,7 +20,15 @@ import java.util.Locale
 internal class HiCarControlSession(
     private val cipher: HiCarRecordCipher,
     private val events: Events = Events,
+    /** Handles `serviceid`-tagged text (speaker, microphone); null means "not offered". */
+    private val textHandler: TextHandler? = null,
 ) {
+    /** A service-specific text exchange (RTSP-shaped) that runs before the generic handlers. */
+    interface TextHandler {
+        /** Returns the replies, or null when the service id is not this handler's. */
+        fun receive(startLine: String, headers: Map<String, String>, body: ByteArray): List<ByteArray>?
+    }
+
     interface Events {
         fun onLog(message: String) {}
 
@@ -186,6 +194,20 @@ internal class HiCarControlSession(
             text = text.copyOfRange(end + HEADER_TERMINATOR_BYTES + size, text.size)
             val method = startLine.split(" ", limit = 2).first()
             events.onLog("DMSDP control message: $method, ${body.size} bytes")
+            val service = if (headers.containsKey("serviceid") && textHandler != null) {
+                if (!negotiated) throw HiCarWireException("service before encryption")
+                try {
+                    textHandler.receive(startLine, headers, body)
+                } finally {
+                    body.fill(0)
+                }
+            } else {
+                null
+            }
+            if (service != null) {
+                for (answer in service) replies.add(pack(HiCarCodes.RECORD_ENCRYPTED, cipher.encrypt(answer)))
+                continue
+            }
             handleText(startLine, headers, body, replies)
             body.fill(0)
         }
@@ -255,17 +277,8 @@ internal class HiCarControlSession(
         )
     }
 
-    private fun encode(startLine: String, vararg headers: Pair<String, String>): ByteArray {
-        val out = ByteArrayOutputStream()
-        out.write(startLine.toByteArray(StandardCharsets.US_ASCII))
-        out.write(CRLF)
-        for ((name, value) in headers) {
-            out.write("$name: $value".toByteArray(StandardCharsets.US_ASCII))
-            out.write(CRLF)
-        }
-        out.write(CRLF)
-        return out.toByteArray()
-    }
+    private fun encode(startLine: String, vararg headers: Pair<String, String>): ByteArray =
+        encodeMessage(startLine, headers.toList())
 
     private fun indexOfHeaderEnd(data: ByteArray): Int {
         for (index in 0..data.size - HEADER_TERMINATOR_BYTES) {
@@ -280,19 +293,32 @@ internal class HiCarControlSession(
         return -1
     }
 
-    private companion object {
-        const val RECORD_HEADER_BYTES = 3
-        const val MAX_RECORD_BYTES = 1498
-        const val MAX_WIRE_BYTES = 65_536
-        const val MAX_TEXT_BYTES = 73_732
-        const val MAX_HEADER_BYTES = 8_192
-        const val MAX_HEADERS = 64
-        const val MAX_BODY_BYTES = 65_536
-        const val HEADER_TERMINATOR_BYTES = 4
-        const val BINARY_HEADER_BYTES = 11
-        const val BINARY_PREFIX = '$'.code.toByte()
-        const val SET_PARAMETER = "SET_PARAMETER * DMSDP/1.0"
-        const val GET_PARAMETER = "GET_PARAMETER * DMSDP/1.0"
+    companion object {
+        /** `start line | header: value… | blank line`, ASCII only; also used by the service handlers. */
+        fun encodeMessage(startLine: String, headers: List<Pair<String, String>>): ByteArray {
+            val out = ByteArrayOutputStream()
+            out.write(startLine.toByteArray(StandardCharsets.US_ASCII))
+            out.write(CRLF)
+            for ((name, value) in headers) {
+                out.write("$name: $value".toByteArray(StandardCharsets.US_ASCII))
+                out.write(CRLF)
+            }
+            out.write(CRLF)
+            return out.toByteArray()
+        }
+
+        private const val RECORD_HEADER_BYTES = 3
+        private const val MAX_RECORD_BYTES = 1498
+        private const val MAX_WIRE_BYTES = 65_536
+        private const val MAX_TEXT_BYTES = 73_732
+        private const val MAX_HEADER_BYTES = 8_192
+        private const val MAX_HEADERS = 64
+        private const val MAX_BODY_BYTES = 65_536
+        private const val HEADER_TERMINATOR_BYTES = 4
+        private const val BINARY_HEADER_BYTES = 11
+        private const val BINARY_PREFIX = '$'.code.toByte()
+        private const val SET_PARAMETER = "SET_PARAMETER * DMSDP/1.0"
+        private const val GET_PARAMETER = "GET_PARAMETER * DMSDP/1.0"
         val CRLF = byteArrayOf(13.toByte(), 10.toByte())
         val START_LINE = Regex("[A-Z_]+ \\S+ DMSDP/1\\.0|DMSDP/1\\.0 [1-5][0-9]{2}( [ -~]+)?")
         val HEADER_NAME = Regex("[A-Za-z][A-Za-z0-9-]{0,63}")

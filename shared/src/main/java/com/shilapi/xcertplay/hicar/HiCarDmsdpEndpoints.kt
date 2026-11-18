@@ -39,7 +39,21 @@ internal class HiCarDmsdpEndpoints(
     private val sessionKey: () -> ByteArray?,
     private val active: () -> Boolean,
     private val onLog: (String) -> Unit,
+    /**
+     * Builds the per-session media bundle (audio receiver, microphone, service handlers).
+     *
+     * It runs when the control connection is accepted — before the phone's first service message —
+     * because the speaker's UDP port has to exist before the phone can ask where to send audio.
+     * Everything it returns is closed when the control connection ends.
+     */
+    private val mediaFactory: (ByteArray) -> Media? = { null },
 ) : Closeable {
+
+    /** Audio and microphone live only as long as one control connection. */
+    internal interface Media : Closeable {
+        /** Handlers tried in order; the first non-null reply wins. */
+        fun textHandlers(): List<HiCarControlSession.TextHandler>
+    }
     private val servers = CopyOnWriteArrayList<ServerSocket>()
     private val clients = CopyOnWriteArrayList<Socket>()
     private val controlBusy = AtomicBoolean(false)
@@ -189,9 +203,16 @@ internal class HiCarDmsdpEndpoints(
      */
     private fun serveControl(socket: Socket, input: InputStream, output: OutputStream) {
         val key = sessionKey() ?: throw HiCarWireException("missing authenticated key")
+        val media = try {
+            mediaFactory(key)
+        } catch (failure: IOException) {
+            onLog("DMSDP: media unavailable for this session (${failure.message ?: failure.javaClass.simpleName}); control continues")
+            null
+        }
         val cipher = HiCarRecordCipher(key, maxRecordBytes = CONTROL_RECORD_BYTES)
         var lastHeartbeat = System.nanoTime()
         var lastPeer = lastHeartbeat
+        val handlers = media?.textHandlers().orEmpty()
         val session = HiCarControlSession(
             cipher,
             object : HiCarControlSession.Events {
@@ -199,8 +220,25 @@ internal class HiCarDmsdpEndpoints(
                     this@HiCarDmsdpEndpoints.onLog("DMSDP: $message")
                 }
 
+                override fun onClock(high: Long, low: Long) {
+                    (media as? Clocked)?.onClock(high, low)
+                }
+
                 override fun onApplicationService(module: Long, type: Long, body: ByteArray): List<ByteArray> =
                     business.handle(module, type, body)
+            },
+            textHandler = if (handlers.isEmpty()) {
+                null
+            } else {
+                object : HiCarControlSession.TextHandler {
+                    override fun receive(startLine: String, headers: Map<String, String>, body: ByteArray): List<ByteArray>? {
+                        for (handler in handlers) {
+                            val replies = handler.receive(startLine, headers, body)
+                            if (replies != null) return replies
+                        }
+                        return null
+                    }
+                }
             },
         )
         try {
@@ -233,8 +271,14 @@ internal class HiCarDmsdpEndpoints(
             }
         } finally {
             session.close()
+            runCatching { media?.close() }
             cipher.clear()
         }
+    }
+
+    /** A media bundle that also wants the phone's clock samples (the microphone timestamps with them). */
+    internal interface Clocked {
+        fun onClock(high: Long, low: Long)
     }
 
     private companion object {

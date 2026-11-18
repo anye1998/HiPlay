@@ -30,13 +30,15 @@
 | `DmsdpWire` | **TCP 4006**：入口模块帧，答控制端口（+2） | `HiCarDmsdpTransport`（本轮新增） | **本轮补齐** |
 | `ControlSession` | **TCP 4007**：`OPTIONS * DMSDP/1.0`、`CryptoSwitch 222` 转 AES-CTR、心跳、时钟、`$` 业务包 | `HiCarControlSession`（已有）+ `HiCarDmsdpEndpoints`（本轮接线到 TCP） | **本轮补齐** |
 | `SessionCipher` | AES-128-CTR，密钥取 HiChain 会话密钥前 16 字节，每条记录前置随机 IV | `HiCarRecordCipher` | 已有，逐字节一致 |
-| `DeviceBusiness` | 模块 3：指令 101 身份、104 服务目录、102 宣布服务；模块 5 拿视频端口 | `HiCarDeviceBusiness` | **本轮新增**（显示服务先不宣布） |
-| `HiSightWire` | 视频 RTSP：`ANNOUNCE`(aes128ctr) → `OPTIONS`/`GET_PARAMETER`/`SET_PARAMETER` → `SETUP`(server_port) → `PLAY` | — | **未做**，下一阶段 |
-| `HiSightClient`/`HiSightMedia`/`VideoSink`/`VideoProfile` | 视频 UDP 收流、H.264 解码、800×480 起（可到 2K） | — | **未做** |
-| `AudioMedia`/`AudioSink`/`AudioReceiver` | AAC 音频；`SpeakerControl` 处理手机侧扬声器指令 | — | **未做** |
-| `MicrophoneSender`/`MicrophoneWire`/`MicrophoneControl` | 语音实验（默认关闭） | — | **不做**（不是当前目标） |
-| `InputChannel`/`InputRouter`/`UiInput` | 触控/返回/主页（UIBC） | — | **未做** |
-| `ReconnectGate` | 断线后重连门控，避免误判断开 | — | **未做**（我们目前直接关会话） |
+| `DeviceBusiness` | 模块 3：指令 101 身份、104 服务目录、102 宣布服务；模块 5 拿视频端口 | `HiCarDeviceBusiness` | 已有：显示/扬声器/麦克风三项按就绪状态宣布 |
+| `HiSightWire` | 视频 RTSP：`ANNOUNCE`(aes128ctr) → `OPTIONS`/`GET_PARAMETER`/`SET_PARAMETER` → `SETUP`(server_port) → `PLAY` | `HiCarHiSightWire` | **本轮移植**，含 7 个单元测试 |
+| `HiSightClient` | 控制/视频/输入三条 TCP，媒体线程与空闲/断流判定 | `HiCarHiSightClient` | **本轮移植** |
+| `HiSightMedia` | RTP → PES → 解密 → H.264 访问单元 | `HiCarHiSightMedia` | **本轮移植**（视频走 TCP，不是 UDP） |
+| `VideoSink` | H.264 → Surface，有界队列，窗口可来可走 | `HiCarVideoSink` | **本轮移植**（分离式 `SurfaceTexture`） |
+| `AudioMedia`/`AudioSink`/`AudioReceiver` | 加密 UDP → RTP → ADTS → AAC → AudioTrack；`SpeakerControl` 处理扬声器指令 | `HiCarAudioWire`/`HiCarAudioSink`/`HiCarAudioReceiver`/`HiCarSpeakerControl` | **本轮移植** |
+| `MicrophoneSender`/`MicrophoneWire`/`MicrophoneControl` | 语音上行（需录音权限，默认关闭） | `HiCarMicrophone`/`HiCarMicrophoneControl` | **本轮移植**，默认关闭，需手动打开 |
+| `InputChannel`/`InputRouter`/`UiInput` | 触控/返回/主页（UIBC） | `HiCarUiInput`（编码器 + 路由 + 发送通道） | **本轮移植** |
+| `ReconnectGate` | 断线后重连门控，避免误判断开 | `HiCarController` 的重入保护 | 部分：控制连接结束即释放媒体，监听仍在，手机可重连；不做整轮重启 |
 | `WireIdentity` | **用本机蓝牙地址派生 deviceId**，让手机的记忆键稳定 | `HiCarHostActivity.rotateIdentity`（随机 16 位） | 部分：我们可换标识，但不是从 BT 地址派生 |
 | `P2pHotspot`/`LocalHotspot`/`LocalApInfo`/`OwnApScan` | 5GHz 热点与地址读取 | `WifiP2pGroupManager`/`LocalOnlyHotspotManager`/`HiCarAccessPoints`/`HiCarAccessPointBssid` | 已有（且我们补了 BSSID 三源取证） |
 | `RfcommPort`/`ClientPreflight` | 反射取 RFCOMM 动态通道号、前置检查 | `HiCarRfcommServices` | 已有 |
@@ -54,23 +56,35 @@ body 以 varint 指令号开头，101=身份、102=服务宣布、104=服务请�
 
 ## 四、本轮做了什么、故意没做什么
 
-做：
+做（累计）：
 
 - `HiCarDmsdpTransport.kt`：DMSDP 模块帧、增量解码器、入口应答。
-- `HiCarDeviceBusiness.kt`：身份（101）与服务目录（104），`$` 包头封装。
+- `HiCarDeviceBusiness.kt`：身份（101）与服务目录（104/102），`$` 包头封装；三个服务各自按就绪状态宣布。
 - `HiCarDmsdpEndpoints.kt`：三个 TCP 监听，只接受"本轮发过凭据的那个手机地址 + 已认证"的连接，
-  控制通道带 1 秒心跳与 30 秒空闲断开。
-- `HiCarController`：热点就绪即开监听；认证成功后把会话密钥复制给 TCP 侧（RFCOMM 关闭时密钥不会随之消失）。
+  控制通道带 1 秒心跳与 30 秒空闲断开；控制连接建立时构建媒体（音频 UDP、麦克风），连接结束即释放。
+- `HiCarHiSightWire.kt` / `HiCarHiSightClient.kt` / `HiCarHiSightMedia.kt`：RTSP 握手、三条 TCP、
+  RTP→PES→H.264。
+- `HiCarVideoSink.kt`：`MediaCodec` 解码到 `SurfaceTexture`，队列有界，窗口可分离。
+- `HiCarAudioWire.kt` / `HiCarAudioSink.kt` / `HiCarAudioReceiver.kt` / `HiCarSpeakerControl`：
+  加密 UDP、RTP/ADTS、AAC→AudioTrack、`speaker1` 协商。
+- `HiCarMicrophone.kt`：`mic1` 协商 + `AudioRecord`→AAC→RTP→UDP，默认关闭。
+- `HiCarUiInput.kt`：UIBC 编码、按下/抬起配对、发送队列、800×480 坐标映射。
+- `HiCarController`：热点就绪即开监听并预热解码器；认证后把会话密钥复制给 TCP 侧；
+  媒体端口一到就 dial HiSight；`sendTouchAt`/`sendKey` 给界面用。
 
-故意没做：
+故意没做 / 保持保守的地方：
 
-1. **不宣布显示服务**（`displayReady = { false }`）。宣布了却放不出画面，手机只会报"连接失败"，
-   比"没有这个功能"更难排查。等 HiSight + 解码器接上再打开这一位。
-2. 不做麦克风、不做重连门控。
+1. **显示服务只在解码器真的就绪时宣布**（`displayReady = { video.ready }`）。宣布了却放不出画面，
+   手机只会报"连接失败"，比"没有这个功能"更难排查。
+2. **麦克风默认关闭**：需要 `RECORD_AUDIO` 权限并且界面上手动打开；关闭时对手机的 `mic1` 请求回 403。
+3. **不宣布方向盘按键与 HUD**：`his_uibc_capability` 只声明触控与返回/主页，方向盘的按键码没有验证过。
+4. **不改 deviceId 派生方式**：参考实现用蓝牙地址派生，我们目前用 ANDROID_ID 派生（同样稳定、可轮换），
+   换成 BT 地址会让已经配对成功的手机把车当成新车，等真车链路稳定后再评估。
 
-## 五、下一阶段（按顺序）
+## 五、下一阶段
 
-1. `HiSightWire` 等价物：RTSP 握手 + AES-CTR + `SETUP` 拿到 `server_port`/`remotectl_port`。
-2. 视频 UDP 收流与 H.264 解码（我们已有 CarPlay 的解码管线可复用）。
-3. 打开显示服务，`displayReady` 接真实解码器。
-4. `ReconnectGate` + `WireIdentity`（BT 地址派生），解决"重启后回连"。
+1. 上车验证这一轮：`service request` → 显示服务宣布 → `SETUP` 拿到端口 → 首帧。
+2. 若首帧不出：按日志分层定位——`HiSight: ANNOUNCE sent` / `SETUP sent` / `video socket connected` /
+   `H.264 access unit`，哪一层没有就补哪一层。
+3. 画面正常后再看音频与触控（`speaker: SETUP sent`、`UIBC: … event(s) sent`）。
+4. 最后才评估重连门控与身份派生。
