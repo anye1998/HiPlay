@@ -288,6 +288,22 @@ static int32_t on_confirm(const struct session_identity *identity, int32_t opera
     return (operation_code == BIND || operation_code == AUTHENTICATE) ? 0 : -1;
 }
 
+/* Copies a Java byte array into a fixed buffer, returning the length or 0 when it does not fit.
+ * Auth ids are binary blobs, so this replaces copy_string for them: a phone's id is 32 bytes that
+ * HiCar writes on the wire as 64 hex characters, and only the bytes are what the engine signs. */
+static uint32_t copy_bytes(JNIEnv *env, jbyteArray value, uint8_t *out, uint32_t max)
+{
+    if (value == NULL || out == NULL) {
+        return 0;
+    }
+    jsize length = (*env)->GetArrayLength(env, value);
+    if (length <= 0 || (uint32_t)length > max) {
+        return 0;
+    }
+    (*env)->GetByteArrayRegion(env, value, 0, length, (jbyte *)out);
+    return (uint32_t)length;
+}
+
 /* Copies a Java string into a fixed buffer, returning the length or 0 when it does not fit. */
 static uint32_t copy_string(JNIEnv *env, jstring value, uint8_t *out, uint32_t max)
 {
@@ -671,7 +687,7 @@ static void probe_append_hex(char *out, size_t capacity, size_t *used, const uin
 
 JNIEXPORT jstring JNICALL
 Java_com_shilapi_xcertplay_hicarauth_HiChainNative_probeKeyset(JNIEnv *env, jclass clazz,
-    jstring self, jstring peer)
+    jbyteArray self, jbyteArray peer)
 {
     (void)clazz;
     if (g_root_fd < 0) {
@@ -688,10 +704,10 @@ Java_com_shilapi_xcertplay_hicarauth_HiChainNative_probeKeyset(JNIEnv *env, jcla
 
     struct hc_auth_id owner;
     memset(&owner, 0, sizeof(owner));
-    owner.length = copy_string(env, self, owner.auth_id, MAX_ID_BYTES);
+    owner.length = copy_bytes(env, self, owner.auth_id, MAX_ID_BYTES);
     struct hc_auth_id remote;
     memset(&remote, 0, sizeof(remote));
-    remote.length = copy_string(env, peer, remote.auth_id, MAX_ID_BYTES);
+    remote.length = copy_bytes(env, peer, remote.auth_id, MAX_ID_BYTES);
     if (service.length == 0 || owner.length == 0 || remote.length == 0) {
         return NULL;
     }
@@ -742,8 +758,8 @@ Java_com_shilapi_xcertplay_hicarauth_HiChainNative_probeKeyset(JNIEnv *env, jcla
 }
 
 JNIEXPORT jlong JNICALL
-Java_com_shilapi_xcertplay_hicarauth_HiChainNative_create(JNIEnv *env, jclass clazz, jstring self,
-    jstring peer, jstring pin, jint role)
+Java_com_shilapi_xcertplay_hicarauth_HiChainNative_create(JNIEnv *env, jclass clazz, jbyteArray self,
+    jbyteArray peer, jstring pin, jint role)
 {    (void)clazz;
     if (g_root_fd < 0 || (role != HC_CENTRE && role != HC_ACCESSORY)) {
         return 0;
@@ -754,9 +770,9 @@ Java_com_shilapi_xcertplay_hicarauth_HiChainNative_create(JNIEnv *env, jclass cl
     }
     session->result = -1;
 
-    session->params.self_auth_id.length = copy_string(env, self, session->params.self_auth_id.auth_id,
+    session->params.self_auth_id.length = copy_bytes(env, self, session->params.self_auth_id.auth_id,
         MAX_ID_BYTES);
-    session->params.peer_auth_id.length = copy_string(env, peer, session->params.peer_auth_id.auth_id,
+    session->params.peer_auth_id.length = copy_bytes(env, peer, session->params.peer_auth_id.auth_id,
         MAX_ID_BYTES);
     session->pin.length = copy_string(env, pin, session->pin.pin, PIN_DIGITS);
     session->params.key_length = MAX_KEY_BYTES;

@@ -26,7 +26,7 @@ internal class HiChainAuthenticator(
     private var stepIndex = 0
     private var operationDone = false
     private var failed = false
-    private var peerIdentity: String? = null
+    private var peerAuthId: ByteArray? = null
 
     /**
      * Prints the long-term keys this pairing has in the store at one moment.
@@ -37,9 +37,10 @@ internal class HiChainAuthenticator(
      * next run answers "is it the same key?" with bytes instead of reasoning.
      */
     private fun probeKeyset(stage: String) {
-        val peer = peerIdentity ?: return
+        val peer = peerAuthId ?: return
+        val local = authIdBytes(localIdentity) ?: return
         if (!HiChainNative.available || handle == 0L) return
-        val report = runCatching { HiChainNative.probeKeyset(localIdentity, peer) }.getOrNull() ?: return
+        val report = runCatching { HiChainNative.probeKeyset(local, peer) }.getOrNull() ?: return
         onLog("HiChain key store [$stage]: $report")
     }
 
@@ -66,11 +67,16 @@ internal class HiChainAuthenticator(
         if (initialized != 0) {
             throw HiCarAuthException(HiCarAuthBlocker.NATIVE_HICHAIN_LIBRARY_MISSING)
         }
-        handle = HiChainNative.create(localIdentity, peerIdentity, pin, ROLE_ACCESSORY)
+        // The engine signs raw bytes; the hex the wire carries is only a transport encoding.
+        val localAuthId = authIdBytes(localIdentity)
+            ?: throw HiCarWireException("this car's identity '$localIdentity' is not an even-length hex id")
+        val remoteAuthId = authIdBytes(peerIdentity)
+            ?: throw HiCarWireException("the phone's identity '$peerIdentity' is not an even-length hex id")
+        handle = HiChainNative.create(localAuthId, remoteAuthId, pin, ROLE_ACCESSORY)
         if (handle == 0L) {
             throw HiCarAuthException(HiCarAuthBlocker.NATIVE_HICHAIN_LIBRARY_MISSING)
         }
-        this.peerIdentity = peerIdentity
+        this.peerAuthId = remoteAuthId
         started = true
         stepIndex = 0
         operationDone = false
@@ -82,7 +88,9 @@ internal class HiChainAuthenticator(
         // code on the screen has one obvious explanation, and the log should be able to show it
         // without anyone having to reproduce the screen.
         onLog(
-            "HiChain begin: role=accessory peer=$peerIdentity pin=${pin.take(2)}…${pin.takeLast(2)} " +
+            "HiChain begin: role=accessory peer=$peerIdentity " +
+                "(ids: this car ${localAuthId.size} bytes, the phone ${remoteAuthId.size} bytes) " +
+                "pin=${pin.take(2)}…${pin.takeLast(2)} " +
                 "(${pin.length} digits, to be compared with the code on this screen)",
         )
     }

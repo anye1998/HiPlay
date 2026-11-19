@@ -41,10 +41,18 @@ class HiChainNative private constructor() {
         @Synchronized
         external fun init(directory: String, seed: String): Int
 
-        /** Creates a session. [role] is 1 for the centre and 2 for the accessory (the car). */
+        /**
+         * Creates a session. [role] is 1 for the centre and 2 for the accessory (the car).
+         *
+         * The identities are the raw auth-id bytes, not the hex text HiCar exchanges over the
+         * wire. A phone reports its `deviceId` as 64 hex characters standing for a 32-byte id;
+         * handing the engine those 64 characters instead of the 32 bytes makes every signature
+         * cover different bytes than the phone reconstructs, which it answers with
+         * HC_VERIFY_PROOF_FAILED on an authenticate even though the bind that preceded it worked.
+         */
         @JvmStatic
         @Synchronized
-        external fun create(selfIdentity: String, peerIdentity: String, pin: String, role: Int): Long
+        external fun create(selfIdentity: ByteArray, peerIdentity: ByteArray, pin: String, role: Int): Long
 
         @JvmStatic
         @Synchronized
@@ -89,7 +97,7 @@ class HiChainNative private constructor() {
          */
         @JvmStatic
         @Synchronized
-        external fun probeKeyset(selfIdentity: String, peerIdentity: String): String?
+        external fun probeKeyset(selfIdentity: ByteArray, peerIdentity: ByteArray): String?
 
         /** One engine step: what the engine wants sent, plus what it reported. */
         class Step(

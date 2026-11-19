@@ -74,6 +74,30 @@ internal interface HiCarAuthenticator : Closeable {
  * are forwarded to [authenticator] untouched. The envelope framing lives here so it can be tested
  * without a phone, while the cryptography lives in the native engine.
  */
+/**
+ * Decodes the hex text HiCar puts on the wire into the binary auth id the engine signs.
+ *
+ * A phone reports its `deviceId` as 64 hex characters, which is a 32-byte id written out — not a
+ * 64-byte id. Passing that text straight through made every signature cover double the id, and the
+ * phone, which rebuilds the signed bytes from the real id, rejected it with
+ * `HC_VERIFY_PROOF_FAILED`. The bind still succeeded, because a bind's signed payload is JSON text
+ * where the id appears as a string; only the authenticate signs it as raw bytes.
+ *
+ * Returns null for anything that is not an even-length hex string, so the caller can refuse instead
+ * of pairing against a mangled identity.
+ */
+internal fun authIdBytes(identity: String): ByteArray? {
+    if (identity.isEmpty() || identity.length % 2 != 0) return null
+    val bytes = ByteArray(identity.length / 2)
+    for (index in bytes.indices) {
+        val high = Character.digit(identity[index * 2], 16)
+        val low = Character.digit(identity[index * 2 + 1], 16)
+        if (high < 0 || low < 0) return null
+        bytes[index] = ((high shl 4) or low).toByte()
+    }
+    return bytes
+}
+
 internal class HiCarIdentityExchange(
     private val localIdentity: String,
     private val deviceName: String,

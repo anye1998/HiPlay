@@ -199,8 +199,8 @@ class HiCarController(
         var car = 0L
         var phone = 0L
         try {
-            car = HiChainNative.create(CAR_ID, PHONE_ID, config.pin, ROLE_ACCESSORY)
-            phone = HiChainNative.create(PHONE_ID, CAR_ID, config.pin, ROLE_CENTRE)
+            car = HiChainNative.create(CAR_ID.toByteArray(), PHONE_ID.toByteArray(), config.pin, ROLE_ACCESSORY)
+            phone = HiChainNative.create(PHONE_ID.toByteArray(), CAR_ID.toByteArray(), config.pin, ROLE_CENTRE)
             if (car == 0L || phone == 0L) {
                 onLog("HiChain loopback: could not create both sessions (car=$car, phone=$phone)")
                 return
