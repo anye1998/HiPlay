@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: hicar-debug-${{ github.ref }}
@@ -77,21 +77,6 @@ jobs:
           name: hicar-debug-apk
           path: mobile/build/outputs/apk/debug/*.apk
           if-no-files-found: error
-
-      # Artifacts need an authenticated download. A release asset is reachable over plain HTTPS,
-      # so the workstation can pull the APK and side-load it without anyone clicking through the UI.
-      - name: Publish the APK as a release asset
-        if: success()
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SHA: ${{ github.sha }}
-        run: |
-          tag=hicar-latest
-          gh release delete "$tag" --yes --cleanup-tag >/dev/null 2>&1 || true
-          gh release create "$tag" mobile/build/outputs/apk/debug/*.apk \
-            --title "HiCar debug APK ${SHA:0:7}" \
-            --notes "Side-load with: adb install -r app-debug.apk" \
-            --latest
 
       - name: Upload test reports
         if: always()
