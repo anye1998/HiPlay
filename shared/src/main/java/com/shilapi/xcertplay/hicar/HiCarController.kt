@@ -11,6 +11,7 @@ import com.shilapi.xcertplay.network.WifiP2pGroupManager
 import com.shilapi.xcertplay.network.WirelessHotspotInfo
 import com.shilapi.xcertplay.network.WirelessHotspotManager
 import java.io.Closeable
+import java.io.File
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
@@ -20,6 +21,7 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.zip.ZipFile
 
 /** What the HiCar receiver is doing, for the driver and for diagnostics. */
 sealed class HiCarStatus {
@@ -156,6 +158,7 @@ class HiCarController(
      * authenticate" and "signing returns -134".
      */
     fun cryptoSelfTest() {
+        probeVendorSdk()
         if (!HiChainNative.available) {
             onLog("HiChain self-test: the native engine is not in this build")
             return
@@ -179,6 +182,61 @@ class HiCarController(
             onLog("HiChain self-test: $line")
         }
         loopbackHandshake()
+    }
+
+    /**
+     * Extracts the head unit's own HiCar authentication libraries and reports whether they load.
+     *
+     * The vendor app keeps Huawei's SDK as uncompressed members of its APK, and that APK is world
+     * readable, so nothing has to be shipped with this one: the members are copied into this app's
+     * private directory (reachable only by this app) and handed to the loader. What matters there
+     * is `authenticate_peer` and `is_trust_peer` — entries the OpenHarmony engine does not have at
+     * all, and the ones a trusted reconnect depends on.
+     */
+    private fun probeVendorSdk() {
+        if (!HiChainNative.available) {
+            return
+        }
+        val apk = File(VENDOR_APK)
+        if (!apk.isFile || !apk.canRead()) {
+            onLog("Vendor SDK: $VENDOR_APK is not readable; nothing to probe")
+            return
+        }
+        val abi = Build.SUPPORTED_ABIS.firstOrNull() ?: "arm64-v8a"
+        val directory = File(appContext.filesDir, "vendor-$abi").apply { mkdirs() }
+        val members = listOf("libsecurec.so", "libHwKeystoreSDK.so", "libHwDeviceAuthSDK.so")
+        try {
+            ZipFile(apk).use { zip ->
+                for (name in members) {
+                    val entry = zip.getEntry("lib/$abi/$name")
+                    if (entry == null) {
+                        onLog("Vendor SDK: the firmware APK has no lib/$abi/$name")
+                        return
+                    }
+                    val target = File(directory, name)
+                    if (target.length() != entry.size) {
+                        zip.getInputStream(entry).use { input ->
+                            target.outputStream().use { output -> input.copyTo(output) }
+                        }
+                    }
+                    runCatching {
+                        target.setReadable(false, false)
+                        target.setReadable(true, true)
+                    }
+                }
+            }
+        } catch (failure: Exception) {
+            onLog("Vendor SDK: could not extract (${failure.javaClass.simpleName})")
+            return
+        }
+        val report = runCatching { HiChainNative.probeVendorSdk(directory.absolutePath) }.getOrNull()
+        if (report == null) {
+            onLog("Vendor SDK: the loader probe returned nothing")
+            return
+        }
+        report.lineSequence().filter { it.isNotBlank() }.forEach { line ->
+            onLog("Vendor SDK: $line")
+        }
     }
 
     /**
@@ -1138,6 +1196,14 @@ class HiCarController(
         const val ROLE_ACCESSORY = 2
         const val USER_TYPE_ACCESSORY = 0
         const val USER_TYPE_CONTROLLER = 1
+
+        /**
+         * Where the head unit keeps its own HiCar app.
+         *
+         * Read only for its uncompressed native libraries, into this app's private directory; the
+         * vendor app itself is never started and nothing of it is redistributed.
+         */
+        const val VENDOR_APK = "/system/app/HiCar/HiCar.apk"
 
         /** The loopback's identities: distinct from anything a phone would present. */
         const val CAR_ID = "selftest-car"

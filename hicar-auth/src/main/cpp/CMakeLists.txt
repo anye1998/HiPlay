@@ -107,7 +107,9 @@ set_target_properties(hicarauth PROPERTIES
     INSTALL_RPATH "$ORIGIN")
 
 find_library(ANDROID_LOG log)
-target_link_libraries(hicarauth PRIVATE ${ANDROID_LOG})
+# `dl` is for the vendor-SDK probe: it dlopens the head unit's own HiCar libraries, which are not
+# available at link time and must never become a link-time dependency.
+target_link_libraries(hicarauth PRIVATE ${ANDROID_LOG} dl)
 target_link_options(hicarauth PRIVATE -Wl,--no-undefined -Wl,-z,max-page-size=16384)
 
 # A separate, deliberately tiny library: reading an interface address is not authentication, and a

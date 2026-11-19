@@ -28,6 +28,7 @@
 #include <sys/system_properties.h>
 #include <unistd.h>
 
+#include <dlfcn.h>
 #include <jni.h>
 #include <mbedtls/sha256.h>
 #include <android/log.h>
@@ -786,6 +787,77 @@ Java_com_shilapi_xcertplay_hicarauth_HiChainNative_probeKeyset(JNIEnv *env, jcla
             probe_append(report, sizeof(report), &used, ":export-failed");
         }
     }
+    return (*env)->NewStringUTF(env, report);
+}
+
+/*
+ * Loads the head unit's own HiCar authentication libraries and reports what it finds.
+ *
+ * The vendor app (/system/app/HiCar/HiCar.apk) ships Huawei's commercial deviceauth SDK as
+ * uncompressed members inside the APK. Its exported surface matches the OpenHarmony engine this
+ * module builds - get_instance, start_pake, receive_data, init_center, set_self_auth_id - and adds
+ * entries the open source one does not have at all, authenticate_peer and is_trust_peer among them.
+ * Those extra entries are the reason the second connection can be trusted at all.
+ *
+ * Nothing is distributed here: the caller reads the members out of the firmware's own APK at run
+ * time, into this app's private directory, and this only tries to load them in dependency order.
+ * A failed dlopen returns the linker's own message rather than a guess.
+ */
+JNIEXPORT jstring JNICALL
+Java_com_shilapi_xcertplay_hicarauth_HiChainNative_probeVendorSdk(JNIEnv *env, jclass clazz,
+    jstring directory)
+{
+    (void)clazz;
+    if (directory == NULL) {
+        return NULL;
+    }
+    const char *dir = (*env)->GetStringUTFChars(env, directory, NULL);
+    if (dir == NULL) {
+        return NULL;
+    }
+
+    static const char *LIBS[] = { "libsecurec.so", "libHwKeystoreSDK.so", "libHwDeviceAuthSDK.so" };
+    static const char *SYMBOLS[] = {
+        "get_instance", "init_center", "set_self_auth_id", "start_pake", "receive_data",
+        "authenticate_peer", "is_trust_peer", "import_auth_info", "registe_log",
+    };
+    const size_t lib_count = sizeof(LIBS) / sizeof(LIBS[0]);
+    const size_t symbol_count = sizeof(SYMBOLS) / sizeof(SYMBOLS[0]);
+
+    char report[1024];
+    size_t used = 0;
+    report[0] = '\0';
+    void *main_handle = NULL;
+
+    for (size_t index = 0; index < lib_count; index++) {
+        char path[512];
+        (void)snprintf(path, sizeof(path), "%s/%s", dir, LIBS[index]);
+        void *handle = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+        probe_append(report, sizeof(report), &used, LIBS[index]);
+        probe_append(report, sizeof(report), &used, ": ");
+        if (handle == NULL) {
+            const char *reason = dlerror();
+            probe_append(report, sizeof(report), &used, (reason != NULL) ? reason : "dlopen failed");
+            probe_append(report, sizeof(report), &used, "\n");
+            break;
+        }
+        probe_append(report, sizeof(report), &used, "loaded\n");
+        if (index + 1 == lib_count) {
+            main_handle = handle;
+        }
+    }
+
+    if (main_handle != NULL) {
+        probe_append(report, sizeof(report), &used, "symbols:");
+        for (size_t index = 0; index < symbol_count; index++) {
+            probe_append(report, sizeof(report), &used, " ");
+            probe_append(report, sizeof(report), &used, SYMBOLS[index]);
+            probe_append(report, sizeof(report), &used,
+                (dlsym(main_handle, SYMBOLS[index]) != NULL) ? "=yes" : "=no");
+        }
+    }
+
+    (*env)->ReleaseStringUTFChars(env, directory, dir);
     return (*env)->NewStringUTF(env, report);
 }
 

@@ -99,6 +99,17 @@ class HiChainNative private constructor() {
         @Synchronized
         external fun probeKeyset(selfIdentity: ByteArray, peerIdentity: ByteArray): String?
 
+        /**
+         * Tries to load the head unit's own HiCar authentication libraries from [directory].
+         *
+         * The caller is expected to have extracted them from the firmware's own APK first; nothing
+         * is shipped here. Returns one line per library plus the symbols the loader could resolve,
+         * or null when the engine is not in this build.
+         */
+        @JvmStatic
+        @Synchronized
+        external fun probeVendorSdk(directory: String): String?
+
         /** One engine step: what the engine wants sent, plus what it reported. */
         class Step(
             val code: Int,
