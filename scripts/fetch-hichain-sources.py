@@ -62,6 +62,101 @@ MBEDTLS_SHA256 = "e4dbcf86a4fb31506482888560f02b161e0ecfb82fee0643abcfc86abee581
 MBEDTLS_URL = f"https://codeload.github.com/Mbed-TLS/mbedtls/tar.gz/refs/tags/{MBEDTLS_TAG}"
 MBEDTLS_KEEP = ("library", "include", "LICENSE")
 
+# `third_party/` is fetched and ignored by git, so a change that has to survive a fresh checkout is
+# written here as an exact-match patch and applied right after the fetch. Each entry must match
+# exactly once; a miss aborts the build rather than shipping a tree that quietly differs from what
+# was reviewed.
+#
+# Both patches are diagnostics, not fixes: the engine's DBG_OUT lines only reach logcat when
+# debug.hicar.engine=1. A second connection to a car proves whether the public key handed to the
+# phone during a bind is the key later used to sign, and whether that signature is self-consistent.
+_DIAG_HELPERS = r'''/* Diagnostic, applied by scripts/fetch-hichain-sources.py: dumps the bytes that get signed and
+ * checks the result against the public key this device stores. */
+static void diag_dump(const char *label, const uint8_t *data, int32_t length)
+{
+    static const char digits[] = "0123456789ABCDEF";
+    char hex[2 * 264 + 1];
+    int32_t index;
+    int32_t limit = (length > 264) ? 264 : length;
+    for (index = 0; index < limit; index++) {
+        hex[index * 2] = digits[(data[index] >> 4) & 0x0F];
+        hex[index * 2 + 1] = digits[data[index] & 0x0F];
+    }
+    hex[limit * 2] = 0;
+    DBG_OUT("%s (%d bytes): %s", label, length, hex);
+}
+
+static int32_t diag_self_check(struct hc_key_alias *alias, struct uint8_buff *message,
+    struct signature *signature)
+{
+    struct ltpk public_key;
+    (void)memset_s(&public_key, sizeof(public_key), 0, sizeof(public_key));
+    if (export_lt_public_key(alias, &public_key) != HC_OK) {
+        DBG_OUT("diag self-check: cannot export the stored public key");
+        return -1;
+    }
+    diag_dump("stored public key", public_key.ltpk, (int32_t)public_key.length);
+    /* ltpk is {length, bytes} and var_buffer is {length, data[]}: the same layout. */
+    return verify_with_public_key(HC_USER_TYPE_ACCESSORY, message,
+        (struct var_buffer *)&public_key, signature);
+}
+
+'''
+
+PATCHES: tuple[tuple[str, str, str], ...] = (
+    # 1. The STS (authenticate) signature: what exactly is signed, and does our own signature hold
+    #    up against the stored key?
+    (
+        "deviceauth/frameworks/deviceauth_lite/source/key_agreement/sts_server.c",
+        "static int32_t generate_sts_response_sign(void *handle, struct signature *signature)\n{\n",
+        _DIAG_HELPERS
+        + "static int32_t generate_sts_response_sign(void *handle, struct signature *signature)\n{\n",
+    ),
+    (
+        "deviceauth/frameworks/deviceauth_lite/source/key_agreement/sts_server.c",
+        "    struct uint8_buff sign_message = { info2, len, len };\n"
+        "    int32_t ret = sign(&key_alias, &sign_message, signature);\n",
+        "    struct uint8_buff sign_message = { info2, len, len };\n"
+        "    diag_dump(\"sts sign source\", info2, len);\n"
+        "    int32_t ret = sign(&key_alias, &sign_message, signature);\n"
+        "    if (ret == HC_OK) {\n"
+        "        diag_dump(\"sts signature\", signature->signature, (int32_t)signature->length);\n"
+        "        DBG_OUT(\"sts self-check: our signature verifies against the stored key = %d\",\n"
+        "            diag_self_check(&key_alias, &sign_message, signature));\n"
+        "    }\n",
+    ),
+    # 2. What the bind actually hands over: the public key inside the auth info we send back.
+    #    The helpers go right after the includes because they are used before that file's own
+    #    definitions, and C decides visibility at the point of use.
+    (
+        "deviceauth/frameworks/deviceauth_lite/source/auth_info/exchange_auth_info.c",
+        "#include \"huks_adapter.h\"\n",
+        "#include \"huks_adapter.h\"\n\n" + _DIAG_HELPERS,
+    ),
+    (
+        "deviceauth/frameworks/deviceauth_lite/source/auth_info/exchange_auth_info.c",
+        "    struct signature sign_result;\n"
+        "    ret = sign_self_public_key(hichain, &auth_info, auth_id, &sign_result);\n",
+        "    struct signature sign_result;\n"
+        "    diag_dump(\"bind auth info sent to the phone\", auth_info.val, (int32_t)auth_info.length);\n"
+        "    ret = sign_self_public_key(hichain, &auth_info, auth_id, &sign_result);\n",
+    ),
+)
+
+
+def apply_patches() -> None:
+    for relative, old, new in PATCHES:
+        path = TARGET / relative
+        if not path.is_file():
+            raise SystemExit(f"patch target missing: {relative}")
+        text = path.read_text(encoding="utf-8")
+        matches = text.count(old)
+        if matches != 1:
+            raise SystemExit(f"patch for {relative} matched {matches} times, expected exactly 1")
+        path.write_text(text.replace(old, new, 1), encoding="utf-8")
+        print(f"patched {relative}")
+
+
 
 def run(args: list[str], cwd: Path | None = None) -> None:
     subprocess.run(args, cwd=cwd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -204,6 +299,7 @@ def main() -> int:
         git_source(name, repository, commit, subtrees)
     mbedtls()
     cjson()
+    apply_patches()
     print(f"HiChain sources ready in {TARGET}")
     return 0
 
