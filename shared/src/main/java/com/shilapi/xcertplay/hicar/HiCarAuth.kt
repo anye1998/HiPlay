@@ -264,14 +264,28 @@ internal class HiCarIdentityExchange(
                 }
                 // Message 17 announces the key length the phone will accept; every other message
                 // keeps the current value, which starts at the engine's 32-byte default.
+                var engineText = dataText
                 if (messageCode == MESSAGE_STS_REQUEST) {
+                    // The phone writes `keyLength` and `peerUserType` as JSON strings ("32", "1").
+                    // The engine parses an incoming message with cJSON, where a string's `valueint`
+                    // is 0 — so the key length reads as 0 and a controller peer reads as an
+                    // accessory. The reference receiver rewrites exactly these two to numbers before
+                    // handing the message over, and its authenticate path depends on it.
+                    val rewritten = normaliseIntegerFields(data.optJSONObject("payload"))
+                    if (rewritten.isNotEmpty()) {
+                        engineText = data.toString()
+                        onLog(
+                            "HiCar: the phone sent ${rewritten.joinToString()} as text; " +
+                                "rewritten as numbers before the engine parses the message",
+                        )
+                    }
                     val requested = data.optJSONObject("payload")?.optInt("keyLength", 0) ?: 0
                     if (requested != 0) {
                         if (requested != 16 && requested != 32) throw HiCarWireException("key length")
                         keyLength = requested
                     }
                 }
-                val packets = engine.step(dataText.toByteArray(StandardCharsets.UTF_8), keyLength)
+                val packets = engine.step(engineText.toByteArray(StandardCharsets.UTF_8), keyLength)
                 // The phone's own message number names the phase (17 announces the key length, 3 is
                 // the bind exchange); without it a step count says nothing about where we are.
                 onLog("HiChain step: ${packets.size} packet(s) for message ${data.optInt("message", -1)}")
@@ -294,6 +308,29 @@ internal class HiCarIdentityExchange(
                 emptyList()
             }
         }
+    }
+
+    /**
+     * Rewrites the fields the phone sends as quoted text into the numbers the engine expects.
+     *
+     * The engine parses an incoming message with cJSON, where a string's `valueint` is 0: a
+     * `keyLength` of "32" reads as 0 and a `peerUserType` of "1" (controller) reads as 0
+     * (accessory). The reference receiver normalises exactly these two before the message reaches
+     * the engine, and its authenticate path relies on it.
+     *
+     * Returns the names it changed, so the log can say whether this mattered.
+     */
+    private fun normaliseIntegerFields(payload: JSONObject?): List<String> {
+        if (payload == null) return emptyList()
+        val changed = ArrayList<String>(2)
+        for (name in INTEGER_TEXT_FIELDS) {
+            val value = payload.opt(name)
+            if (value is String && INTEGER_TEXT.matches(value)) {
+                payload.put(name, value.toInt())
+                changed.add(name)
+            }
+        }
+        return changed
     }
 
     private fun keysOf(data: JSONObject): String =
@@ -374,6 +411,12 @@ internal class HiCarIdentityExchange(
 
         /** An `errorCode` inside an inform payload; the only field that explains a refusal. */
         val ERROR_CODE = Regex("\"errorCode\"\\s*:\\s*(-?\\d+)")
+
+        /** Fields HiCar writes as JSON text but the engine reads as integers. */
+        val INTEGER_TEXT_FIELDS = arrayOf("keyLength", "peerUserType")
+
+        /** What those fields look like when they arrive quoted. */
+        val INTEGER_TEXT = Regex("-?[0-9]{1,4}")
     }
 }
 
