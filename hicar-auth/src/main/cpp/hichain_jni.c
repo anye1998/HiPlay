@@ -1103,15 +1103,80 @@ static void session_release(struct session *session, const struct engine_ops *op
     free(session);
 }
 
+/*
+ * Rewrites "keyLength":"32" as "keyLength":32.
+ *
+ * The engine writes these two fields as JSON strings and reads them back through cJSON, where a
+ * string's integer value is 0. Both sides of this harness therefore agree on 0 by accident. The
+ * real receiver normalises the phone's message before handing it over, so the harness has to do
+ * the same or it would fail for a reason the real path already fixed.
+ */
+static uint32_t normalize_numeric_fields(const uint8_t *in, uint32_t length, uint8_t *out,
+    uint32_t capacity)
+{
+    static const char *KEYS[] = { "keyLength", "peerUserType" };
+    uint32_t used = 0;
+    uint32_t index = 0;
+    while (index < length && used + 1 < capacity) {
+        int matched = 0;
+        if (in[index] == '"') {
+            for (size_t key = 0; key < sizeof(KEYS) / sizeof(KEYS[0]) && !matched; key++) {
+                size_t key_len = strlen(KEYS[key]);
+                if (index + 2 + key_len >= length) {
+                    continue;
+                }
+                if (memcmp(in + index + 1, KEYS[key], key_len) != 0) {
+                    continue;
+                }
+                if (memcmp(in + index + 1 + key_len, "\":\"", 3) != 0) {
+                    continue;
+                }
+                uint32_t start = index + 1 + (uint32_t)key_len + 3;
+                uint32_t end = start;
+                while (end < length && in[end] >= '0' && in[end] <= '9') {
+                    end++;
+                }
+                if (end == start || end >= length || in[end] != '"') {
+                    continue;
+                }
+                uint32_t head = 1 + (uint32_t)key_len + 2; /* " key " : */
+                if (used + head + (end - start) + 1 >= capacity) {
+                    return 0;
+                }
+                memcpy(out + used, in + index, head);
+                used += head;
+                memcpy(out + used, in + start, end - start);
+                used += end - start;
+                index = end + 1; /* the closing quote is dropped with the opening one */
+                matched = 1;
+            }
+        }
+        if (!matched) {
+            out[used++] = in[index++];
+        }
+    }
+    out[used] = '\0';
+    return used;
+}
+
 /* Hands the packets one side produced to the other, until both queues drain. */
 static void session_exchange(const struct engine_ops *car_ops, struct session *car,
     const struct engine_ops *phone_ops, struct session *phone)
 {
+    uint8_t *scratch = malloc(MAX_PACKET_BYTES);
+    if (scratch == NULL) {
+        return;
+    }
     for (int round = 0; round < 12; round++) {
         int moved = 0;
         for (uint32_t index = 0; index < phone->count; index++) {
-            struct uint8_buff buffer = { phone->packets[index], phone->lengths[index],
-                phone->lengths[index] };
+            uint32_t length = normalize_numeric_fields(phone->packets[index],
+                phone->lengths[index], scratch, MAX_PACKET_BYTES);
+            if (length == 0) {
+                length = phone->lengths[index];
+                memcpy(scratch, phone->packets[index], length);
+            }
+            struct uint8_buff buffer = { scratch, length, length };
             (void)car_ops->receive_data(car->handle, &buffer);
             free(phone->packets[index]);
             phone->packets[index] = NULL;
@@ -1119,8 +1184,13 @@ static void session_exchange(const struct engine_ops *car_ops, struct session *c
         }
         phone->count = 0;
         for (uint32_t index = 0; index < car->count; index++) {
-            struct uint8_buff buffer = { car->packets[index], car->lengths[index],
-                car->lengths[index] };
+            uint32_t length = normalize_numeric_fields(car->packets[index], car->lengths[index],
+                scratch, MAX_PACKET_BYTES);
+            if (length == 0) {
+                length = car->lengths[index];
+                memcpy(scratch, car->packets[index], length);
+            }
+            struct uint8_buff buffer = { scratch, length, length };
             (void)phone_ops->receive_data(phone->handle, &buffer);
             free(car->packets[index]);
             car->packets[index] = NULL;
@@ -1131,6 +1201,7 @@ static void session_exchange(const struct engine_ops *car_ops, struct session *c
             break;
         }
     }
+    free(scratch);
 }
 
 /*
@@ -1174,15 +1245,23 @@ static void run_connection(const struct engine_ops *phone_ops, const uint8_t *ca
         probe_append(report, capacity, used, "; authenticate skipped");
         goto done;
     }
-    phone->handle = phone_ops->get_instance(&phone->identity, HC_CENTRE, &phone->callbacks);
-    if (phone->handle == NULL) {
-        probe_append(report, capacity, used, "; the phone side did not start");
+
+    /* A second connection is a new round on both sides: the receiver builds a fresh engine, and
+     * its predecessor ended in the key-agreement state, where an authenticate request is refused
+     * as out of order ("Check hichain state failed, state is 3, message nav is 2-1-1"). Only the
+     * trust entry lives on, in the key store. */
+    session_release(car, &g_ours);
+    car = session_build(car_id, car_len, phone_id, phone_len, pin, HC_ACCESSORY);
+    if (car == NULL) {
+        probe_append(report, capacity, used, "; the car side did not start again");
         goto done;
     }
-    car->count = 0;
-    car->error = 0;
-    car->result = -1;
-    car->key.length = 0;
+    car->handle = g_ours.get_instance(&car->identity, HC_ACCESSORY, &car->callbacks);
+    phone->handle = phone_ops->get_instance(&phone->identity, HC_CENTRE, &phone->callbacks);
+    if (car->handle == NULL || phone->handle == NULL) {
+        probe_append(report, capacity, used, "; a fresh instance failed to start");
+        goto done;
+    }
     int32_t started = phone_ops->authenticate_peer(phone->handle, &phone->params);
     session_exchange(&g_ours, car, phone_ops, phone);
     probe_append(report, capacity, used, "\n authenticate start=");
