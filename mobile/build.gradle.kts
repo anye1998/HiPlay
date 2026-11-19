@@ -45,6 +45,13 @@ android {
         debug {
             applicationIdSuffix = ".hudtest"
             versionNameSuffix = "-hud-test"
+            // A car-side build must keep one signing identity across rebuilds. Android derives the
+            // app UID from the signature, and the HiChain keystore (app_hicar-huks) is encrypted
+            // against that UID: re-signing with a fresh debug key makes the stored pairing keys
+            // unreadable (`ksf file flag is invalid`, rc=-1015), so the phone's next AUTHENTICATE
+            // fails with HC_VERIFY_PROOF_FAILED and the car looks like a device it cannot prove
+            // itself to be. Falls back to the stock debug key when no keystore is supplied.
+            signingConfig = releaseSigning?.let { signingConfigs.getByName("release") }
         }
         release {
             optimization {

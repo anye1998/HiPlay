@@ -35,6 +35,21 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
 
+      # One stable signing identity across every rebuild. Without this the runner generates a fresh
+      # debug key each time, which changes the app UID and makes the stored HiChain keystore
+      # unreadable — the phone then fails AUTHENTICATE with HC_VERIFY_PROOF_FAILED.
+      - name: Restore the fixed car signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::warning title=Signing key missing::ANDROID_KEYSTORE_BASE64 is unset, so this APK will carry a throwaway debug key and cannot be installed over the previous build"
+            exit 0
+          fi
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/hicar-release.jks"
+          echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/hicar-release.jks" >> "$GITHUB_ENV"
+          echo "keystore restored: $(stat -c%s "$RUNNER_TEMP/hicar-release.jks") bytes"
+
       # The HiChain C engine is third-party source and deliberately not committed. Without this
       # step the APK still builds with ENGINE_BUILT=false and authentication can never finish.
       - name: Cache the pinned HiChain engine sources
@@ -52,6 +67,10 @@ jobs:
         run: ./gradlew :shared:testDebugUnitTest --tests "com.shilapi.xcertplay.hicar.*" --console=plain
 
       - name: Build the debug APK
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           set -o pipefail
           ./gradlew --no-configuration-cache --console=plain \
