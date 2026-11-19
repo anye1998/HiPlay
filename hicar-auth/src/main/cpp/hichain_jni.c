@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/system_properties.h>
 #include <unistd.h>
 
 #include <jni.h>
@@ -75,12 +76,24 @@ static void engine_log(int priority, const char *func, const char *format, va_li
 
 static void engine_log_debug(const char *tag, const char *func, const char *format, ...)
 {
+    /* DEBUG is where the engine narrates every field it parsed, so it stays off by default. It is
+     * the only place that says *which* key alias an AUTHENTICATE step looked up and whether the
+     * long-term public key it sent back was the one the bind stored, which is exactly the question
+     * a "bind works, reconnect fails with HC_VERIFY_PROOF_FAILED" report turns on. Set
+     * debug.hicar.engine to 1 (adb shell setprop, or the Root probe screen) to have it. */
+    static int verbose = -1;
+    if (verbose < 0) {
+        char value[PROP_VALUE_MAX] = { 0 };
+        verbose = (__system_property_get("debug.hicar.engine", value) > 0 && value[0] == '1') ? 1 : 0;
+    }
+    if (!verbose) {
+        return;
+    }
     (void)tag;
-    (void)func;
-    (void)format;
-    /* DEBUG is where the engine narrates every field it parsed; a single pairing produces hundreds
-     * of those lines and they bury the INFO/ERROR ones that say what went wrong. To see them, send
-     * this one through `engine_log(ANDROID_LOG_DEBUG, ...)` again. */
+    va_list args;
+    va_start(args, format);
+    engine_log(ANDROID_LOG_DEBUG, func, format, args);
+    va_end(args);
 }
 
 static void engine_log_info(const char *tag, const char *func, const char *format, ...)

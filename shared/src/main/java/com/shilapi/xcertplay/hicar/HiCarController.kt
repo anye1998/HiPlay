@@ -300,9 +300,31 @@ class HiCarController(
      * the edge still releases the one the phone believes is down.
      */
     fun sendTouchAt(x: Float, y: Float, width: Int, height: Int, action: Int): Boolean {
-        val mapped = HiCarInputRouter.map(x, y, width, height, action != 0) ?: return false
-        return input.touch(action, mapped[0], mapped[1])
+        val mapped = HiCarInputRouter.map(x, y, width, height, action != 0)
+        if (mapped == null) {
+            onLog("touch: dropped, (${x.toInt()},${y.toInt()}) is outside the ${width}x$height window")
+            return false
+        }
+        val sent = input.touch(action, mapped[0], mapped[1])
+        // The phone answered nothing at all on 2026-11-19 11:5x while 60 encrypted events went out,
+        // so the numbers have to be visible: a wrong mapping and a refused event look identical
+        // from the outside. Moves are summarised, presses are always named.
+        if (action != 2 || touchMoves++ % 30 == 0) {
+            val name = when (action) {
+                0 -> "down"
+                1 -> "up"
+                else -> "move"
+            }
+            onLog(
+                "touch: $name view=${width}x$height at (${x.toInt()},${y.toInt()}) " +
+                    "-> (${mapped[0]},${mapped[1]}) of ${HiCarInputRouter.DISPLAY_WIDTH}x" +
+                    "${HiCarInputRouter.DISPLAY_HEIGHT} sent=$sent",
+            )
+        }
+        return sent
     }
+
+    private var touchMoves = 0
 
     /** Sends the home or back key (Android key codes 3 and 4). */
     fun sendKey(key: Int): Boolean = input.key(key)
