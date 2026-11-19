@@ -182,6 +182,41 @@ class HiCarController(
             onLog("HiChain self-test: $line")
         }
         loopbackHandshake()
+        secondConnection()
+    }
+
+    /**
+     * Binds inside this process and then connects again, the way a phone that already trusts this
+     * car does.
+     *
+     * This is the one part of the protocol that could not be exercised without the car: a second
+     * connection can only be started by the centre, which is the phone's role. The engine does
+     * implement `authenticate_peer`, so both roles can be played here and the exchange becomes
+     * readable. The firmware's SDK is tried as a second phone when it was extracted, which is what
+     * separates "we refuse a correct request" from "its request differs from ours".
+     */
+    private fun secondConnection() {
+        if (!PIN_DIGITS.matches(config.pin)) {
+            onLog("HiChain second connection: skipped, the connection code is not six digits")
+            return
+        }
+        val abi = Build.SUPPORTED_ABIS.firstOrNull() ?: "arm64-v8a"
+        val vendor = File(appContext.filesDir, "vendor-$abi").takeIf { it.isDirectory }
+        val report = runCatching {
+            HiChainNative.probeVendorAuthenticate(
+                vendor?.absolutePath,
+                CAR_ID.toByteArray(),
+                PHONE_ID.toByteArray(),
+                config.pin,
+            )
+        }.getOrNull()
+        if (report == null) {
+            onLog("HiChain second connection: the harness returned no report")
+            return
+        }
+        report.lineSequence().filter { it.isNotBlank() }.forEach { line ->
+            onLog("HiChain second connection:$line")
+        }
     }
 
     /**

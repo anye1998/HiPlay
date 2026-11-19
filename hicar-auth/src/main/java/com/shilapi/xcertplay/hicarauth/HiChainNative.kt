@@ -110,6 +110,24 @@ class HiChainNative private constructor() {
         @Synchronized
         external fun probeVendorSdk(directory: String): String?
 
+        /**
+         * Runs a bind and then a second connection with the vendor SDK playing the phone.
+         *
+         * A car's second connection cannot be reached through this module's own engine: it declares
+         * `authenticate_peer` without implementing it, so nothing here can take the centre's role.
+         * The vendor SDK can, which makes the exchange reproducible inside one process. Codes are
+         * the engines' own; the car side reporting a key after "authenticate" means it accepted the
+         * request, and a phone side error means it rejected our proof.
+         */
+        @JvmStatic
+        @Synchronized
+        external fun probeVendorAuthenticate(
+            directory: String?,
+            carIdentity: ByteArray,
+            phoneIdentity: ByteArray,
+            pin: String,
+        ): String?
+
         /** One engine step: what the engine wants sent, plus what it reported. */
         class Step(
             val code: Int,

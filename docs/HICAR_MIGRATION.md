@@ -2303,3 +2303,38 @@ AUTHENTICATE——这取决于手机侧的配对记录，只有上车才能确�
 修复后的判据：日志里 `HiChain begin` 一行会出现
 `(ids: this car 8 bytes, the phone 32 bytes)`，`sts sign source` 变成 **104 字节**，
 并且手机不再回 `errorCode:17`，而是继续走 Wi-Fi 协商与 DMSDP。
+
+### 7.44 更正 7.43 的一个错误结论：`authenticate_peer` 是实现了的
+
+7.43 之后曾判断"开源引擎只声明、不实现 `authenticate_peer`，所以二次认证只能靠华为商业 SDK"。
+**这个结论是错的**，依据是搜索时写成了 `^int32_t`，而实现用的是
+`DLL_API_PUBLIC int32_t` 前缀，于是被漏掉：
+
+```
+hichain.c:446: DLL_API_PUBLIC int32_t authenticate_peer(hc_handle handle, struct operation_parameter *params)
+```
+
+编出来的 `libhicarauth.so` 也确实导出 `authenticate_peer`、`is_trust_peer`、`import_auth_info`、
+`delete_local_auth_info`。原厂与我们的差别不在"有没有这个入口"，而在入口内部的实现。
+
+这个更正带来一个直接好处：**二次认证可以在进程内复现**——centre（手机的角色）由我们自己的引擎扮演，
+不必等手机、也不必上车。
+
+#### 新增：离线二次认证复现台
+
+自检按钮现在多做两件事（`HiChainNative.probeVendorAuthenticate`）：
+
+1. `ours->ours`：本引擎当车机 + 本引擎当手机，先 bind，再**用新实例重新连一次**并走
+   `authenticate_peer`，打印两侧的返回码、会话密钥长度与错误位。
+2. `vendor->ours`：原厂 SDK 当手机，对同一台"车机"重复同样流程。两者对比即可判定
+   "我们拒绝了正确的请求"还是"原厂的请求与我们的不同"。
+
+日志形如：
+
+```
+HiChain second connection: ours->ours: bind car=0/key32 phone=0
+HiChain second connection: authenticate start=0 car=…/key…/err0 phone=…/key…/err…
+```
+
+判断标准：`authenticate` 一行里，两侧都拿到 32 字节密钥 = 通过；`phone` 侧 err≠0 = 手机
+（这里由对应引擎扮演）拒绝了我们的证明；`car` 侧 err≠0 = 我们没接住请求。

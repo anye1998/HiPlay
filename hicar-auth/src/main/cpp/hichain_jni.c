@@ -718,6 +718,30 @@ static void probe_append_hex(char *out, size_t capacity, size_t *used, const uin
     out[*used] = '\0';
 }
 
+/* Signed, because an engine code of -1 means "invalid" rather than a failure phase. */
+static void probe_append_int(char *out, size_t capacity, size_t *used, int32_t value)
+{
+    char digits[12];
+    size_t count = 0;
+    uint32_t magnitude;
+    if (value < 0) {
+        if (*used + 1 < capacity) {
+            out[(*used)++] = '-';
+        }
+        magnitude = (uint32_t)(-(int64_t)value);
+    } else {
+        magnitude = (uint32_t)value;
+    }
+    do {
+        digits[count++] = (char)('0' + (magnitude % 10u));
+        magnitude /= 10u;
+    } while (magnitude != 0);
+    while (count > 0 && *used + 1 < capacity) {
+        out[(*used)++] = digits[--count];
+    }
+    out[*used] = '\0';
+}
+
 JNIEXPORT jstring JNICALL
 Java_com_shilapi_xcertplay_hicarauth_HiChainNative_probeKeyset(JNIEnv *env, jclass clazz,
     jbyteArray self, jbyteArray peer)
@@ -832,7 +856,10 @@ Java_com_shilapi_xcertplay_hicarauth_HiChainNative_probeVendorSdk(JNIEnv *env, j
     for (size_t index = 0; index < lib_count; index++) {
         char path[512];
         (void)snprintf(path, sizeof(path), "%s/%s", dir, LIBS[index]);
-        void *handle = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+        /* RTLD_LOCAL: these libraries export the same names this module already defines
+         * (hks_init, hks_generate_key, get_instance...). Loading them globally would let them
+         * interpose on our own calls; kept local, each library resolves inside its own group. */
+        void *handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
         probe_append(report, sizeof(report), &used, LIBS[index]);
         probe_append(report, sizeof(report), &used, ": ");
         if (handle == NULL) {
@@ -858,6 +885,408 @@ Java_com_shilapi_xcertplay_hicarauth_HiChainNative_probeVendorSdk(JNIEnv *env, j
     }
 
     (*env)->ReleaseStringUTFChars(env, directory, dir);
+    return (*env)->NewStringUTF(env, report);
+}
+
+/* ================================================================================================
+ * Vendor engine harness: a second connection, reproduced without a phone
+ *
+ * The car's second connection (operationCode 2) cannot be tested without a phone, and cannot be
+ * exercised in isolation either: the open source engine declares authenticate_peer but does not
+ * implement it, so the centre side - normally the phone - has no way to start one. The vendor SDK
+ * in /system/app/HiCar does implement it.
+ *
+ * So the vendor SDK takes the phone's role and this module keeps the car's: a bind, then the
+ * authenticate the phone would send. Both engines run in one process, which makes the exchange
+ * observable end to end. If the vendor car accepts what our car refuses - or the reverse - the
+ * fault is located in the engine rather than in the phone, and the difference can be read from a
+ * log instead of another trip to the car.
+ *
+ * The vendor engine gets its own key store directory: sharing one with the real pairing would let
+ * a test overwrite the keys the car currently trusts.
+ * ============================================================================================== */
+
+static int g_vendor_root_fd = -1;
+static int g_vendor_state; /* 0 = not tried, 1 = ready, -1 = unavailable */
+
+struct vendor_api {
+    void *keystore;
+    void *main;
+    hc_handle (*get_instance)(const struct session_identity *, enum hc_type,
+        const struct hc_call_back *);
+    int32_t (*start_pake)(hc_handle, const struct operation_parameter *);
+    int32_t (*authenticate_peer)(hc_handle, struct operation_parameter *);
+    int32_t (*receive_data)(hc_handle, struct uint8_buff *);
+    int32_t (*delete_local_auth_info)(hc_handle, struct hc_user_info *);
+    void (*destroy)(hc_handle *);
+};
+
+static struct vendor_api g_vendor;
+
+/* The four entries a connection needs, so one routine can drive either engine. Our own engine
+ * implements authenticate_peer too, which is what makes a second connection reproducible here at
+ * all: the centre side - the phone's role - can be played in this process. */
+struct engine_ops {
+    const char *name;
+    hc_handle (*get_instance)(const struct session_identity *, enum hc_type,
+        const struct hc_call_back *);
+    int32_t (*start_pake)(hc_handle, const struct operation_parameter *);
+    int32_t (*authenticate_peer)(hc_handle, struct operation_parameter *);
+    int32_t (*receive_data)(hc_handle, struct uint8_buff *);
+    int32_t (*delete_local_auth_info)(hc_handle, struct hc_user_info *);
+    void (*destroy)(hc_handle *);
+};
+
+static const struct engine_ops g_ours = {
+    "ours", get_instance, start_pake, authenticate_peer, receive_data, delete_local_auth_info,
+    destroy,
+};
+
+/* Same three callbacks the car's own store uses, kept apart by a different root descriptor. */
+static int32_t vendor_read(const char *name, uint32_t offset, uint8_t *buf, uint32_t len)
+{
+    if (!storage_name_allowed(name) || buf == NULL || g_vendor_root_fd < 0 ||
+        offset > MAX_STORAGE_BYTES || len > MAX_STORAGE_BYTES - offset) {
+        return -1;
+    }
+    int fd = openat(g_vendor_root_fd, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        return errno == ENOENT ? 0 : -1;
+    }
+    ssize_t read = pread(fd, buf, len, (off_t)offset);
+    close(fd);
+    return (read < 0) ? -1 : (int32_t)read;
+}
+
+static int32_t vendor_write(const char *name, uint32_t offset, const uint8_t *buf, uint32_t len)
+{
+    if (!storage_name_allowed(name) || buf == NULL || g_vendor_root_fd < 0 ||
+        offset > MAX_STORAGE_BYTES || len > MAX_STORAGE_BYTES - offset) {
+        return -1;
+    }
+    int fd = openat(g_vendor_root_fd, name, O_WRONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        return -1;
+    }
+    ssize_t written = pwrite(fd, buf, len, (off_t)offset);
+    int ok = (written == (ssize_t)len) && (fsync(fd) == 0);
+    close(fd);
+    return ok ? 0 : -1;
+}
+
+static int32_t vendor_size(const char *name)
+{
+    if (!storage_name_allowed(name) || g_vendor_root_fd < 0) {
+        return -1;
+    }
+    int fd = openat(g_vendor_root_fd, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        return errno == ENOENT ? 0 : -1;
+    }
+    struct stat status;
+    int ok = (fstat(fd, &status) == 0) && S_ISREG(status.st_mode) &&
+        (status.st_size <= (off_t)MAX_STORAGE_BYTES);
+    close(fd);
+    return ok ? (int32_t)status.st_size : -1;
+}
+
+static struct hks_file_callbacks g_vendor_files = { vendor_read, vendor_write, vendor_size };
+
+/* Loads the vendor stack in dependency order and points its key store at its own directory. */
+static int vendor_load(const char *directory)
+{
+    if (g_vendor_state != 0) {
+        return g_vendor_state > 0;
+    }
+    g_vendor_state = -1;
+
+    static const char *LIBS[] = { "libsecurec.so", "libHwKeystoreSDK.so", "libHwDeviceAuthSDK.so" };
+    void *handles[3] = { NULL, NULL, NULL };
+    for (size_t index = 0; index < 3; index++) {
+        char path[512];
+        (void)snprintf(path, sizeof(path), "%s/%s", directory, LIBS[index]);
+        handles[index] = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+        if (handles[index] == NULL) {
+            return 0;
+        }
+    }
+    g_vendor.keystore = handles[1];
+    g_vendor.main = handles[2];
+
+    *(void **)(&g_vendor.get_instance) = dlsym(g_vendor.main, "get_instance");
+    *(void **)(&g_vendor.start_pake) = dlsym(g_vendor.main, "start_pake");
+    *(void **)(&g_vendor.authenticate_peer) = dlsym(g_vendor.main, "authenticate_peer");
+    *(void **)(&g_vendor.receive_data) = dlsym(g_vendor.main, "receive_data");
+    *(void **)(&g_vendor.delete_local_auth_info) = dlsym(g_vendor.main,
+        "delete_local_auth_info");
+    *(void **)(&g_vendor.destroy) = dlsym(g_vendor.main, "destroy");
+    if (g_vendor.get_instance == NULL || g_vendor.start_pake == NULL ||
+        g_vendor.authenticate_peer == NULL || g_vendor.receive_data == NULL ||
+        g_vendor.delete_local_auth_info == NULL || g_vendor.destroy == NULL) {
+        return 0;
+    }
+
+    int32_t (*register_files)(struct hks_file_callbacks *) =
+        (int32_t (*)(struct hks_file_callbacks *))dlsym(g_vendor.keystore, "hks_register_file_callbacks");
+    int32_t (*register_udid)(int32_t (*)(uint8_t *, uint32_t)) =
+        (int32_t (*)(int32_t (*)(uint8_t *, uint32_t)))dlsym(g_vendor.keystore,
+            "hks_register_get_hardware_udid_callback");
+    int32_t (*init)(void) = (int32_t (*)(void))dlsym(g_vendor.keystore, "hks_init");
+    if (register_files == NULL || init == NULL) {
+        return 0;
+    }
+
+    char store[512];
+    (void)snprintf(store, sizeof(store), "%s/keystore", directory);
+    (void)mkdir(store, 0700);
+    g_vendor_root_fd = open(store, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (g_vendor_root_fd < 0) {
+        return 0;
+    }
+    /* The vendor engine resolves hks_* inside its own group, so these land on its own store. */
+    if (register_files(&g_vendor_files) != 0) {
+        return 0;
+    }
+    if (register_udid != NULL) {
+        (void)register_udid(hardware_udid);
+    }
+    if (init() != 0) {
+        return 0;
+    }
+    g_vendor_state = 1;
+    return 1;
+}
+
+/* Fills a session with the same parameters the Java entry point builds. */
+static struct session *session_build(const uint8_t *self, uint32_t self_len, const uint8_t *peer,
+    uint32_t peer_len, const char *pin, int role)
+{
+    (void)role; /* carried for symmetry with get_instance; the role is passed there */
+    struct session *session = calloc(1, sizeof(*session));
+    if (session == NULL) {
+        return NULL;
+    }
+    session->result = -1;
+    session->params.self_auth_id.length = self_len;
+    memcpy(session->params.self_auth_id.auth_id, self, self_len);
+    session->params.peer_auth_id.length = peer_len;
+    memcpy(session->params.peer_auth_id.auth_id, peer, peer_len);
+    session->pin.length = (uint32_t)strlen(pin);
+    memcpy(session->pin.pin, pin, session->pin.length);
+    session->params.key_length = MAX_KEY_BYTES;
+    session->identity.session_id = 0;
+    session->identity.package_name.length = (uint32_t)strlen(PACKAGE_NAME);
+    memcpy(session->identity.package_name.name, PACKAGE_NAME, session->identity.package_name.length);
+    session->identity.service_type.length = (uint32_t)strlen(SERVICE_TYPE);
+    memcpy(session->identity.service_type.type, SERVICE_TYPE, session->identity.service_type.length);
+    session->identity.context = session;
+    session->callbacks.transmit = on_transmit;
+    session->callbacks.get_protocol_params = on_protocol_params;
+    session->callbacks.set_session_key = on_session_key;
+    session->callbacks.set_service_result = on_service_result;
+    session->callbacks.confirm_receive_request = on_confirm;
+    return session;
+}
+
+static void session_release(struct session *session, const struct engine_ops *ops)
+{
+    if (session == NULL) {
+        return;
+    }
+    if (session->handle != NULL) {
+        ops->destroy(&session->handle);
+    }
+    for (uint32_t index = 0; index < session->count; index++) {
+        free(session->packets[index]);
+    }
+    memset(session, 0, sizeof(*session));
+    free(session);
+}
+
+/* Hands the packets one side produced to the other, until both queues drain. */
+static void session_exchange(const struct engine_ops *car_ops, struct session *car,
+    const struct engine_ops *phone_ops, struct session *phone)
+{
+    for (int round = 0; round < 12; round++) {
+        int moved = 0;
+        for (uint32_t index = 0; index < phone->count; index++) {
+            struct uint8_buff buffer = { phone->packets[index], phone->lengths[index],
+                phone->lengths[index] };
+            (void)car_ops->receive_data(car->handle, &buffer);
+            free(phone->packets[index]);
+            phone->packets[index] = NULL;
+            moved++;
+        }
+        phone->count = 0;
+        for (uint32_t index = 0; index < car->count; index++) {
+            struct uint8_buff buffer = { car->packets[index], car->lengths[index],
+                car->lengths[index] };
+            (void)phone_ops->receive_data(phone->handle, &buffer);
+            free(car->packets[index]);
+            car->packets[index] = NULL;
+            moved++;
+        }
+        car->count = 0;
+        if (moved == 0) {
+            break;
+        }
+    }
+}
+
+/*
+ * Binds, then connects a second time the way a phone that already trusts this car does: a fresh
+ * centre instance and an authenticate instead of a pair. The car is always this module's engine,
+ * because that is the side being diagnosed; only the phone's engine varies.
+ */
+static void run_connection(const struct engine_ops *phone_ops, const uint8_t *car_id,
+    uint32_t car_len, const uint8_t *phone_id, uint32_t phone_len, const char *pin, char *report,
+    size_t capacity, size_t *used)
+{
+    struct session *car = session_build(car_id, car_len, phone_id, phone_len, pin, HC_ACCESSORY);
+    struct session *phone = session_build(phone_id, phone_len, car_id, car_len, pin, HC_CENTRE);
+    if (car == NULL || phone == NULL) {
+        probe_append(report, capacity, used, "out of memory");
+        session_release(car, &g_ours);
+        session_release(phone, phone_ops);
+        return;
+    }
+    car->handle = g_ours.get_instance(&car->identity, HC_ACCESSORY, &car->callbacks);
+    phone->handle = phone_ops->get_instance(&phone->identity, HC_CENTRE, &phone->callbacks);
+    if (car->handle == NULL || phone->handle == NULL) {
+        probe_append(report, capacity, used, "either side failed to start");
+        goto done;
+    }
+
+    (void)phone_ops->start_pake(phone->handle, &phone->params);
+    session_exchange(&g_ours, car, phone_ops, phone);
+    probe_append(report, capacity, used, " bind car=");
+    probe_append_int(report, capacity, used, car->result);
+    probe_append(report, capacity, used, "/key");
+    probe_append_int(report, capacity, used, (int32_t)car->key.length);
+    probe_append(report, capacity, used, " phone=");
+    probe_append_int(report, capacity, used, phone->result);
+
+    /* Only the centre is rebuilt. The car keeps the trust entry a bind just wrote, which is what
+     * a phone dialling again looks like from this side. */
+    session_release(phone, phone_ops);
+    phone = session_build(phone_id, phone_len, car_id, car_len, pin, HC_CENTRE);
+    if (phone == NULL) {
+        probe_append(report, capacity, used, "; authenticate skipped");
+        goto done;
+    }
+    phone->handle = phone_ops->get_instance(&phone->identity, HC_CENTRE, &phone->callbacks);
+    if (phone->handle == NULL) {
+        probe_append(report, capacity, used, "; the phone side did not start");
+        goto done;
+    }
+    car->count = 0;
+    car->error = 0;
+    car->result = -1;
+    car->key.length = 0;
+    int32_t started = phone_ops->authenticate_peer(phone->handle, &phone->params);
+    session_exchange(&g_ours, car, phone_ops, phone);
+    probe_append(report, capacity, used, "\n authenticate start=");
+    probe_append_int(report, capacity, used, started);
+    probe_append(report, capacity, used, " car=");
+    probe_append_int(report, capacity, used, car->result);
+    probe_append(report, capacity, used, "/key");
+    probe_append_int(report, capacity, used, (int32_t)car->key.length);
+    probe_append(report, capacity, used, "/err");
+    probe_append_int(report, capacity, used, car->error);
+    probe_append(report, capacity, used, " phone=");
+    probe_append_int(report, capacity, used, phone->result);
+    probe_append(report, capacity, used, "/key");
+    probe_append_int(report, capacity, used, (int32_t)phone->key.length);
+    probe_append(report, capacity, used, "/err");
+    probe_append_int(report, capacity, used, phone->error);
+
+done:
+    /* Leaves both stores as they were found: a test peer must not stay trusted on either side. */
+    if (car != NULL && car->handle != NULL) {
+        struct hc_user_info info;
+        memset(&info, 0, sizeof(info));
+        info.auth_id.length = phone_len;
+        memcpy(info.auth_id.auth_id, phone_id, phone_len);
+        info.user_type = HC_USER_TYPE_CONTROLLER;
+        (void)delete_local_auth_info(car->handle, &info);
+    }
+    if (phone != NULL && phone->handle != NULL) {
+        struct hc_user_info info;
+        memset(&info, 0, sizeof(info));
+        info.auth_id.length = car_len;
+        memcpy(info.auth_id.auth_id, car_id, car_len);
+        info.user_type = HC_USER_TYPE_ACCESSORY;
+        (void)phone_ops->delete_local_auth_info(phone->handle, &info);
+    }
+    session_release(car, &g_ours);
+    session_release(phone, phone_ops);
+}
+
+/*
+ * Reproduces a second connection without a phone.
+ *
+ * A car's second connection is the one thing that cannot be exercised from this side alone: a
+ * centre has to start it. This module's engine implements authenticate_peer, so the phone's role
+ * can be played in this process, and the whole exchange becomes observable. The vendor SDK is run
+ * as a second phone when the firmware has it, which tells apart "our engine refuses a correct
+ * request" from "the vendor engine refuses ours".
+ *
+ * Needs no directory when only this module's engine is used; [directory] is where the firmware's
+ * SDK was extracted to, and a null one skips that half.
+ */
+JNIEXPORT jstring JNICALL
+Java_com_shilapi_xcertplay_hicarauth_HiChainNative_probeVendorAuthenticate(JNIEnv *env, jclass clazz,
+    jstring directory, jbyteArray car_id, jbyteArray phone_id, jstring pin)
+{
+    (void)clazz;
+    if (car_id == NULL || phone_id == NULL || pin == NULL || g_root_fd < 0) {
+        return NULL;
+    }
+    const char *code = (*env)->GetStringUTFChars(env, pin, NULL);
+    if (code == NULL) {
+        return NULL;
+    }
+
+    char report[2048];
+    size_t used = 0;
+    report[0] = '\0';
+
+    uint8_t car_auth[MAX_ID_BYTES];
+    uint8_t phone_auth[MAX_ID_BYTES];
+    jsize car_len = (*env)->GetArrayLength(env, car_id);
+    jsize phone_len = (*env)->GetArrayLength(env, phone_id);
+    if (car_len <= 0 || car_len > (jsize)MAX_ID_BYTES || phone_len <= 0 ||
+        phone_len > (jsize)MAX_ID_BYTES) {
+        probe_append(report, sizeof(report), &used, "an auth id is the wrong size");
+        (*env)->ReleaseStringUTFChars(env, pin, code);
+        return (*env)->NewStringUTF(env, report);
+    }
+    (*env)->GetByteArrayRegion(env, car_id, 0, car_len, (jbyte *)car_auth);
+    (*env)->GetByteArrayRegion(env, phone_id, 0, phone_len, (jbyte *)phone_auth);
+
+    probe_append(report, sizeof(report), &used, "ours->ours:");
+    run_connection(&g_ours, car_auth, (uint32_t)car_len, phone_auth, (uint32_t)phone_len, code,
+        report, sizeof(report), &used);
+
+    if (directory != NULL) {
+        const char *dir = (*env)->GetStringUTFChars(env, directory, NULL);
+        if (dir != NULL) {
+            if (vendor_load(dir)) {
+                struct engine_ops vendor = { "vendor", g_vendor.get_instance, g_vendor.start_pake,
+                    g_vendor.authenticate_peer, g_vendor.receive_data,
+                    g_vendor.delete_local_auth_info, g_vendor.destroy };
+                probe_append(report, sizeof(report), &used, "\nvendor->ours:");
+                run_connection(&vendor, car_auth, (uint32_t)car_len, phone_auth,
+                    (uint32_t)phone_len, code, report, sizeof(report), &used);
+            } else {
+                probe_append(report, sizeof(report), &used,
+                    "\nvendor->ours: the firmware SDK did not start");
+            }
+            (*env)->ReleaseStringUTFChars(env, directory, dir);
+        }
+    }
+
+    (*env)->ReleaseStringUTFChars(env, pin, code);
     return (*env)->NewStringUTF(env, report);
 }
 
