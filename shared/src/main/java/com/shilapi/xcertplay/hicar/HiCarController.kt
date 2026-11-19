@@ -831,7 +831,12 @@ class HiCarController(
                 acceptSocket()
             } catch (closed: IOException) {
                 if (running.get() && generation == round) {
+                    // This is the listener itself failing, not one phone connection ending: the
+                    // whole round is gone and only a restart brings discovery back. The reference
+                    // receiver restarts here too. A release triggered by Stop or by a previous
+                    // reconnect has already bumped `generation`, so it never lands here.
                     onLog("HiCar ${if (control) "control" else "business"} listener closed")
+                    scheduleReconnect("the ${if (control) "control" else "business"} listener closed")
                 }
                 return
             } catch (denied: SecurityException) {
@@ -998,11 +1003,24 @@ class HiCarController(
             authenticator.close()
             closeQuietly(socket)
             sockets.remove(socket)
-            // Only this round may ask for a restart: a stale channel closing after a new round has
-            // begun must not tear that round down again.
-            if (generation == round) {
-                scheduleReconnect(if (control) "the control channel closed" else "the business channel closed")
-            }
+            // A channel closing is not the round ending.
+            //
+            // The phone releases both RFCOMM channels as soon as it has authenticated and moved to
+            // the access point: at that moment DMSDP and HiSight are still running and the picture
+            // is on screen (2026-11-19 09:31: `channel closed` arrived while `decoder output
+            // 800x480` was already flowing). Releasing the round here tore down the access point,
+            // the TCP listeners and the video socket underneath a working session, so the phone
+            // reconnected from scratch and did a fresh BIND — which is why it asked for the six
+            // digit code again. The reference receiver only restarts on a DMSDP control socket
+            // closing, a HiSight session ending, or a listener failure; RFCOMM going away is
+            // expected and is not one of them.
+            //
+            // The listeners started by this round keep accepting, the advertisement keeps running,
+            // and `Stop` still releases everything.
+            onLog(
+                "HiCar ${if (control) "control" else "business"} channel closed; " +
+                    "the round stays up (DMSDP and video are independent of RFCOMM)",
+            )
         }
     }
 

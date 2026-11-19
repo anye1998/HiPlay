@@ -2183,3 +2183,66 @@ GitHub 的 `ubuntu-latest` runner 路径全 ASCII，这个问题天然不存在�
 
 **尚未验证**：本工作流第一次在 GitHub 上实际运行的结果；推送成功后要看它的
 "Assert the native engine is inside the APK" 与 artifact 是否生成。
+
+### 7.42 画面通了，但"重复要密码"是我们把 RFCOMM 关闭当成整轮结束
+
+11-19 09:31 的上车日志第一次出现完整成功链路，而且时间只用了不到 20 秒：
+
+```
+--- receiver started 09:31:09 with code 618008 ---
+HiChain begin: role=accessory peer=01CF…017E pin=61…08
+HiCar in: oper_type=3 message=1 (PAKE_REQUEST) … "operationCode":1     ← 首次 BIND，要码是正常的
+HiChain step 2 finished: 32-byte session key
+HiChain step 3 completed the operation (phase=END_SUCCESS)
+station address 4e:7a:54:5f:eb:99 accepted; credentials sent for 'DIRECT-…-AWsF' on 5200 MHz
+DMSDP: control connection accepted from 192.168.49.2
+DMSDP: DMSDP AES-CTR negotiated
+DMSDP display service announced: 800×480
+DMSDP media endpoint: the phone serves video on 192.168.49.2:41645
+HiSight: video port negotiated; input port also offered
+HiSight: 1 H.264 access unit(s), 0 dropped, 1170 bytes last
+HiSight: decoder output 800×480
+```
+
+手机侧的"连接成功"动画和车机上的画面，与这份日志是同一件事。**要排查的问题只剩"手机重复要求输密码"。**
+
+#### 证据链
+
+1. 第一轮是 `operationCode:1`（BIND），首次配对向用户要六位码属于正常流程。
+2. 画面开始后出现 `HiCar channel closed: IOException`。关键点是：**此刻 DMSDP 与 HiSight 都还活着**，
+   紧接着日志里还有 `DMSDP media endpoint`、`HiSight: video socket connected`、`decoder output 800×480`。
+   也就是手机在认证完成、切到热点之后**正常释放了 RFCOMM**。
+3. 我们却在 `serve()` 的 finally 里对**任何** RFCOMM 通道关闭都调用 `scheduleReconnect`：
+   `releasing this round and waiting for the phone again in 1s` → `releaseChain` 关掉热点、三个 TCP 监听、
+   HiSight 会话 → 手机侧看到连接消失 → 重新连接 → 又从 `operationCode:1` BIND 开始，于是**再要一次密码**。
+4. 日志里第二轮确实是又一次 `PAKE_REQUEST` + `operationCode:1`，与推断一致。
+
+#### 参考实现的触发点（不是猜）
+
+`ReceiverEngine.requestReconnect` 只在四处被调用：监听注册失败、TCP 监听 I/O 错误、
+**DMSDP 控制连接（kind==2）结束**、**HiSight 会话结束**。
+`acceptProtocol`（FE35/FE36）的异常分支只记日志，**不重启整轮**——RFCOMM 被手机释放是预期行为。
+
+#### 改动
+
+- `HiCarController.serve()` 的 finally：**不再** `scheduleReconnect`。只记录
+  `HiCar control/business channel closed; the round stays up (DMSDP and video are independent of RFCOMM)`。
+  监听循环继续 accept，广播与热点保持，`Stop` 仍然完整释放。
+- `HiCarController.acceptLoop()` 的 `catch (IOException)`：补回参考的行为——**只有监听器本身失败**
+  才 `scheduleReconnect("the … listener closed")`。`Stop` 或上一次重启已经把 `generation` 加一，
+  所以不会误触发。
+
+#### 预期与判据
+
+首次连接输一次六位码；之后手机释放 RFCOMM 时画面不应中断，日志只多一行 `channel closed; the round stays up`。
+如果手机重新连上来，它应该带 `operationCode:2`（AUTHENTICATE）而不是 `1`（BIND），也就不再要密码。
+
+**尚未验证**：真车上的实际表现（本轮只做到 Kotlin 编译通过 + CI 构建）；以及手机在重连时是否真的改走
+AUTHENTICATE——这取决于手机侧的配对记录，只有上车才能确认。
+
+#### 顺带记录
+
+- GitHub Actions 第一次运行成功（run #1，4m42s），`hicar-debug-apk` 已上传（23.5 MB，
+  sha256 `218c19fc…e8689`），说明 CI 构建链路可用。
+- 车上 USB ADB 未识别：`adb devices` 为空。需要车机在开发者选项里打开 USB 调试并在弹窗里允许；
+  在此之前只能用 U 盘或车机自身的文件管理器安装 artifact。
