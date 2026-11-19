@@ -80,6 +80,17 @@ class HiChainNative private constructor() {
         @Synchronized
         external fun selfTest(): String?
 
+        /**
+         * Reports which long-term keys the store holds for one pairing, without changing anything.
+         *
+         * A bind hands the phone a public key; a later authenticate signs with whatever private
+         * key the store returns for the same alias. Printing both fingerprints says whether those
+         * two are the same key, which reading the code cannot establish.
+         */
+        @JvmStatic
+        @Synchronized
+        external fun probeKeyset(selfIdentity: String, peerIdentity: String): String?
+
         /** One engine step: what the engine wants sent, plus what it reported. */
         class Step(
             val code: Int,

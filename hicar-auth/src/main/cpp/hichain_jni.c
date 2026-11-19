@@ -33,6 +33,9 @@
 #include <android/log.h>
 
 #include "hichain.h"
+/* generate_service_id / generate_key_alias / export_lt_public_key: the probe below rebuilds the
+ * exact alias the engine derives, so it reports the key the engine would sign with. */
+#include "huks_adapter.h"
 /* The Ed25519 shim's entry points; see openssl_shim/ec_local.h and hicar_ed25519.c. */
 #include "ec_local.h"
 #include "hks_client.h"
@@ -634,11 +637,114 @@ Java_com_shilapi_xcertplay_hicarauth_HiChainNative_selfTest(JNIEnv *env, jclass 
     return (*env)->NewStringUTF(env, report);
 }
 
+/*
+ * Reports which long-term keys the store holds for one pairing, without changing anything.
+ *
+ * The engine derives every alias from (package name, service type, auth id, key type), so this
+ * rebuilds the same alias through the engine's own generate_service_id / generate_key_alias and
+ * exports whatever sits there. Two calls - one after a successful BIND, one on the phone's next
+ * AUTHENTICATE - settle a question code reading could not: whether the private key behind the
+ * public key handed to the phone is still the one being used to sign. Identical fingerprints mean
+ * the store is fine and the disagreement is in the signed payload; a changed or absent one means
+ * the engine is signing with a key the phone never saw.
+ *
+ * Returns null before the store is initialised or when an identity is unusable.
+ */
+static void probe_append(char *out, size_t capacity, size_t *used, const char *text)
+{
+    while (*text != '\0' && *used + 1 < capacity) {
+        out[(*used)++] = *text++;
+    }
+    out[*used] = '\0';
+}
+
+static void probe_append_hex(char *out, size_t capacity, size_t *used, const uint8_t *data,
+    uint32_t length)
+{
+    static const char digits[] = "0123456789abcdef";
+    for (uint32_t index = 0; index < length && *used + 2 < capacity; index++) {
+        out[(*used)++] = digits[data[index] >> 4];
+        out[(*used)++] = digits[data[index] & 0x0f];
+    }
+    out[*used] = '\0';
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_shilapi_xcertplay_hicarauth_HiChainNative_probeKeyset(JNIEnv *env, jclass clazz,
+    jstring self, jstring peer)
+{
+    (void)clazz;
+    if (g_root_fd < 0) {
+        return NULL;
+    }
+    struct session_identity identity;
+    memset(&identity, 0, sizeof(identity));
+    identity.package_name.length = (uint32_t)strlen(PACKAGE_NAME);
+    memcpy(identity.package_name.name, PACKAGE_NAME, identity.package_name.length);
+    identity.service_type.length = (uint32_t)strlen(SERVICE_TYPE);
+    memcpy(identity.service_type.type, SERVICE_TYPE, identity.service_type.length);
+
+    struct service_id service = generate_service_id(&identity);
+
+    struct hc_auth_id owner;
+    memset(&owner, 0, sizeof(owner));
+    owner.length = copy_string(env, self, owner.auth_id, MAX_ID_BYTES);
+    struct hc_auth_id remote;
+    memset(&remote, 0, sizeof(remote));
+    remote.length = copy_string(env, peer, remote.auth_id, MAX_ID_BYTES);
+    if (service.length == 0 || owner.length == 0 || remote.length == 0) {
+        return NULL;
+    }
+
+    char report[1024];
+    size_t used = 0;
+    report[0] = '\0';
+    probe_append(report, sizeof(report), &used, "service=");
+    probe_append_hex(report, sizeof(report), &used, service.service_id, service.length);
+    probe_append(report, sizeof(report), &used, " self=");
+    probe_append_hex(report, sizeof(report), &used, owner.auth_id, owner.length);
+
+    struct {
+        enum huks_key_alias_type type;
+        const char *name;
+        const struct hc_auth_id *who;
+        int show_public_key;
+    } entries[] = {
+        /* Without _SUPPORT_SEC_CLONE_ the engine signs with KEY_ALIAS_ACCESSOR_PK, so that alias is
+         * reported alongside the LT pair rather than instead of it: which one holds the key decides
+         * whether a rebuild of the alias is even looking in the right slot. */
+        { KEY_ALIAS_LT_KEY_PAIR, "self_lt", &owner, 1 },
+        { KEY_ALIAS_ACCESSOR_PK, "self_acc", &owner, 1 },
+        { KEY_ALIAS_KEK, "kek", &owner, 0 },
+        { KEY_ALIAS_DEK, "dek", &owner, 0 },
+        { KEY_ALIAS_ACCESSOR_PK, "peer_acc", &remote, 1 },
+    };
+    for (size_t index = 0; index < sizeof(entries) / sizeof(entries[0]); index++) {
+        struct hc_key_alias alias = generate_key_alias(&service, entries[index].who,
+            entries[index].type);
+        int32_t status = check_lt_public_key_exist(&alias);
+        probe_append(report, sizeof(report), &used, " ");
+        probe_append(report, sizeof(report), &used, entries[index].name);
+        probe_append(report, sizeof(report), &used, (status == 0) ? "=present" : "=absent");
+        if (status != 0 || !entries[index].show_public_key) {
+            continue;
+        }
+        struct ltpk public_key;
+        memset(&public_key, 0, sizeof(public_key));
+        if (export_lt_public_key(&alias, &public_key) == 0 && public_key.length > 0) {
+            probe_append(report, sizeof(report), &used, ":");
+            probe_append_hex(report, sizeof(report), &used, public_key.ltpk, public_key.length);
+        } else {
+            probe_append(report, sizeof(report), &used, ":export-failed");
+        }
+    }
+    return (*env)->NewStringUTF(env, report);
+}
+
 JNIEXPORT jlong JNICALL
 Java_com_shilapi_xcertplay_hicarauth_HiChainNative_create(JNIEnv *env, jclass clazz, jstring self,
     jstring peer, jstring pin, jint role)
-{
-    (void)clazz;
+{    (void)clazz;
     if (g_root_fd < 0 || (role != HC_CENTRE && role != HC_ACCESSORY)) {
         return 0;
     }

@@ -26,6 +26,22 @@ internal class HiChainAuthenticator(
     private var stepIndex = 0
     private var operationDone = false
     private var failed = false
+    private var peerIdentity: String? = null
+
+    /**
+     * Prints the long-term keys this pairing has in the store at one moment.
+     *
+     * The phone verifies our signature with the public key a bind gave it; an authenticate signs
+     * with whatever private key the store returns for the same alias. Calling this before a session,
+     * as soon as key agreement ends, and again at close puts both fingerprints in one log, so the
+     * next run answers "is it the same key?" with bytes instead of reasoning.
+     */
+    private fun probeKeyset(stage: String) {
+        val peer = peerIdentity ?: return
+        if (!HiChainNative.available || handle == 0L) return
+        val report = runCatching { HiChainNative.probeKeyset(localIdentity, peer) }.getOrNull() ?: return
+        onLog("HiChain key store [$stage]: $report")
+    }
 
     override var sessionKey: ByteArray? = null
         private set
@@ -54,10 +70,14 @@ internal class HiChainAuthenticator(
         if (handle == 0L) {
             throw HiCarAuthException(HiCarAuthBlocker.NATIVE_HICHAIN_LIBRARY_MISSING)
         }
+        this.peerIdentity = peerIdentity
         started = true
         stepIndex = 0
         operationDone = false
         failed = false
+        // Whatever the previous run left behind: absent means a first bind, present means the phone
+        // is expected to authenticate against this key.
+        probeKeyset("session start")
         // The code the engine will authenticate with, masked. A run where this does not match the
         // code on the screen has one obvious explanation, and the log should be able to show it
         // without anyone having to reproduce the screen.
@@ -119,6 +139,9 @@ internal class HiChainAuthenticator(
             }
             sessionKey = key
             onLog("HiChain step $stepIndex finished: ${key.size}-byte session key")
+            // For a bind this is the moment the public half has already gone to the phone, so this
+            // fingerprint is exactly what the phone should remember as ours.
+            probeKeyset("key agreement end")
         }
         if (step.completed) {
             // The bind exchange has been parsed and answered at this point. This, not the key, is
@@ -149,6 +172,9 @@ internal class HiChainAuthenticator(
     }
 
     override fun close() {
+        // Last look before the store is released: a key that changed during an authenticate was
+        // regenerated instead of reloaded, which is precisely what the phone's verify failure means.
+        probeKeyset("session close")
         // An exchange that ran steps and ended without a key can mean two very different things: the
         // phone rejected the code, or the engine finished a phase we did not recognise as the end.
         // The earlier wording asserted the first, and the run at 21:43 showed the second, so this
