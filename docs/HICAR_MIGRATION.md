@@ -2338,3 +2338,52 @@ HiChain second connection: authenticate start=0 car=…/key…/err0 phone=…/ke
 
 判断标准：`authenticate` 一行里，两侧都拿到 32 字节密钥 = 通过；`phone` 侧 err≠0 = 手机
 （这里由对应引擎扮演）拒绝了我们的证明；`car` 侧 err≠0 = 我们没接住请求。
+
+### 7.45 二次认证失败的真正原因：手机的身份被我们多解码了一层
+
+#### 证据来源
+
+自检里的复现台（见 7.44）先给出方向：用原厂 SDK 当手机、我们的引擎当车机，
+`authenticate` 两侧都得到 32 字节密钥、零错误；`ours->ours` 反而失败。**服务端不拒绝正确请求。**
+
+然后把真实手机发来的报文整段打印出来（`HiCar: the authenticate request as given to the engine`），
+与同一日志里原厂客户端发出的报文逐字段对照：
+
+| 字段 | 原厂客户端（与我们通过） | Mate 80 Pro Max（失败） |
+|---|---|---|
+| `peerAuthId` | 26 字符 → 解码 13 字节 | **128 字符 → 解码 64 字节** |
+| `keyLength` | `"32"` | `16` |
+| `serviceType` | `CarDevice`（hex） | `SFXTEST`（hex） |
+| `peerUserType` | `"1"` | `1` |
+
+`peerAuthId` 解码后是 `01CF830A…017E`，**正是手机在 HIPROTO 里上报的那 64 个字符本身**。
+也就是说手机把自己的 id 当作「那 64 个字符」这 64 个字节，`peerAuthId` 是它的再一层十六进制。
+
+#### 根因
+
+我们对着同一个字符串**又解码了一次**，得到 32 字节，于是：
+
+```
+我们的待签名数据 = 32(epk) + 8(本机id) + 32(手机epk) + 32(手机id) = 104 字节
+手机重建的数据   = 32        + 8          + 32          + 64        = 136 字节
+```
+
+两者长度都不同，签名必然验不过，手机报 `HC_VERIFY_PROOF_FAILED`（17）——与"密钥不对"是同一个错误码，
+这也是它长期伪装成密钥库问题的原因。
+
+顺带排除一项：手机要求 `keyLength:16`，而引擎的 `STS_SESSION_KEY_LENGTH` 正好是 16（`sts_server.h:35`），
+长度本身一致，不是问题。
+
+#### 修复
+
+`HiChainAuthenticator.begin` 里，手机身份改为**原样取字节**（不再 hex 解码）：
+
+- 本机身份仍是 hex 解码（8 字节）——这是手机在绑定阶段收到的 `authId` 的同一表示，已被手机接受过；
+- 手机身份 = `peerIdentity` 的 ASCII 字节（64 字节），与 `peerAuthId` 解码结果完全一致。
+
+#### 代价
+
+车机记录对方公钥所用的别名由 32 字节身份派生，改为 64 字节后旧记录对不上，
+因此**这一版需要再配对一次**（清手机 HiCar 数据 → 车机开始 → 输连接码）。之后换包不再需要。
+
+判据：日志里 `HiChain begin` 一行应显示 `(ids: this car 8 bytes, the phone 64 bytes)`。

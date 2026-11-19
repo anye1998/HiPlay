@@ -2,6 +2,7 @@ package com.shilapi.xcertplay.hicar
 
 import com.shilapi.xcertplay.hicarauth.HiChainNative
 import java.io.File
+import java.nio.charset.StandardCharsets
 import java.util.Arrays
 
 /**
@@ -70,8 +71,15 @@ internal class HiChainAuthenticator(
         // The engine signs raw bytes; the hex the wire carries is only a transport encoding.
         val localAuthId = authIdBytes(localIdentity)
             ?: throw HiCarWireException("this car's identity '$localIdentity' is not an even-length hex id")
-        val remoteAuthId = authIdBytes(peerIdentity)
-            ?: throw HiCarWireException("the phone's identity '$peerIdentity' is not an even-length hex id")
+        // The phone's id is not encoded twice. It reports a 64-character deviceId and signs over
+        // those 64 characters verbatim: its authenticate request carries peerAuthId as 128 hex
+        // characters, which decode to exactly this string and not to the 32 bytes it spells out.
+        // Decoding it here made the car sign 104 bytes where the phone rebuilds 136, and the phone
+        // reported that as HC_VERIFY_PROOF_FAILED - the same code a wrong key produces.
+        val remoteAuthId = peerIdentity.toByteArray(StandardCharsets.UTF_8)
+        if (remoteAuthId.isEmpty() || remoteAuthId.size > MAX_AUTH_ID_BYTES) {
+            throw HiCarWireException("the phone's identity '${peerIdentity.take(8)}…' does not fit an auth id")
+        }
         handle = HiChainNative.create(localAuthId, remoteAuthId, pin, ROLE_ACCESSORY)
         if (handle == 0L) {
             throw HiCarAuthException(HiCarAuthBlocker.NATIVE_HICHAIN_LIBRARY_MISSING)
@@ -214,6 +222,9 @@ internal class HiChainAuthenticator(
 
     private companion object {
         const val ROLE_ACCESSORY = 2
+
+        /** The engine's own buffer size for an auth id (HC_AUTH_ID_BUFF_LEN on the native side). */
+        const val MAX_AUTH_ID_BYTES = 64
         val PIN_PATTERN = Regex("[0-9]{6}")
 
         /** The inform message carries its error as a bare int32 payload. */
