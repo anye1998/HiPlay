@@ -256,7 +256,17 @@ internal class HiCarDmsdpEndpoints(
                     input.read(buffer)
                 } catch (timeout: SocketTimeoutException) {
                     val now = System.nanoTime()
-                    if (now - lastPeer > IDLE_TIMEOUT_NANOS) throw HiCarWireException("DMSDP idle timeout")
+                    // Only an unnegotiated channel may be reclaimed for silence. Once the phone has
+                    // switched to AES-CTR the control channel is idle by design while it streams
+                    // video: on 2026-11-19 10:15:17 this check closed a working session 30 s after
+                    // the last control message, the phone reconnected at once, our fresh session had
+                    // `negotiated = false`, so the phone's already-encrypted records looked like
+                    // "early encryption", the channel was refused again and the phone tore the whole
+                    // projection down. Clamping the timeout to the pre-negotiation phase keeps the
+                    // guard against a silent peer without ever cutting a live session.
+                    if (!session.negotiated && now - lastPeer > IDLE_TIMEOUT_NANOS) {
+                        throw HiCarWireException("DMSDP idle timeout before negotiation")
+                    }
                     if (session.negotiated && now - lastHeartbeat > HEARTBEAT_PERIOD_NANOS) {
                         session.heartbeat()?.let {
                             output.write(it)
