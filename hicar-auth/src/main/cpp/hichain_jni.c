@@ -641,6 +641,38 @@ Java_com_shilapi_xcertplay_hicarauth_HiChainNative_selfTest(JNIEnv *env, jclass 
     ST_LINE(status == HKS_SUCCESS, "hks_delete_key (self): status=%d (%s)", status,
         hks_status_name(status));
 
+    /*
+     * The STS (authenticate) round derives its session key from an X25519 agreement between a
+     * freshly generated pair and the peer's ephemeral key. Nothing in a bind touches that path, so
+     * a fault here only appears on the second connection — and it appears as a proof the phone
+     * cannot verify, because its session key differs from ours and the signature it decrypts is
+     * garbage. Generating two pairs and agreeing in both directions is the only check that does not
+     * need the phone.
+     */
+    {
+        struct st_key_pair alice;
+        struct st_key_pair bob;
+        int32_t generated_a = generate_st_key_pair(&alice);
+        int32_t generated_b = generate_st_key_pair(&bob);
+        ST_LINE(generated_a == HC_OK && generated_b == HC_OK,
+            "X25519 temporary pairs generated: a=%d b=%d", generated_a, generated_b);
+        if (generated_a == HC_OK && generated_b == HC_OK) {
+            struct sts_shared_secret from_alice;
+            struct sts_shared_secret from_bob;
+            int32_t agree_a = compute_sts_shared_secret(&alice.st_private_key, &bob.st_public_key,
+                &from_alice);
+            int32_t agree_b = compute_sts_shared_secret(&bob.st_private_key, &alice.st_public_key,
+                &from_bob);
+            int agreed = agree_a == HC_OK && agree_b == HC_OK && from_alice.length > 0 &&
+                from_alice.length == from_bob.length &&
+                memcmp(from_alice.sts_shared_secret, from_bob.sts_shared_secret,
+                    from_alice.length) == 0;
+            ST_LINE(agree_a == HC_OK, "agreement a-private/b-public: %d", agree_a);
+            ST_LINE(agree_b == HC_OK, "agreement b-private/a-public: %d", agree_b);
+            ST_LINE(agreed, "both directions reach the same shared secret: %s", agreed ? "yes" : "no");
+        }
+    }
+
     #undef ST_LINE
     #undef ST_SKIP
 

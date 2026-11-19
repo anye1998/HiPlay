@@ -2246,3 +2246,60 @@ AUTHENTICATE——这取决于手机侧的配对记录，只有上车才能确�
   sha256 `218c19fc…e8689`），说明 CI 构建链路可用。
 - 车上 USB ADB 未识别：`adb devices` 为空。需要车机在开发者选项里打开 USB 调试并在弹窗里允许；
   在此之前只能用 U 盘或车机自身的文件管理器安装 artifact。
+
+### 7.43 第二次连接必然失败的真因：auth id 被当成十六进制文本签名
+
+#### 现象
+
+一次绑定（BIND，`operationCode:1`）成功，画面出来；手机随后自己断开重连时改走
+`operationCode:2`（AUTHENTICATE），车机发出签名，手机立刻回
+`errorCode:17 HC_VERIFY_PROOF_FAILED`，重试四五次全部一样。清手机记录后重来，仍然是
+"BIND 成功 → AUTH 失败"。
+
+#### 排查顺序（每一步都排除了一个猜测）
+
+1. **密钥有没有存**：在 JNI 里加 `probeKeyset`，用引擎自己的 `generate_service_id` /
+   `generate_key_alias` 重建别名，再 `export_lt_public_key` 导出公钥。四个时机各打一次
+   （会话开始、密钥协商结束、操作完成、会话关闭），公钥始终是
+   `23EE979D…7383`，`self_lt=absent`、`self_acc=present`，**密钥全程没变**。
+2. **绑定发给手机的是不是同一把**：引擎补丁把 BIND 的 `auth_info` 打出来，内容为
+   `{"authId":"37646638363631303936386532643563","authPk":"23EE979D…7383"}`，
+   与库里导出的完全一致。
+3. **签名本身对不对**：同一补丁在 STS 里用库里的公钥自验我们刚生成的签名，
+   `self-check = 0`（通过）。所以签名算法、密钥对、HUKS 都没有问题。
+
+#### 根因
+
+把 STS 的待签名数据（`sts sign source`）打出来，长度是 **144 字节**：
+
+| 段 | 长度 | 内容 |
+|---|---|---|
+| self epk | 32 | 我们的临时公钥 |
+| self id | 16 | ASCII `7df86610968e2d5c` |
+| peer epk | 32 | 手机的临时公钥 |
+| peer id | **64** | ASCII `1CF830AF5F158379C72FE80E2C0A4007E84FB547B6B38F7D5B628E158A017E` |
+
+手机上报的 `deviceId` 是 **64 个字符的十六进制**，代表 **32 字节**的二进制 auth id。
+我们把这 64 个字符本身当成了 id 交给引擎，于是签名覆盖了 64 字节；手机用真实的 32 字节
+重建同一段拼接，得到 104 字节，验签自然对不上。
+
+为什么 BIND 能过：绑定的签名对象是 **JSON 文本** `{"authId":"…","authPk":"…"}`，id 在里面是
+字符串，两边看到的一致；只有二次认证才把它当作裸字节拼接。
+
+#### 修复
+
+- `HiChainNative.create` / `probeKeyset` 的身份参数由 `String` 改为 `ByteArray`，
+  JNI 侧新增 `copy_bytes`（顺带避免 id 里的 `0x00` 被字符串语义截断）。
+- 新增 `authIdBytes(identity)`：偶数长度十六进制才解码，否则返回 null 让调用方拒绝对接，
+  而不是拿一个被截断的身份去配对。
+- 本机身份 16 字符 → 8 字节，手机身份 64 字符 → 32 字节，拼接恢复成
+  `32 + 8 + 32 + 32 = 104` 字节。
+
+#### 代价与判据
+
+本机 auth id 的**字节**变了（16 字节 ASCII → 8 字节二进制），手机上针对这台车的旧记录
+不再匹配，**必须再配对一次**：清手机 HiCar 数据 → 车机开始 → 输屏幕上的六位码。
+
+修复后的判据：日志里 `HiChain begin` 一行会出现
+`(ids: this car 8 bytes, the phone 32 bytes)`，`sts sign source` 变成 **104 字节**，
+并且手机不再回 `errorCode:17`，而是继续走 Wi-Fi 协商与 DMSDP。
