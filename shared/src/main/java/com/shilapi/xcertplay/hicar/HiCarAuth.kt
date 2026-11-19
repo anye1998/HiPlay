@@ -284,6 +284,11 @@ internal class HiCarIdentityExchange(
                         if (requested != 16 && requested != 32) throw HiCarWireException("key length")
                         keyLength = requested
                     }
+                    // The whole request, because a second connection that fails on the phone's side
+                    // is a disagreement about exactly these fields - and ours now succeeds against
+                    // the vendor SDK's client, which makes the difference a property of this phone's
+                    // message rather than of our engine.
+                    onLog("HiCar: the authenticate request as given to the engine: $engineText")
                 }
                 val packets = engine.step(engineText.toByteArray(StandardCharsets.UTF_8), keyLength)
                 // The phone's own message number names the phase (17 announces the key length, 3 is
