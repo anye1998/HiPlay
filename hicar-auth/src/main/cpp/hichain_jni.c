@@ -1160,8 +1160,31 @@ static uint32_t normalize_numeric_fields(const uint8_t *in, uint32_t length, uin
 }
 
 /* Hands the packets one side produced to the other, until both queues drain. */
+/* Appends the authenticate response a car sent, because its field set is what a failing phone
+ * judges. Compared between an engine that works and one that does not, a missing or different
+ * field is visible directly instead of being inferred from the peer's error code. */
+static void capture_response(const uint8_t *packet, uint32_t length, char *report, size_t capacity,
+    size_t *used)
+{
+    static const char MARKER[] = "\"message\":32785";
+    if (length < sizeof(MARKER) || memmem(packet, length, MARKER, sizeof(MARKER) - 1) == NULL) {
+        return;
+    }
+    uint32_t limit = (length > 1400) ? 1400 : length;
+    probe_append(report, capacity, used, "\n response: ");
+    size_t room = capacity - *used - 1;
+    if (room > limit) {
+        room = limit;
+    }
+    memcpy(report + *used, packet, room);
+    *used += room;
+    report[*used] = '\0';
+}
+
+/* Hands the packets one side produced to the other, until both queues drain. */
 static void session_exchange(const struct engine_ops *car_ops, struct session *car,
-    const struct engine_ops *phone_ops, struct session *phone)
+    const struct engine_ops *phone_ops, struct session *phone, char *report, size_t capacity,
+    size_t *used)
 {
     uint8_t *scratch = malloc(MAX_PACKET_BYTES);
     if (scratch == NULL) {
@@ -1190,6 +1213,7 @@ static void session_exchange(const struct engine_ops *car_ops, struct session *c
                 length = car->lengths[index];
                 memcpy(scratch, car->packets[index], length);
             }
+            capture_response(scratch, length, report, capacity, used);
             struct uint8_buff buffer = { scratch, length, length };
             (void)phone_ops->receive_data(phone->handle, &buffer);
             free(car->packets[index]);
@@ -1206,22 +1230,22 @@ static void session_exchange(const struct engine_ops *car_ops, struct session *c
 
 /*
  * Binds, then connects a second time the way a phone that already trusts this car does: a fresh
- * centre instance and an authenticate instead of a pair. The car is always this module's engine,
- * because that is the side being diagnosed; only the phone's engine varies.
+ * centre instance and an authenticate instead of a pair. Either half can be the vendor engine, so
+ * the same exchange can be run with each of them doing the car's part.
  */
-static void run_connection(const struct engine_ops *phone_ops, const uint8_t *car_id,
-    uint32_t car_len, const uint8_t *phone_id, uint32_t phone_len, const char *pin, char *report,
-    size_t capacity, size_t *used)
+static void run_connection(const struct engine_ops *car_ops, const struct engine_ops *phone_ops,
+    const uint8_t *car_id, uint32_t car_len, const uint8_t *phone_id, uint32_t phone_len,
+    const char *pin, char *report, size_t capacity, size_t *used)
 {
     struct session *car = session_build(car_id, car_len, phone_id, phone_len, pin, HC_ACCESSORY);
     struct session *phone = session_build(phone_id, phone_len, car_id, car_len, pin, HC_CENTRE);
     if (car == NULL || phone == NULL) {
         probe_append(report, capacity, used, "out of memory");
-        session_release(car, &g_ours);
+        session_release(car, car_ops);
         session_release(phone, phone_ops);
         return;
     }
-    car->handle = g_ours.get_instance(&car->identity, HC_ACCESSORY, &car->callbacks);
+    car->handle = car_ops->get_instance(&car->identity, HC_ACCESSORY, &car->callbacks);
     phone->handle = phone_ops->get_instance(&phone->identity, HC_CENTRE, &phone->callbacks);
     if (car->handle == NULL || phone->handle == NULL) {
         probe_append(report, capacity, used, "either side failed to start");
@@ -1229,7 +1253,7 @@ static void run_connection(const struct engine_ops *phone_ops, const uint8_t *ca
     }
 
     (void)phone_ops->start_pake(phone->handle, &phone->params);
-    session_exchange(&g_ours, car, phone_ops, phone);
+    session_exchange(car_ops, car, phone_ops, phone, report, capacity, used);
     probe_append(report, capacity, used, " bind car=");
     probe_append_int(report, capacity, used, car->result);
     probe_append(report, capacity, used, "/key");
@@ -1237,8 +1261,6 @@ static void run_connection(const struct engine_ops *phone_ops, const uint8_t *ca
     probe_append(report, capacity, used, " phone=");
     probe_append_int(report, capacity, used, phone->result);
 
-    /* Only the centre is rebuilt. The car keeps the trust entry a bind just wrote, which is what
-     * a phone dialling again looks like from this side. */
     session_release(phone, phone_ops);
     phone = session_build(phone_id, phone_len, car_id, car_len, pin, HC_CENTRE);
     if (phone == NULL) {
@@ -1250,20 +1272,20 @@ static void run_connection(const struct engine_ops *phone_ops, const uint8_t *ca
      * its predecessor ended in the key-agreement state, where an authenticate request is refused
      * as out of order ("Check hichain state failed, state is 3, message nav is 2-1-1"). Only the
      * trust entry lives on, in the key store. */
-    session_release(car, &g_ours);
+    session_release(car, car_ops);
     car = session_build(car_id, car_len, phone_id, phone_len, pin, HC_ACCESSORY);
     if (car == NULL) {
         probe_append(report, capacity, used, "; the car side did not start again");
         goto done;
     }
-    car->handle = g_ours.get_instance(&car->identity, HC_ACCESSORY, &car->callbacks);
+    car->handle = car_ops->get_instance(&car->identity, HC_ACCESSORY, &car->callbacks);
     phone->handle = phone_ops->get_instance(&phone->identity, HC_CENTRE, &phone->callbacks);
     if (car->handle == NULL || phone->handle == NULL) {
         probe_append(report, capacity, used, "; a fresh instance failed to start");
         goto done;
     }
     int32_t started = phone_ops->authenticate_peer(phone->handle, &phone->params);
-    session_exchange(&g_ours, car, phone_ops, phone);
+    session_exchange(car_ops, car, phone_ops, phone, report, capacity, used);
     probe_append(report, capacity, used, "\n authenticate start=");
     probe_append_int(report, capacity, used, started);
     probe_append(report, capacity, used, " car=");
@@ -1287,7 +1309,7 @@ done:
         info.auth_id.length = phone_len;
         memcpy(info.auth_id.auth_id, phone_id, phone_len);
         info.user_type = HC_USER_TYPE_CONTROLLER;
-        (void)delete_local_auth_info(car->handle, &info);
+        (void)car_ops->delete_local_auth_info(car->handle, &info);
     }
     if (phone != NULL && phone->handle != NULL) {
         struct hc_user_info info;
@@ -1297,21 +1319,18 @@ done:
         info.user_type = HC_USER_TYPE_ACCESSORY;
         (void)phone_ops->delete_local_auth_info(phone->handle, &info);
     }
-    session_release(car, &g_ours);
+    session_release(car, car_ops);
     session_release(phone, phone_ops);
 }
 
 /*
- * Reproduces a second connection without a phone.
+ * Reproduces a second connection without a phone, and prints the response each engine sends.
  *
  * A car's second connection is the one thing that cannot be exercised from this side alone: a
  * centre has to start it. This module's engine implements authenticate_peer, so the phone's role
- * can be played in this process, and the whole exchange becomes observable. The vendor SDK is run
- * as a second phone when the firmware has it, which tells apart "our engine refuses a correct
- * request" from "the vendor engine refuses ours".
- *
- * Needs no directory when only this module's engine is used; [directory] is where the firmware's
- * SDK was extracted to, and a null one skips that half.
+ * can be played in this process. The firmware's SDK is then run in each role in turn - as the
+ * phone, to show whether this car answers a foreign client correctly, and as the car, to show what
+ * a correct response to the same request looks like.
  */
 JNIEXPORT jstring JNICALL
 Java_com_shilapi_xcertplay_hicarauth_HiChainNative_probeVendorAuthenticate(JNIEnv *env, jclass clazz,
@@ -1326,7 +1345,7 @@ Java_com_shilapi_xcertplay_hicarauth_HiChainNative_probeVendorAuthenticate(JNIEn
         return NULL;
     }
 
-    char report[2048];
+    char report[8192];
     size_t used = 0;
     report[0] = '\0';
 
@@ -1344,8 +1363,8 @@ Java_com_shilapi_xcertplay_hicarauth_HiChainNative_probeVendorAuthenticate(JNIEn
     (*env)->GetByteArrayRegion(env, phone_id, 0, phone_len, (jbyte *)phone_auth);
 
     probe_append(report, sizeof(report), &used, "ours->ours:");
-    run_connection(&g_ours, car_auth, (uint32_t)car_len, phone_auth, (uint32_t)phone_len, code,
-        report, sizeof(report), &used);
+    run_connection(&g_ours, &g_ours, car_auth, (uint32_t)car_len, phone_auth, (uint32_t)phone_len,
+        code, report, sizeof(report), &used);
 
     if (directory != NULL) {
         const char *dir = (*env)->GetStringUTFChars(env, directory, NULL);
@@ -1355,11 +1374,16 @@ Java_com_shilapi_xcertplay_hicarauth_HiChainNative_probeVendorAuthenticate(JNIEn
                     g_vendor.authenticate_peer, g_vendor.receive_data,
                     g_vendor.delete_local_auth_info, g_vendor.destroy };
                 probe_append(report, sizeof(report), &used, "\nvendor->ours:");
-                run_connection(&vendor, car_auth, (uint32_t)car_len, phone_auth,
+                run_connection(&g_ours, &vendor, car_auth, (uint32_t)car_len, phone_auth,
+                    (uint32_t)phone_len, code, report, sizeof(report), &used);
+                /* The same request, answered by Huawei's engine: whatever its response contains
+                 * that ours does not is the difference a phone can act on. */
+                probe_append(report, sizeof(report), &used, "\nours->vendor:");
+                run_connection(&vendor, &g_ours, car_auth, (uint32_t)car_len, phone_auth,
                     (uint32_t)phone_len, code, report, sizeof(report), &used);
             } else {
                 probe_append(report, sizeof(report), &used,
-                    "\nvendor->ours: the firmware SDK did not start");
+                    "\nvendor: the firmware SDK did not start");
             }
             (*env)->ReleaseStringUTFChars(env, directory, dir);
         }
