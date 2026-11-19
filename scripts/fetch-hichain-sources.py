@@ -150,6 +150,12 @@ def apply_patches() -> None:
         if not path.is_file():
             raise SystemExit(f"patch target missing: {relative}")
         text = path.read_text(encoding="utf-8")
+        # The CI caches this tree between runs, so a patch is often already in place. Recognising
+        # that is not optional: applying it a second time would define the helpers twice and the
+        # native build would fail on a duplicate symbol rather than on anything real.
+        if new in text:
+            print(f"{relative} already patched")
+            continue
         matches = text.count(old)
         if matches != 1:
             raise SystemExit(f"patch for {relative} matched {matches} times, expected exactly 1")
@@ -274,6 +280,12 @@ def verify() -> int:
             problems.append(f"{name}: not fetched")
         elif marker.read_text().strip() != digest:
             problems.append(f"{name}: marker is not the pinned archive")
+    for relative, _, new in PATCHES:
+        path = TARGET / relative
+        if not path.is_file():
+            problems.append(f"{relative}: missing")
+        elif new not in path.read_text(encoding="utf-8"):
+            problems.append(f"{relative}: patch not applied")
     for problem in problems:
         print(problem, file=sys.stderr)
     print("HiChain sources: " + ("ok" if not problems else f"{len(problems)} problem(s)"))
