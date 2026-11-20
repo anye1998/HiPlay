@@ -202,20 +202,29 @@ class HiCarController(
         }
         val abi = Build.SUPPORTED_ABIS.firstOrNull() ?: "arm64-v8a"
         val vendor = File(appContext.filesDir, "vendor-$abi").takeIf { it.isDirectory }
-        val report = runCatching {
-            HiChainNative.probeVendorAuthenticate(
-                vendor?.absolutePath,
-                CAR_ID.toByteArray(),
-                PHONE_ID.toByteArray(),
-                config.pin,
-            )
-        }.getOrNull()
-        if (report == null) {
-            onLog("HiChain second connection: the harness returned no report")
-            return
-        }
-        report.lineSequence().filter { it.isNotBlank() }.forEach { line ->
-            onLog("HiChain second connection:$line")
+        // Two identity shapes: this test's own short ids, and the phone's, whose auth id is the
+        // 64 characters of its deviceId. Everything else about the request is the same, so a
+        // difference between the two runs is a difference the id length causes.
+        val shapes = listOf(
+            "short ids" to (CAR_ID.toByteArray() to PHONE_ID.toByteArray()),
+            "phone-shaped" to ("car-test".toByteArray() to PHONE_SHAPED_ID.toByteArray()),
+        )
+        for ((label, ids) in shapes) {
+            val report = runCatching {
+                HiChainNative.probeVendorAuthenticate(
+                    vendor?.absolutePath,
+                    ids.first,
+                    ids.second,
+                    config.pin,
+                )
+            }.getOrNull()
+            if (report == null) {
+                onLog("HiChain second connection [$label]: the harness returned no report")
+                continue
+            }
+            report.lineSequence().filter { it.isNotBlank() }.forEach { line ->
+                onLog("HiChain second connection [$label]:$line")
+            }
         }
     }
 
@@ -1243,6 +1252,13 @@ class HiCarController(
         /** The loopback's identities: distinct from anything a phone would present. */
         const val CAR_ID = "selftest-car"
         const val PHONE_ID = "selftest-phone"
+
+        /**
+         * A stand-in with the shape of a real phone's id: HiCar reports a 64-character deviceId and
+         * signs over those very characters, so the length is what a mismatch would expose. Synthetic
+         * on purpose - binding a real phone's id here would put a trust entry in this car's store.
+         */
+        const val PHONE_SHAPED_ID = "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF"
         const val KEY_BYTES = 32
 
         /** Generous: a bind is a handful of messages, so exceeding this means it is looping. */
