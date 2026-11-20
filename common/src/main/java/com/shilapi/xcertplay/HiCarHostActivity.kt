@@ -12,10 +12,12 @@ import android.os.Build
 import android.os.Bundle
 import android.graphics.SurfaceTexture
 import android.provider.Settings
+import android.util.DisplayMetrics
 import android.util.Log
 import android.view.MotionEvent
 import android.view.TextureView
 import android.view.View
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -548,19 +550,42 @@ class HiCarHostActivity : ComponentActivity() {
             return
         }
         controller = next
-        // Ask for the sharpest geometry this screen can actually show; the phone may answer with a
+        // Ask for the sharpest geometry this panel can actually show; the phone may answer with a
         // different one, and the window ratio follows whatever it really sends.
-        val screen = resources.displayMetrics
-        val requested = HiCarDisplaySize.best(screen.widthPixels, screen.heightPixels)
+        val screen = realScreenPixels()
+        val requested = HiCarDisplaySize.best(screen[0], screen[1])
         next.setDisplaySize(requested)
         videoAspect = requested.aspect
+        val window = resources.displayMetrics
         appendLog(
             "display: offering ${requested.width}×${requested.height} at " +
-                "${HiCarDisplaySize.densityFor(requested.width)} dpi to the phone",
+                "${HiCarDisplaySize.densityFor(requested.width)} dpi " +
+                "(panel ${screen[0]}×${screen[1]}, window ${window.widthPixels}×${window.heightPixels})",
         )
         next.start()
         // The view already exists on this screen; attach it so the first frame has somewhere to go.
         attachVideo()
+    }
+
+    /**
+     * The panel's real pixels, not the window's.
+     *
+     * On this head unit the activity is laid out on a smaller logical canvas than the panel - 1600×900
+     * for a 1920×1080 screen, a 1.2 compatibility scale - so `resources.displayMetrics` answers with
+     * the canvas and asking the phone for that size would throw away a fifth of the panel. The
+     * density is scaled with the width, so the phone's dp geometry is unchanged either way: only the
+     * number of pixels behind each dp differs, which is exactly the sharpness being asked for.
+     */
+    private fun realScreenPixels(): IntArray {
+        val metrics = DisplayMetrics()
+        val manager = getSystemService(WINDOW_SERVICE) as? WindowManager
+        @Suppress("DEPRECATION")
+        manager?.defaultDisplay?.getRealMetrics(metrics)
+        if (metrics.widthPixels > 0 && metrics.heightPixels > 0) {
+            return intArrayOf(metrics.widthPixels, metrics.heightPixels)
+        }
+        val fallback = resources.displayMetrics
+        return intArrayOf(fallback.widthPixels, fallback.heightPixels)
     }
 
     /**
