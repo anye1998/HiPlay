@@ -149,6 +149,19 @@ class HiCarController(
     @Volatile private var microphoneReady = false
     @Volatile private var microphoneWanted = false
 
+    /** The speaker of the current session; kept here so navigation focus can move its route. */
+    private var speaker: HiCarAudioSink? = null
+
+    /**
+     * The head unit's navigation stream type.
+     *
+     * This unit gives guidance its own channel - 14 - so a prompt is not attenuated with the music
+     * it plays over. It is a vendor number the platform does not know, which is why it goes through
+     * the legacy track constructor; a ROM that refuses it says so once and keeps the media route.
+     */
+    private val navigationStreamType: Int
+        get() = HiCarDebug.number(PROP_NAV_STREAM, DEFAULT_NAV_STREAM)
+
     /**
      * A copy of the authenticated session key, for the TCP side.
      *
@@ -769,6 +782,7 @@ class HiCarController(
             speakerReady = { audioReady },
             microphoneReady = { microphoneReady },
             onMediaEndpoint = { port -> startHiSight(port) },
+            onNavFocus = { active -> routeNavigation(active) },
         )
         val endpoints = HiCarDmsdpEndpoints(
             offer = offer,
@@ -819,6 +833,7 @@ class HiCarController(
                 )
                 receiver = created
                 handlers.add(HiCarSpeakerControl(created, onLog))
+                speaker = sink
                 audioReady = true
             } catch (failure: IOException) {
                 sink.close()
@@ -858,10 +873,24 @@ class HiCarController(
             override fun close() {
                 audioReady = false
                 microphoneReady = false
+                if (speaker === sink) speaker = null
                 runCatching { audio?.close() }
                 runCatching { mic?.close() }
             }
         }
+    }
+
+    /**
+     * Sends the speaker to the navigation channel while guidance is talking, and back afterwards.
+     *
+     * The phone mixes guidance and music into one stream, so this is a routing decision made on the
+     * only signal the phone gives: navigation focus. While it holds, the car plays the sound on its
+     * navigation channel - the same one its own satnav uses - so a prompt is not attenuated with the
+     * music it interrupts. Zero puts the track back on the usage-based media route.
+     */
+    private fun routeNavigation(active: Boolean) {
+        val sink = speaker ?: return
+        sink.setStreamType(if (active) navigationStreamType else 0)
     }
 
     /**
@@ -1277,6 +1306,10 @@ class HiCarController(
         const val KIND_NETWORK_COMMAND = 33
         const val PREFERENCES = "hicar-receiver"
         const val KEY_SEQUENCE = "discovery_sequence"
+
+        /** Where this head unit's navigation channel lives; `setprop debug.hicar.navstream` overrides. */
+        const val PROP_NAV_STREAM = "debug.hicar.navstream"
+        const val DEFAULT_NAV_STREAM = 14
 
         /** Roles and user types from the engine's own header; the car is always the accessory. */
         const val ROLE_CENTRE = 1

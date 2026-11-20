@@ -170,6 +170,10 @@ internal class HiCarSpeakerControl(
             // Names only. A field this code does not read is exactly what would carry an audio
             // purpose, and it cannot be discovered from a filtered view of the message.
             onLog("speaker: request ${startLine.substringBefore(' ')} headers=[${headers.keys.sorted().joinToString(",")}]")
+            // `audioparameter` is the only header whose value this code parses at all, and it is
+            // also the only place a per-session stream type could hide. Printing it costs one line
+            // and removes the need to guess whether the phone ever re-declares the audio purpose.
+            headers["audioparameter"]?.let { onLog("speaker: audioparameter=$it") }
         }
         if (headers["serviceid"] != SERVICE_ID) return null
         val cseq = headers["cseq"]

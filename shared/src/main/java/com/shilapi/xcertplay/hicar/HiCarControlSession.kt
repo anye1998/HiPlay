@@ -154,9 +154,10 @@ internal class HiCarControlSession(
         events.onLog("DMSDP application frame: module $module, type $type, ${body.size} bytes")
         // Payloads are shown only when a test explicitly asks for them: the point is to find out
         // whether the phone signals an audio-purpose change at all, and that cannot be answered from
-        // a byte count.
+        // a byte count. JSON is printed as text in full - the device-info frame is where a phone
+        // states its own versions and capabilities, and a truncated hex view of it is useless.
         if (HiCarDebug.enabled("debug.hicar.frames")) {
-            events.onLog("DMSDP application frame body: module $module type $type ${HiCarDebug.hex(body)}")
+            events.onLog("DMSDP application frame body: module $module type $type ${HiCarDebug.body(body)}")
         }
         val answers = try {
             events.onApplicationService(module, type, body)

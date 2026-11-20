@@ -50,6 +50,9 @@ internal object HiCarCodes {
     const val DMSDP_MODULE_DEVICE = 3
     const val DMSDP_MODULE_MEDIA = 5
 
+    /** Entry-module frame: `{"navFocus":"HICAR"|"HICAR_STOP","navPackageName":"…"}`. */
+    const val DMSDP_TYPE_NAV_FOCUS = 503L
+
     /** The device module always addresses the wildcard type. */
     const val DMSDP_TYPE_WILDCARD = 0xFFFF_FFFFL
 

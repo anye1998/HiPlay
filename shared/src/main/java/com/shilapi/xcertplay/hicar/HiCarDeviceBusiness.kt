@@ -35,6 +35,13 @@ internal class HiCarDeviceBusiness(
     private val microphoneReady: () -> Boolean = { false },
     /** Called with the port the phone names for the video stream, before any RTSP happens. */
     private val onMediaEndpoint: (Int) -> Unit = {},
+    /**
+     * Called when the phone says navigation has taken the audio, and again when it lets go.
+     *
+     * The phone mixes guidance and music into one stream, so this flag is the only thing that tells
+     * a receiver which of its two output channels the sound currently belongs on.
+     */
+    private val onNavFocus: (Boolean) -> Unit = {},
 ) {
     private var peer: String? = null
     private var exchanged = false
@@ -65,6 +72,9 @@ internal class HiCarDeviceBusiness(
         if (module == HiCarCodes.DMSDP_MODULE_MEDIA.toLong() && type == HiCarCodes.DMSDP_TYPE_WILDCARD) {
             return mediaEndpoint(body)
         }
+        if (module == HiCarCodes.DMSDP_MODULE_ENTRY.toLong() && type == HiCarCodes.DMSDP_TYPE_NAV_FOCUS) {
+            return navFocus(body)
+        }
         if (module != HiCarCodes.DMSDP_MODULE_DEVICE.toLong() || type != HiCarCodes.DMSDP_TYPE_WILDCARD) {
             onLog("DMSDP device module: module $module type $type ignored")
             return emptyList()
@@ -80,6 +90,31 @@ internal class HiCarDeviceBusiness(
                 emptyList()
             }
         }
+    }
+
+    /**
+     * Navigation audio focus, the phone's only statement that a guidance prompt is playing.
+     *
+     * The frame is `{"navFocus":"HICAR","navPackageName":"com.amap…"}` while guidance owns the audio
+     * and `"HICAR_STOP"` when it lets go. Everything else in this session is mixed into one RTP
+     * stream, so this flag - and not a stream id - is what tells a receiver which output channel the
+     * sound currently belongs on.
+     *
+     * Nothing is answered: the frame is a notification, and inventing a reply would be a message the
+     * phone does not expect.
+     */
+    private fun navFocus(body: ByteArray): List<ByteArray> {
+        val message = runCatching { JSONObject(String(body, StandardCharsets.UTF_8)) }.getOrNull()
+        val focus = message?.optString("navFocus").orEmpty()
+        val source = message?.optString("navPackageName").orEmpty()
+        val active = focus.isNotEmpty() && focus != NAV_FOCUS_RELEASED
+        onLog(
+            "nav focus: " + (if (active) "guidance is talking" else "released") +
+                (if (source.isEmpty()) "" else " ($source)") +
+                "; the speaker follows",
+        )
+        onNavFocus(active)
+        return emptyList()
     }
 
     /**
@@ -270,6 +305,8 @@ internal class HiCarDeviceBusiness(
         const val DISPLAY_WIDTH = 800
         const val DISPLAY_HEIGHT = 480
         const val MAX_BODY_BYTES = 4096
+        /** `navFocus` value that means guidance has let the audio go. Anything else is "talking". */
+        const val NAV_FOCUS_RELEASED = "HICAR_STOP"
         const val BINARY_PREFIX = '$'.code.toByte()
         const val MASK_DISPLAY = 8L
         const val MASK_MICROPHONE = 2L

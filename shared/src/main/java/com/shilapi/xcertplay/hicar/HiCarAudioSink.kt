@@ -38,6 +38,20 @@ internal class HiCarAudioSink(context: Context, private val onLog: (String) -> U
     private var rate = 0
     private var channels = 0
     private var decoded = 0L
+    private var mask = AudioFormat.CHANNEL_OUT_STEREO
+    private var encoding = AudioFormat.ENCODING_PCM_16BIT
+
+    /**
+     * Which output route the sound takes, and which one it was built for.
+     *
+     * A head unit gives navigation its own stream type so a guidance prompt is not attenuated with
+     * the music it is playing over. The phone mixes its audio into one stream, so the only thing this
+     * side can do is move the track when the phone says guidance is talking - which is what
+     * [setStreamType] is called for. Zero means "no stream type", the usage-based route that this
+     * receiver has always used.
+     */
+    @Volatile private var wantedStreamType = 0
+    private var builtStreamType = 0
 
     /**
      * Frames per RTP stream, keyed by the SSRC-derived id.
@@ -93,6 +107,17 @@ internal class HiCarAudioSink(context: Context, private val onLog: (String) -> U
         if (audio != null) runCatching { audio.pause(); audio.flush() }
     }
 
+    /**
+     * Asks for a different output route, e.g. the navigation channel while guidance is talking.
+     *
+     * The rebuild happens on the playback thread at the next buffer, so the change cannot race with
+     * a write. Passing the same value twice is free, which matters because the phone repeats its
+     * navigation focus on every guidance event.
+     */
+    fun setStreamType(type: Int) {
+        if (type != wantedStreamType) wantedStreamType = type
+    }
+
     override fun close() {
         if (closed) return
         closed = true
@@ -127,6 +152,11 @@ internal class HiCarAudioSink(context: Context, private val onLog: (String) -> U
                     pending = null
                     Thread.sleep(20)
                     continue
+                }
+                // A route change is applied here rather than from the caller so that it cannot land
+                // in the middle of a write; it costs one buffer of silence.
+                if (track != null && rate > 0 && wantedStreamType != builtStreamType) {
+                    buildTrack(rate, channels, encoding, wantedStreamType)
                 }
                 if (pending == null) pending = queue.poll()
                 val frame = pending
@@ -163,7 +193,7 @@ internal class HiCarAudioSink(context: Context, private val onLog: (String) -> U
                         if (encoding != AudioFormat.ENCODING_PCM_16BIT || channelCount !in 1..2) {
                             throw IOException("AAC output PCM format")
                         }
-                        buildTrack(sampleRate, channelCount, encoding)
+                        buildTrack(sampleRate, channelCount, encoding, wantedStreamType)
                     }
 
                     output >= 0 -> {
@@ -201,35 +231,71 @@ internal class HiCarAudioSink(context: Context, private val onLog: (String) -> U
         return decoder
     }
 
-    private fun buildTrack(sampleRate: Int, channelCount: Int, encoding: Int) {
-        track?.let { old -> runCatching { old.release() } }
-        val mask = if (channelCount == 1) AudioFormat.CHANNEL_OUT_MONO else AudioFormat.CHANNEL_OUT_STEREO
-        val minimum = AudioTrack.getMinBufferSize(sampleRate, mask, encoding)
+    /**
+     * Builds the output track for one geometry, on one route.
+     *
+     * A stream type of zero keeps the usage-based track this receiver has always used. Anything else
+     * goes through the legacy constructor, which is the only way to name a stream type the platform
+     * does not know - and this head unit's navigation channel is one of those. A ROM that refuses
+     * the number gets the media route back with a line in the log, because silently losing audio
+     * would look like the phone's fault.
+     */
+    private fun buildTrack(sampleRate: Int, channelCount: Int, encoding: Int, streamType: Int) {
+        track?.let { old ->
+            runCatching { old.pause() }
+            runCatching { old.flush() }
+            runCatching { old.release() }
+        }
+        val channelMask = if (channelCount == 1) AudioFormat.CHANNEL_OUT_MONO else AudioFormat.CHANNEL_OUT_STEREO
+        val minimum = AudioTrack.getMinBufferSize(sampleRate, channelMask, encoding)
         if (minimum < 1) throw IOException("audio buffer unavailable")
-        val audio = AudioTrack.Builder()
-            .setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                    .build(),
-            )
-            .setAudioFormat(
-                AudioFormat.Builder()
-                    .setEncoding(encoding)
-                    .setSampleRate(sampleRate)
-                    .setChannelMask(mask)
-                    .build(),
-            )
-            .setTransferMode(AudioTrack.MODE_STREAM)
-            .setBufferSizeInBytes(maxOf(minimum * 2, sampleRate * channelCount * 2 / 10))
-            .build()
-        if (audio.state != AudioTrack.STATE_INITIALIZED) {
-            runCatching { audio.release() }
+        val bytes = maxOf(minimum * 2, sampleRate * channelCount * 2 / 10)
+        mask = channelMask
+        this.encoding = encoding
+        var effective = 0
+        var audio: AudioTrack? = null
+        if (streamType != 0) {
+            audio = runCatching {
+                @Suppress("DEPRECATION")
+                AudioTrack(streamType, sampleRate, channelMask, encoding, bytes, AudioTrack.MODE_STREAM)
+            }.getOrNull()
+            if (audio != null && audio.state == AudioTrack.STATE_INITIALIZED) {
+                effective = streamType
+            } else {
+                audio?.let { refused -> runCatching { refused.release() } }
+                audio = null
+                onLog("audio: stream type $streamType is not usable on this ROM; the media route stays")
+            }
+        }
+        if (audio == null) {
+            audio = AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build(),
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setEncoding(encoding)
+                        .setSampleRate(sampleRate)
+                        .setChannelMask(channelMask)
+                        .build(),
+                )
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .setBufferSizeInBytes(bytes)
+                .build()
+        }
+        val built: AudioTrack = audio ?: throw IOException("AudioTrack unavailable")
+        if (built.state != AudioTrack.STATE_INITIALIZED) {
+            runCatching { built.release() }
             throw IOException("AudioTrack state")
         }
-        audio.play()
-        track = audio
-        onLog("audio: AAC $sampleRate Hz, $channelCount channel(s); playback started")
+        built.play()
+        track = built
+        builtStreamType = effective
+        val route = if (effective == 0) "the media route" else "stream type $effective"
+        onLog("audio: AAC $sampleRate Hz, $channelCount channel(s); playback started on $route")
     }
 
     private fun write(buffer: ByteBuffer?) {
