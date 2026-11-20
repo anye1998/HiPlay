@@ -153,6 +153,14 @@ class HiCarController(
     private var speaker: HiCarAudioSink? = null
 
     /**
+     * Watches the USB host port while the receiver runs.
+     *
+     * Wired HiCar arrives over a network interface the phone brings up on the cable, so the first
+     * thing that has to exist is that interface - everything above it can be built on evidence.
+     */
+    private var usb: HiCarUsbLink? = null
+
+    /**
      * The head unit's navigation stream type.
      *
      * This unit gives guidance its own channel - 14 - so a prompt is not attenuated with the music
@@ -496,6 +504,9 @@ class HiCarController(
             return
         }
         report(HiCarStatus.PreparingNetwork)
+        usb = HiCarUsbLink(appContext, onLog) { name, address ->
+            onLog("USB: the wired link is $name at $address; a phone on this cable is reachable there")
+        }.also { it.start() }
         setup.execute {
             try {
                 startChain()
@@ -522,6 +533,8 @@ class HiCarController(
 
     override fun close() {
         if (!running.compareAndSet(true, false)) return
+        runCatching { usb?.close() }
+        usb = null
         releaseChain(keepVideo = false)
         setup.shutdownNow()
         accept.shutdownNow()
