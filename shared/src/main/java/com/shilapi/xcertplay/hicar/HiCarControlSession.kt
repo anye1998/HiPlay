@@ -152,6 +152,12 @@ internal class HiCarControlSession(
         if (length != payload.size - BINARY_HEADER_BYTES) throw HiCarWireException("binary size")
         val body = payload.copyOfRange(BINARY_HEADER_BYTES, payload.size)
         events.onLog("DMSDP application frame: module $module, type $type, ${body.size} bytes")
+        // Payloads are shown only when a test explicitly asks for them: the point is to find out
+        // whether the phone signals an audio-purpose change at all, and that cannot be answered from
+        // a byte count.
+        if (HiCarDebug.enabled("debug.hicar.frames")) {
+            events.onLog("DMSDP application frame body: module $module type $type ${HiCarDebug.hex(body)}")
+        }
         val answers = try {
             events.onApplicationService(module, type, body)
         } finally {

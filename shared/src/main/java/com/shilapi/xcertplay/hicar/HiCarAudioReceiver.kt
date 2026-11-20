@@ -28,7 +28,7 @@ internal class HiCarAudioReceiver(
     private val onLog: (String) -> Unit,
 ) : Closeable {
     private val cipher = HiCarRecordCipher(sessionKey, MAX_DATAGRAM)
-    private val media = HiCarAudioMedia()
+    private val media = HiCarAudioMedia(onLog)
     private val socket = DatagramSocket(InetSocketAddress(owner, 0))
     private val stateLock = Any()
 
@@ -166,6 +166,11 @@ internal class HiCarSpeakerControl(
     private var setupSequence = 0
 
     override fun receive(startLine: String, headers: Map<String, String>, body: ByteArray): List<ByteArray>? {
+        if (HiCarDebug.enabled("debug.hicar.frames")) {
+            // Names only. A field this code does not read is exactly what would carry an audio
+            // purpose, and it cannot be discovered from a filtered view of the message.
+            onLog("speaker: request ${startLine.substringBefore(' ')} headers=[${headers.keys.sorted().joinToString(",")}]")
+        }
         if (headers["serviceid"] != SERVICE_ID) return null
         val cseq = headers["cseq"]
         val sid = headers["datasessionid"]

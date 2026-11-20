@@ -30,7 +30,7 @@ internal class HiCarAudioFrame(
  * Ported from `AudioMedia` in huducat586/hicar-android-receiver (MIT), from Aki894/CarLink
  * `audio_media.py` (MIT).
  */
-internal class HiCarAudioMedia {
+internal class HiCarAudioMedia(private val onLog: (String) -> Unit = {}) {
     private class Packet(val timestamp: Long, val frames: List<HiCarAudioFrame>?)
     private class Stream(var expected: Int) {
         var timestamp = -1L
@@ -39,6 +39,7 @@ internal class HiCarAudioMedia {
     }
 
     private val streams = HashMap<Int, Stream>()
+    private var probes = 0
 
     var packets: Long = 0
         private set
@@ -73,7 +74,17 @@ internal class HiCarAudioMedia {
             end -= padding
         }
         if (start >= end) throw HiCarWireException("audio empty RTP")
-        val decoded = adts(rtp, start, end)
+        if (probes < PROBE_PACKETS && HiCarDebug.enabled("debug.hicar.audio")) {
+            probes++
+            // The one place a per-packet purpose marker could hide is the RTP header itself, and it
+            // is thrown away by every other line of this parser.
+            onLog(
+                "audio rtp: ssrc=$streamId csrc=${rtp[0].toInt() and 0x0F} " +
+                    "extension=${rtp[0].toInt() and 0x10 != 0} marker=${rtp[1].toInt() and 0x80 != 0} " +
+                    "payloadType=${rtp[1].toInt() and 0x7F}",
+            )
+        }
+        val decoded = adts(rtp, start, end, streamId)
         val state = streams.getOrPut(streamId) {
             if (streams.size >= MAX_STREAMS) throw HiCarWireException("audio stream limit")
             Stream(sequence)
@@ -133,7 +144,7 @@ internal class HiCarAudioMedia {
         streams.clear()
     }
 
-    private fun adts(payload: ByteArray, start: Int, end: Int): List<HiCarAudioFrame> {
+    private fun adts(payload: ByteArray, start: Int, end: Int, streamId: Int): List<HiCarAudioFrame> {
         val output = ArrayList<HiCarAudioFrame>()
         var at = start
         while (at < end) {
@@ -159,7 +170,7 @@ internal class HiCarAudioMedia {
                     rateIndex = rate,
                     channels = channels,
                     samples = 1024,
-                    stream = 0,
+                    stream = streamId,
                 ),
             )
             at += length
@@ -171,6 +182,7 @@ internal class HiCarAudioMedia {
     companion object {
         const val RTP_HEADER_BYTES = 12
         private const val MAX_STREAMS = 8
+        private const val PROBE_PACKETS = 3
         private const val MAX_REORDER = 16
 
         /** ADTS sample-rate table, indexed by the four bits in the header. */
