@@ -2456,3 +2456,44 @@ id 已经被改成 136 了。所以"文本 id"这个组合，从来没有在"绑
 | `idtext` 不设 + `vendor=1` | 原厂引擎是否被接受；若它也被 17，则问题不在引擎 |
 
 第一次配对前请在手机上删除这台车的 HiCar 记录与蓝牙配对（id 形状变了，旧记录必然对不上）。
+
+### 7.47 通过：本机 auth id 就是它对外上报的那 16 个字符
+
+7.46 的取证在车上得到确认。2026-11-20 11:08 的一次完整配对里，手机**第一次没有报 17**：
+
+```
+HiChain engine for this pairing: ours (this car 16 bytes, the phone 64 bytes)
+HiCar in: oper_type=3 message=1 (0x0001 PAKE_REQUEST)          ← 真的重新绑定了
+HiChain step 3: engine=0, phase=END_SUCCESS, key=32B, error=0
+DMSDP: control session opened; DMSDP AES-CTR negotiated
+DMSDP display service announced: 800×480
+HiSight: decoder output 800×480
+HiSight: 600 H.264 access unit(s), 0 dropped
+```
+
+签名源 144 字节 = 32(本机 epk) + 16(本机 id 文本) + 32(手机 epk) + 64(手机 id)。
+三次失败的组合（144 但绑定没跑完、104、136）各自都缺一样东西，缺的都不是"算法"。
+
+#### 为什么改了 id 还是报 17 —— 手机不会自动重绑
+
+11:04 那一次（已改成文本身份）5 次尝试全是 `AUTH_START_REQUEST (operationCode=2)`，
+一次 `PAKE_REQUEST` 都没有：手机按自己的设备记录认为早就配对好了，拿旧公钥验我们的新签名，
+自然还是 17。**改 id 形状而不让手机重绑，等于没测。**
+
+办法是让这台车对手机而言变成一台新车：应用里「换一个本机标识」会写入
+`shared_prefs/hicar-receiver.xml` 的 `local_identity`（默认由 `sha256(ANDROID_ID)[0:8]` 派生）。
+本次直接用 adb 写入 `33967bc3e2f1a7cf`，省掉一次来回。之后手机弹出连接码、重新绑定，
+一次通过。
+
+#### 默认值也随之改了
+
+文本形状现在是默认；`setprop debug.hicar.idbytes 1` 才回到旧的 8 字节形状（只对 7.47 之前
+建立的信任有意义）。这条很重要：`debug.hicar.*` 是 `setprop` 临时属性，重启即失效——
+如果正确答案靠属性开关，车机一重启就会退回错误形状，手机那边存的是文本形状的信任，
+下次连接又会变成"认证失败"。
+
+#### 遗留
+
+- 本次会话的密钥来自绑定阶段（PAKE），还没验证「已配对后重连」那条 `AUTH`（op=2）路径；
+  手机这次绑定存下的正是 16 字节 id + `23ee979d…` 这把公钥，重连应当能过，需要实测确认。
+- 后续再改 `local_identity` 都必须重新配对一次。

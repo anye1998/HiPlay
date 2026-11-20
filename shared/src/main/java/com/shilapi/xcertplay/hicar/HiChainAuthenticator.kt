@@ -32,16 +32,20 @@ internal class HiChainAuthenticator(
     /**
      * This car's auth id in the shape the engine is told to use.
      *
-     * `setprop debug.hicar.idtext 1` hands the engine the identity text - which is exactly what the
-     * car's own auth agent does, its native glue copying both ids as strings capped at 64 - while
-     * the default decodes the hex first. The two differ by the eight bytes the text spells out, and
-     * since the phone rebuilds the signed bytes from its own copy, only the phone can say which one
-     * it has stored. Making it a property keeps both shapes one `setprop` apart instead of a build.
+     * The text is the answer, and it came from the car's own auth agent: `com.byd.hicar` copies
+     * both ids into `hc_protocol_params` with strnlen, capped at 64, so the car's id is the
+     * `deviceId` text itself and the phone's is its 64 characters. Signing the 8 bytes the text
+     * spells out made the phone rebuild a different message and answer
+     * `HC_VERIFY_PROOF_FAILED` - the code a missing key gives, which is why it read as a key-store
+     * fault for three rounds.
+     *
+     * `setprop debug.hicar.idbytes 1` restores the old shape; nothing needs it except a store
+     * whose trust was created before 7.47.
      */
     private fun carAuthId(): ByteArray {
-        val asText = HiChainNative.available &&
-            runCatching { HiChainNative.debugIdShape() == 1 }.getOrDefault(false)
-        if (asText) {
+        val asBytes = HiChainNative.available &&
+            runCatching { HiChainNative.debugIdShape() == 0 }.getOrDefault(false)
+        if (!asBytes) {
             return localIdentity.toByteArray(StandardCharsets.UTF_8)
         }
         return authIdBytes(localIdentity)

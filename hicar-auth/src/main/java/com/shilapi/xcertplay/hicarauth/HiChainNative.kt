@@ -129,11 +129,9 @@ class HiChainNative private constructor() {
         ): String?
 
         /**
-         * Which shape an auth id is given to the engine in: 0 for the bytes the hex spells out,
-         * 1 for the text itself (`setprop debug.hicar.idtext 1`).
-         *
-         * The car's own auth agent hands the engine text, up to 64 characters, so a phone that ever
-         * paired with a factory head unit has only seen the text shape.
+         * Which shape an auth id is given to the engine in: 1 for the text the wire carries (the
+         * default, and what the car's own auth agent does), 0 for the bytes the hex spells out
+         * (`setprop debug.hicar.idbytes 1`).
          */
         @JvmStatic
         external fun debugIdShape(): Int

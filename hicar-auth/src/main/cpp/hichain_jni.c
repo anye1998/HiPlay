@@ -1521,12 +1521,14 @@ static const struct engine_ops *engine_for_session(void)
 
 /*
  * Whether an auth id is handed to the engine as the text the wire carries or as the bytes it
- * spells out.
+ * spells out. Text is the default from 7.47 on: the car's own auth agent (`com.byd.hicar`) copies
+ * both ids with strnlen, capped at 64, so a phone that ever paired with a factory head unit has
+ * only seen the text shape - and on 2026-11-20 11:08 that shape produced the first authenticate
+ * the phone accepted.
  *
- * The car's own auth agent (`com.byd.hicar`) passes both ids as strings - its native glue copies
- * them with strnlen, capped at 64 - so text is what a phone pairing with this car has always seen.
- * Both shapes are wrong in exactly one way each, and only the phone can say which one it expects,
- * so this is a property rather than a rewrite: `setprop debug.hicar.idtext 1` signs with the text.
+ * `setprop debug.hicar.idbytes 1` restores the hex-decoded shape, which is what every build before
+ * 7.47 used; it is kept only because a car whose trust was created in that shape cannot be read by
+ * the text one without pairing again.
  */
 JNIEXPORT jint JNICALL
 Java_com_shilapi_xcertplay_hicarauth_HiChainNative_debugIdShape(JNIEnv *env, jclass clazz)
@@ -1534,8 +1536,8 @@ Java_com_shilapi_xcertplay_hicarauth_HiChainNative_debugIdShape(JNIEnv *env, jcl
     (void)env;
     (void)clazz;
     char flag[PROP_VALUE_MAX] = { 0 };
-    __system_property_get("debug.hicar.idtext", flag);
-    return (flag[0] == '1') ? 1 : 0;
+    __system_property_get("debug.hicar.idbytes", flag);
+    return (flag[0] == '1') ? 0 : 1;
 }
 
 JNIEXPORT jlong JNICALL
