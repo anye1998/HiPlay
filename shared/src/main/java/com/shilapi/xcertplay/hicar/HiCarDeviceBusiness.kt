@@ -169,11 +169,28 @@ internal class HiCarDeviceBusiness(
             replies.add(
                 packet(
                     HiCarCodes.DMSDP_COMMAND_SERVICE_ANNOUNCE,
-                    service(SPEAKER_SERVICE_ID, 4, JSONObject().put("2003", "48000,44100").put("2004", "1").put("2005", "12")),
+                    service(
+                        SPEAKER_SERVICE_ID,
+                        4,
+                        JSONObject()
+                            .put("2003", "48000,44100")
+                            .put("2004", "1")
+                            .put("2005", "12")
+                            // Audio-bus split. Huawei's guide "处理音频分流策略" states that the phone
+                            // keeps navigation and media mixed until the car says it can carry them
+                            // apart, and that the answer goes in the reserved fields of the audio
+                            // capabilities: 1000 = capable, 1001 = policy, 1002 = policy version.
+                            // Without these three the phone sends one stream and no receiver-side
+                            // routing can separate it - which is exactly what 1500 datagrams on a
+                            // single SSRC showed.
+                            .put("1000", "true")
+                            .put("1001", "8:4096:1")
+                            .put("1002", "1.0"),
+                    ),
                 ),
             )
             speakerAnnounced = true
-            onLog("DMSDP speaker service announced: AAC 48 kHz")
+            onLog("DMSDP speaker service announced: AAC 48 kHz, audio-bus split offered (policy 8:4096:1)")
         }
         if (bits and MASK_MICROPHONE != 0L && !microphoneAnnounced && microphoneReady()) {
             replies.add(
