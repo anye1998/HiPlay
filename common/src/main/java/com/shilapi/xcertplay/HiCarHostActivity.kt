@@ -82,6 +82,7 @@ import java.util.Locale
 class HiCarHostActivity : ComponentActivity() {
     private var status by mutableStateOf<HiCarStatus>(HiCarStatus.Idle)
     private var model by mutableStateOf("")
+    private var btAddress by mutableStateOf("")
     private var pin by mutableStateOf("")
     private var running by mutableStateOf(false)
     private val log = mutableStateListOf<String>()
@@ -151,6 +152,7 @@ class HiCarHostActivity : ComponentActivity() {
             appendLog("--- end of previous exception ---")
         }
         model = storedModel()
+        btAddress = storedBluetoothAddress()
         pin = storedPin()
         microphoneEnabled = storedMicrophone()
         setContent {
@@ -225,6 +227,32 @@ class HiCarHostActivity : ComponentActivity() {
                     },
                 )
             }
+            // The id the phone keys its stored trust against is derived from this model and the
+            // head unit's own Bluetooth address. That address cannot be read from an app uid, so it
+            // is typed once and remembered - the same trade the reference receiver makes.
+            OutlinedTextField(
+                value = btAddress,
+                onValueChange = { value ->
+                    btAddress = value.uppercase().take(17)
+                    if (BLUETOOTH_PATTERN.matches(btAddress)) rememberBluetoothAddress(btAddress)
+                },
+                label = { Text("本机蓝牙地址（如 98:BB:1E:67:87:ED）") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Text(
+                "本机标识 = SHA-256(机型码 + 蓝牙地址) 的 64 位大写十六进制，与手机自己的设备号同形。" +
+                    "手机按这个字符串索引存下的公钥：长度少一半，绑定照样能过，但每次重连都会被拒（错误码 17）。",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            TextButton(onClick = { applyBluetoothIdentity() }) {
+                Text("按蓝牙地址派生本机标识")
+            }
+            Text(
+                "当前标识：${identity()}",
+                style = MaterialTheme.typography.bodySmall,
+                fontFamily = FontFamily.Monospace,
+            )
             Text(
                 "连接码：$pin",
                 style = MaterialTheme.typography.headlineSmall,
@@ -798,10 +826,70 @@ class HiCarHostActivity : ComponentActivity() {
         return derivedIdentity()
     }
 
+    /**
+     * The identity a phone will key its stored trust against.
+     *
+     * The car id is not arbitrary: it is the same 64-character upper-case hex the head unit's own
+     * SDK produces, `SHA-256(model + bluetooth address without separators)`. A phone rebuilds the
+     * signed message from the car id in its own device record, so a car presenting any other shape
+     * binds fine and then fails every reconnect with `HC_VERIFY_PROOF_FAILED` - the same code a
+     * wrong key gives, which is why it reads as a key-store fault. See 7.48.
+     *
+     * The address is asked for rather than read: `BluetoothAdapter.getAddress` returns a constant
+     * to apps, the per-interface files under sys/class/net are not readable from an app uid, and
+     * `bluetooth_address` in secure settings needs `BLUETOOTH_PRIVILEGED`. Without it the older
+     * ANDROID_ID derivation still applies, so a build never told the address keeps working.
+     */
     private fun derivedIdentity(): String {
+        val mac = btAddress.uppercase()
+        if (BLUETOOTH_PATTERN.matches(mac)) {
+            return derivedIdentityFrom(model, mac)
+        }
         val seed = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID).orEmpty()
         val digest = MessageDigest.getInstance("SHA-256").digest(seed.toByteArray())
         return digest.copyOf(8).joinToString("") { "%02X".format(it) }
+    }
+
+    private fun derivedIdentityFrom(model: String, mac: String): String {
+        val seed = model.uppercase() + mac.replace(":", "")
+        val digest = MessageDigest.getInstance("SHA-256").digest(seed.toByteArray(Charsets.US_ASCII))
+        return digest.joinToString("") { "%02X".format(it) }
+    }
+
+    /**
+     * Derives and stores the identity, saying what it costs.
+     *
+     * A new identity is a new car as far as the phone is concerned: the trust it holds is keyed
+     * against the old string, so the next connection is a first-time bind (it asks for the code
+     * again) and the stale record has to be deleted on the phone or it keeps answering for the id
+     * this head unit no longer presents.
+     */
+    private fun applyBluetoothIdentity() {
+        val mac = btAddress.uppercase()
+        if (!BLUETOOTH_PATTERN.matches(mac)) {
+            appendLog("A Bluetooth address looks like 98:BB:1E:67:87:ED - $mac does not")
+            return
+        }
+        rememberBluetoothAddress(mac)
+        val next = derivedIdentityFrom(model, mac)
+        val current = getSharedPreferences(PREFERENCES, MODE_PRIVATE).getString(KEY_IDENTITY, null)
+        if (next == current) {
+            appendLog("Identity is already what this address derives: $next")
+            return
+        }
+        if (running) stopReceiver()
+        getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit().putString(KEY_IDENTITY, next).apply()
+        appendLog("Identity from $model + $mac:")
+        appendLog("  $next")
+        appendLog("This car is new to the phone now: delete it in HiCar, then pair once.")
+    }
+
+    private fun storedBluetoothAddress(): String =
+        getSharedPreferences(PREFERENCES, MODE_PRIVATE).getString(KEY_BLUETOOTH_ADDRESS, "").orEmpty()
+
+    private fun rememberBluetoothAddress(value: String) {
+        getSharedPreferences(PREFERENCES, MODE_PRIVATE)
+            .edit().putString(KEY_BLUETOOTH_ADDRESS, value).apply()
     }
 
     /**
@@ -815,7 +903,10 @@ class HiCarHostActivity : ComponentActivity() {
      */
     private fun rotateIdentity() {
         if (running) stopReceiver()
-        val next = ByteArray(8).also { java.security.SecureRandom().nextBytes(it) }
+        // 32 bytes, so the string has the same 64-character shape the derivation produces. A shorter
+        // random id is a shape no part of this protocol uses, and a phone that binds against it will
+        // answer every later authenticate with 17 - the very trap 7.48 describes.
+        val next = ByteArray(32).also { java.security.SecureRandom().nextBytes(it) }
             .joinToString("") { "%02X".format(it) }
         getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit().putString(KEY_IDENTITY, next).apply()
         appendLog("Identity rotated: $next (this car looks new to the phone; press Start, then pair once)")
@@ -910,10 +1001,13 @@ class HiCarHostActivity : ComponentActivity() {
         const val KEY_HOME = 3
         const val KEY_BACK = 4
         const val KEY_IDENTITY = "local_identity"
+        const val KEY_BLUETOOTH_ADDRESS = "bluetooth_address"
         val PIN_PATTERN = Regex("[0-9]{6}")
         val MODEL_PATTERN = Regex("[0-9A-F]{8}")
 
-        /** Sixteen lowercase hex digits: what the phone keys its stored trust against. */
+        /** Six colon-separated hex pairs, the only shape a Bluetooth address is written in. */
+        val BLUETOOTH_PATTERN = Regex("[0-9A-F]{2}(:[0-9A-F]{2}){5}")
+
         /**
          * 16 or 64 upper-case hex characters.
          *
