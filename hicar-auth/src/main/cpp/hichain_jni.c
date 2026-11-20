@@ -997,6 +997,17 @@ static int32_t vendor_size(const char *name)
 
 static struct hks_file_callbacks g_vendor_files = { vendor_read, vendor_write, vendor_size };
 
+/* One line per refused step: without these, "the SDK did not start" is the only thing a run says,
+ * and every guess about which of the five steps refused costs another trip to the car. */
+static void vendor_reason(const char *step, const char *detail, int32_t code)
+{
+    if (detail != NULL) {
+        __android_log_print(ANDROID_LOG_INFO, "HiCar", "Vendor SDK: %s failed (%s)", step, detail);
+    } else {
+        __android_log_print(ANDROID_LOG_INFO, "HiCar", "Vendor SDK: %s failed (%d)", step, code);
+    }
+}
+
 /* Loads the vendor stack in dependency order and points its key store at its own directory. */
 static int vendor_load(const char *directory, int share_store)
 {
@@ -1026,6 +1037,9 @@ static int vendor_load(const char *directory, int share_store)
         (void)snprintf(path, sizeof(path), "%s/%s", directory, LIBS[index]);
         handles[index] = dlopen(path, RTLD_NOW | RTLD_LOCAL);
         if (handles[index] == NULL) {
+            vendor_reason(LIBS[index], dlerror(), 0);
+            /* Nothing has been initialised yet, so another configuration may still try. */
+            g_vendor_state = 0;
             return 0;
         }
     }
@@ -1042,6 +1056,8 @@ static int vendor_load(const char *directory, int share_store)
     if (g_vendor.get_instance == NULL || g_vendor.start_pake == NULL ||
         g_vendor.authenticate_peer == NULL || g_vendor.receive_data == NULL ||
         g_vendor.delete_local_auth_info == NULL || g_vendor.destroy == NULL) {
+        vendor_reason("symbol lookup", "an entry point is missing", 0);
+        g_vendor_state = 0;
         return 0;
     }
 
@@ -1052,6 +1068,8 @@ static int vendor_load(const char *directory, int share_store)
             "hks_register_get_hardware_udid_callback");
     int32_t (*init)(void) = (int32_t (*)(void))dlsym(g_vendor.keystore, "hks_init");
     if (register_files == NULL || init == NULL) {
+        vendor_reason("key store symbol lookup", "hks_register_file_callbacks or hks_init missing", 0);
+        g_vendor_state = 0;
         return 0;
     }
     g_vendor.register_files = register_files;
@@ -1068,16 +1086,26 @@ static int vendor_load(const char *directory, int share_store)
         g_vendor_root_fd = open(store, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     }
     if (g_vendor_root_fd < 0) {
+        vendor_reason("key store directory", "cannot open", 0);
+        g_vendor_state = 0;
         return 0;
     }
     /* The vendor engine resolves hks_* inside its own group, so these land on its own store. */
-    if (register_files(&g_vendor_files) != 0) {
+    int32_t registered = register_files(&g_vendor_files);
+    if (registered != 0) {
+        vendor_reason("hks_register_file_callbacks", NULL, registered);
+        g_vendor_state = 0;
         return 0;
     }
     if (register_udid != NULL) {
         (void)register_udid(hardware_udid);
     }
-    if (init() != 0) {
+    int32_t started = init();
+    if (started != 0) {
+        /* A key store that refuses to open is usually a file written by the other huks_lite build
+         * in a layout this one does not read. Retrying with the same files would fail the same way,
+         * so the state stays settled here. */
+        vendor_reason("hks_init", NULL, started);
         return 0;
     }
     g_vendor_state = 1;
@@ -1424,10 +1452,13 @@ Java_com_shilapi_xcertplay_hicarauth_HiChainNative_probeVendorAuthenticate(JNIEn
  * Which engine a real pairing uses.
  *
  * The firmware's SDK is the only implementation on this car that a Huawei phone is known to accept,
- * so it can be put behind the real flow with one property: `setprop debug.hicar.vendor 1`. It shares
- * this app's key store, so turning it on does not invalidate an existing pairing - and two runs with
- * only that property changed say directly whether the phone's refusal is about our engine or about
- * something neither engine provides.
+ * so it can be put behind the real flow with one property: `setprop debug.hicar.vendor 1`. Two key
+ * store modes are selectable because they fail differently:
+ *
+ *   1  its own store under the extracted library directory - the mode the in-process harness
+ *      already proved it can open, at the cost of one fresh pairing (it has no key for this phone)
+ *   2  this app's store, so an existing pairing survives - refusing to open it is what kept the
+ *      engine from starting at all
  */
 static const struct engine_ops *engine_for_session(void)
 {
@@ -1439,7 +1470,12 @@ static const struct engine_ops *engine_for_session(void)
     decided = 1;
     char flag[PROP_VALUE_MAX] = { 0 };
     __system_property_get("debug.hicar.vendor", flag);
-    if (flag[0] != '1' || g_root_fd < 0) {
+    if (flag[0] != '1' && flag[0] != '2') {
+        return &g_ours;
+    }
+    if (g_root_fd < 0) {
+        __android_log_print(ANDROID_LOG_INFO, "HiCar",
+            "debug.hicar.vendor is set but this app's store is not open; using this engine");
         return &g_ours;
     }
     char link[64];
@@ -1460,7 +1496,11 @@ static const struct engine_ops *engine_for_session(void)
     char directory[600];
     (void)snprintf(directory, sizeof(directory), "%s/vendor-%s", path,
         (abi[0] != '\0') ? abi : "arm64-v8a");
-    if (!vendor_load(directory, 1)) {
+    int share_store = (flag[0] == '2');
+    __android_log_print(ANDROID_LOG_INFO, "HiCar",
+        "Vendor SDK: loading from %s, key store %s", directory,
+        share_store ? "shared with this app" : "of its own (a fresh pairing will be needed)");
+    if (!vendor_load(directory, share_store)) {
         __android_log_print(ANDROID_LOG_INFO, "HiCar",
             "debug.hicar.vendor is set but the firmware SDK did not start; using this engine");
         return &g_ours;
@@ -1474,8 +1514,28 @@ static const struct engine_ops *engine_for_session(void)
     vendor.destroy = g_vendor.destroy;
     decided = 2;
     __android_log_print(ANDROID_LOG_INFO, "HiCar",
-        "pairing runs on the firmware's authentication SDK (debug.hicar.vendor=1)");
+        "pairing runs on the firmware's authentication SDK (debug.hicar.vendor=%c, store %s)",
+        flag[0], share_store ? "shared" : "private");
     return &vendor;
+}
+
+/*
+ * Whether an auth id is handed to the engine as the text the wire carries or as the bytes it
+ * spells out.
+ *
+ * The car's own auth agent (`com.byd.hicar`) passes both ids as strings - its native glue copies
+ * them with strnlen, capped at 64 - so text is what a phone pairing with this car has always seen.
+ * Both shapes are wrong in exactly one way each, and only the phone can say which one it expects,
+ * so this is a property rather than a rewrite: `setprop debug.hicar.idtext 1` signs with the text.
+ */
+JNIEXPORT jint JNICALL
+Java_com_shilapi_xcertplay_hicarauth_HiChainNative_debugIdShape(JNIEnv *env, jclass clazz)
+{
+    (void)env;
+    (void)clazz;
+    char flag[PROP_VALUE_MAX] = { 0 };
+    __system_property_get("debug.hicar.idtext", flag);
+    return (flag[0] == '1') ? 1 : 0;
 }
 
 JNIEXPORT jlong JNICALL
@@ -1522,6 +1582,10 @@ Java_com_shilapi_xcertplay_hicarauth_HiChainNative_create(JNIEnv *env, jclass cl
     session->callbacks.confirm_receive_request = on_confirm;
 
     session->ops = engine_for_session();
+    __android_log_print(ANDROID_LOG_INFO, "HiCar",
+        "HiChain engine for this pairing: %s (this car %u bytes, the phone %u bytes)",
+        session->ops->name, session->params.self_auth_id.length,
+        session->params.peer_auth_id.length);
     session->handle = session->ops->get_instance(&session->identity, (enum hc_type)role,
         &session->callbacks);
     if (session->handle == NULL) {

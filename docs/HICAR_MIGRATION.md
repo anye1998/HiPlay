@@ -2387,3 +2387,72 @@ HiChain second connection: authenticate start=0 car=…/key…/err0 phone=…/ke
 因此**这一版需要再配对一次**（清手机 HiCar 数据 → 车机开始 → 输连接码）。之后换包不再需要。
 
 判据：日志里 `HiChain begin` 一行应显示 `(ids: this car 8 bytes, the phone 64 bytes)`。
+
+### 7.46 拆开原厂认证代理：auth id 是**文本**，而且 144 字节这条路从没被真正测过
+
+7.45 的结论是"手机 id 必须原样取 64 字符"，这一条成立且已生效。但它同时把本机 id 定成 8 字节，
+于是签名 136 字节，手机仍然报 17。这次不再猜，直接把车机上原厂的认证代理拆开看。
+
+#### 原厂是怎么传 id 的
+
+`com.byd.hicar`（uid=1000，开机就常驻）就是这台车机的 HiCar 认证代理，dex 里是
+`com.huawei.authagent.*`，native 是 `libConnectAuthNative.so`。它的调用点：
+
+```
+NearbyConnectControl$ReceiveThread → HiChainAuthControl.receiveData(data, carInfo.getDeviceId(),
+                                        deviceInfo.getDeviceId(), pin)
+```
+
+再往下 `ConnectAuthNative.nativeTransmitHiChainParams(selfId, peerId, …)` → 两个全局缓冲区 →
+`GetHiChainProtocolParamsCallback()` 把它们**按字符串**拷进 `hc_protocol_params`：
+
+```
+strnlen(id, 10240) 上限 64 → memcpy_s(params->self_auth_id.auth_id, 64, id, len)
+                            params->key_length = 16
+```
+
+也就是说，**原厂从头到尾没做过一次 hex 解码**：本机 auth id 就是 `deviceId` 那串字符本身（16 字节），
+手机 auth id 就是它那 64 个字符。这也解释了原厂为什么把 `key_length` 硬写成 16——与手机的
+`keyLength:16` 对齐（这一点我们本来就对，`step()` 已把手机的 keyLength 传进 `params.key_length`）。
+
+#### 为什么"144 字节"当年失败不能算数
+
+git 记录的顺序是：
+
+```
+cc881b8d  跑完绑定的交换阶段（在此之前绑定只走到密钥协商就停了）
+8cfe20fe  把两个 id 都 hex 解码 → 136 字节
+4120b3d2  手机 id 改回 64 字符 → 仍是 136
+```
+
+144 字节（本机 16 字符 + 手机 64 字符）是在 `cc881b8d` **之前**跑的——那时绑定阶段根本没发
+`EXCHANGE_RESPONSE`，手机手里**没有我们的公钥**，之后的认证当然验不过。等绑定能跑完时，
+id 已经被改成 136 了。所以"文本 id"这个组合，从来没有在"绑定真的完成"的前提下测过。
+
+而 7.45 的推理有个漏洞：绑定时手机是按**我们 JSON 里的 authId** 存的公钥（8 或 16 字节都自洽），
+但认证时手机拿来重建签名的 peer id 不是来自绑定报文，而是它自己的设备记录——也就是它在 HIPROTO
+里收到的 `deviceId`。我们对外报的是 16 个字符，签名却用 8 字节，两者对不上，于是"查不到公钥"，
+同样以 17 报出来。
+
+#### 这一版做了什么
+
+- `setprop debug.hicar.idtext 1` → 本机 auth id 用 `localIdentity` 的 ASCII（16 字节），
+  与对外上报的 `deviceId`、与原厂代理完全一致；默认仍是旧的 8 字节，开关只是一个 `setprop`。
+  `HiChain begin` 一行会打印 `(ids: this car 16 bytes, the phone 64 bytes)`，一眼可辨。
+- 原厂 SDK 那条路修好了启动：之前 `vendor_load(dir, share_store=1)` 在 `hks_init` 就退了
+  （两套 huks_lite 的 KSF 布局不同）。现在每一步失败都会打印原因，并且
+  `debug.hicar.vendor=1` 用**它自己的密钥库**（进程内复现台已经证明这条路能开），
+  `=2` 才共享本机库。用原厂库必须重新配对一次，因为它没有这台手机的公钥。
+- 创建会话时打印 `HiChain engine for this pairing: ours|vendor (ids … bytes)`，
+  日志里不再需要靠猜判断这一轮是哪个引擎在跑。
+
+#### 判据
+
+一次配对即可判定，两种引擎都跑一遍：
+
+| 组合 | 期望 |
+|---|---|
+| `idtext=1` + our engine | 手机不再报 17，直接进入桌面镜像 |
+| `idtext` 不设 + `vendor=1` | 原厂引擎是否被接受；若它也被 17，则问题不在引擎 |
+
+第一次配对前请在手机上删除这台车的 HiCar 记录与蓝牙配对（id 形状变了，旧记录必然对不上）。

@@ -30,6 +30,25 @@ internal class HiChainAuthenticator(
     private var peerAuthId: ByteArray? = null
 
     /**
+     * This car's auth id in the shape the engine is told to use.
+     *
+     * `setprop debug.hicar.idtext 1` hands the engine the identity text - which is exactly what the
+     * car's own auth agent does, its native glue copying both ids as strings capped at 64 - while
+     * the default decodes the hex first. The two differ by the eight bytes the text spells out, and
+     * since the phone rebuilds the signed bytes from its own copy, only the phone can say which one
+     * it has stored. Making it a property keeps both shapes one `setprop` apart instead of a build.
+     */
+    private fun carAuthId(): ByteArray {
+        val asText = HiChainNative.available &&
+            runCatching { HiChainNative.debugIdShape() == 1 }.getOrDefault(false)
+        if (asText) {
+            return localIdentity.toByteArray(StandardCharsets.UTF_8)
+        }
+        return authIdBytes(localIdentity)
+            ?: throw HiCarWireException("this car's identity '$localIdentity' is not an even-length hex id")
+    }
+
+    /**
      * Prints the long-term keys this pairing has in the store at one moment.
      *
      * The phone verifies our signature with the public key a bind gave it; an authenticate signs
@@ -39,7 +58,7 @@ internal class HiChainAuthenticator(
      */
     private fun probeKeyset(stage: String) {
         val peer = peerAuthId ?: return
-        val local = authIdBytes(localIdentity) ?: return
+        val local = runCatching { carAuthId() }.getOrNull() ?: return
         if (!HiChainNative.available || handle == 0L) return
         val report = runCatching { HiChainNative.probeKeyset(local, peer) }.getOrNull() ?: return
         onLog("HiChain key store [$stage]: $report")
@@ -69,8 +88,7 @@ internal class HiChainAuthenticator(
             throw HiCarAuthException(HiCarAuthBlocker.NATIVE_HICHAIN_LIBRARY_MISSING)
         }
         // The engine signs raw bytes; the hex the wire carries is only a transport encoding.
-        val localAuthId = authIdBytes(localIdentity)
-            ?: throw HiCarWireException("this car's identity '$localIdentity' is not an even-length hex id")
+        val localAuthId = carAuthId()
         // The phone's id is not encoded twice. It reports a 64-character deviceId and signs over
         // those 64 characters verbatim: its authenticate request carries peerAuthId as 128 hex
         // characters, which decode to exactly this string and not to the 32 bytes it spells out.
