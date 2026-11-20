@@ -2668,9 +2668,28 @@ Android 的 dp = px × 160 / dpi。800×480 配 160 dpi 就是 800 dp 宽；直�
 `displayWidth/Height` 判断，编码器只保证坐标非负。单测随之调整：编码器测负坐标，
 路由器测 1080p 边界（800 在旧尺寸越界、在新尺寸合法，正好区分两种行为）。
 
-#### 待实测
+#### 实测（2026-11-20 13:50）
 
-- 手机是否接受 1920×1080 的声明，以及 384 dpi 是否让它渲染出与 800×480 相同的界面尺度。
-- 若手机仍按自己的比例编码，日志里会出现
-  `picture is W×H (offered 1920×1080); window and touches follow it`，
-  这条本身就是"自适应生效"的证据。
+```
+display: offering 1600×900 at 320 dpi to the phone
+capability answer for 15 request(s): his_version,his_video_formats,his_device_type,his_uibc_capability
+decoder output 1600×912
+picture is 1600×912 (offered 1600×900); window and touches follow it
+video: window follows the picture, 1600×912
+```
+
+三点都被验证：
+
+1. **手机接受了声明**（1600 宽），并只把 900 补到 912 —— 编码器按 16 对齐，不是拒绝。
+2. **自适应生效**：`picture is … follow it` 出现的同一秒，窗口比例从 16:9 切到 1600:912，
+   触摸坐标空间也换成 1600×912。若窗口还锁在 5:3，这行不会打出来、画面会被拉伸。
+3. **触摸在动态空间下依然准确**，这次没有单独调整坐标。
+
+#### 顺手发现的第二个坑：窗口尺寸不等于面板尺寸
+
+1600×900 不是我填的数 —— `resources.displayMetrics` 在车机上返回的就是它，而 `wm size` 是
+1920×1080。这个车机把第三方应用放在 **1.2 的兼容缩放**画布上（1920/1.2 = 1600，240/1.2 = 200 dpi），
+所以"窗口能画多少"比"面板有多少像素"小了一圈，按窗口声明等于白白丢掉五分之一的分辨率。
+
+改成 `Display.getRealMetrics()` 取面板尺寸，于是声明 1920×1080 @ 384 dpi。dpi 与宽度同比例变化，
+手机看到的 dp 宽度恒为 800，元素物理尺寸不变，多出来的只是每 dp 背后的像素——也就是清晰度。
