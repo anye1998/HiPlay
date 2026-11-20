@@ -2952,3 +2952,73 @@ bootloader/ROM 里，OTA 只负责搬运。
 至此有线 HiCar 在这个车机上**没有任何可推进的公开路径**。唯一的两个突破口是：拿到 NDA 版 SDK 的
 `driver_usb.c`，或者在一台真正的 HiCar 车机上用 USB 分析仪抓一次"插入手机→切换成功"的报文。
 这两样都不是本仓库能自己造出来的。
+
+### 7.55 有线的那条控制信息，就在车机自带的 `com.huawei.nearby` 里，而且没有加密
+
+7.54 的结论是"要 NDA 文档或真车抓包"。这两样其实车机自己就有——只是我们一直只盯着 `/system/app/HiCar`
+那个壳，没看同目录下的华为组件。`pm list packages` 一拉就露出来了：
+
+```
+com.huawei.nearby     /system/app/HwNearbyCar/HwNearbyCar.apk   ← 近场传输（NearbySocket 那一层）
+com.huawei.dmsdpdevice/system/app/HwDMSDPDevice/…               ← DMSDP 媒体/输入
+com.huawei.hisight    /system/priv-app/HiSight/…                ← 投屏
+com.byd.hicar         /system/app/HiCar/…                       ← 车厂那层壳
+```
+
+`HwNearbyCar.apk` 只有 833 KB，dex 里直接就有 `UsbNcmChannel`、`UsbNcmSocketThread`、`NcmCommon`、
+`usbNcmStaticConfigInfo`、`ncm.ip`、`192.168.66.`、`usb mode: CDC Network Data`。用 `dexdump -d` 反汇编
+（`build-tools/36.0.0/dexdump`）就能读到整条实现，**没有加壳、没有加密**。
+
+#### 发出去的那一条：`0x40/0x34/0xA0`
+
+`com.huawei.nearby.c.e`（日志标签 `CarInfoHandler`）的 `a(UsbDeviceConnection)`：
+
+```
+04a528: const/16 v1, #int 64      // 0x40   bmRequestType：厂商请求，主机→设备
+04a52c: const/16 v2, #int 52      // 0x34   bRequest
+04a530: const/4  v3, #int 0       // wValue = 0
+04a532: const/16 v4, #int 160     // 0xA0   wIndex
+04a536: iget-object v5, … .mi:[B  // 数据 = getCarInfo() 组好的 91 字节
+04a540: const/16 v7, #int 2000    // 超时 2000 ms
+04a546: invoke-virtual … UsbDeviceConnection;->controlTransfer(IIII[BII)I
+```
+
+日志里对应 `send car info length:N` / `send car info success`。
+
+#### 91 字节的载荷（`getCarInfo()`，小端）
+
+| 偏移 | 内容 | 长度 |
+|---|---|---|
+| 0 | `"hwnearby"` | 8 |
+| 8 | `0x005B`（整包长度 91） | 2 |
+| 10 | `0x0001` | 2 |
+| 12 | `0x0100` | 2 |
+| 14 | `0x0001` | 2 |
+| 16 | `0x00` | 1 |
+| 17 | `0x01` | 1 |
+| 18 | `0x01` | 1 |
+| 19 | tag `1` + len `3` + modelId | 5 |
+| 24 | tag `2` + len `1` + subModelId | 3 |
+| 27 | tag `3` + len `32` + deviceId | 34 |
+| 61 | tag `4` + len `6` + 车机蓝牙 MAC | 8 |
+| 69 | tag `6` + len `14` + 车机 IP 字符串（`192.168.66.100`～`192.168.66.254`） | 16 |
+| 85 | tag `7` + len `4` + 端口（uint32） | 6 |
+
+合计正好 91，和 `ByteBuffer.allocate(91)` 对上。几个字段的来源也都读到了：
+
+- **deviceId**（32 字节）= `SHA256(modelId[3] ‖ subModelId[1] ‖ 蓝牙MAC[6])`，`DeviceIdBuilder` 里
+  `ByteBuffer.allocate(10)` 拼完取哈希，十六进制再转回 32 字节；
+- **车机 IP** = `192.168.66.` + `[100,254]` 随机（`f.ep()`）；
+- **端口** = `f.eq()` 现场 `new ServerSocket(0)` 拿一个临时端口——**车机是服务端，手机连过来**；
+- modelId 3 字节 / subModelId 1 字节，默认值分别是 `{0,0,0}` 和 `{0}`，真实值由车厂那层灌进去。
+
+#### 但还有一道坎：网卡谁来配
+
+`UsbNcmChannel` 里有 `isNeedConfigUsbStaitcIp`、`usbNcmStaticConfigInfo`、`ncm0_reserved` 这些字段，
+说明 NCM 网口起来之后，**给它配 `192.168.66.x` 的动作是华为那套系统级代码做的**（`com.huawei.nearby`
+和 `com.byd.hicar` 都以 `system` uid 运行）。普通第三方应用没有 `CAP_NET_ADMIN`，改不了接口地址，
+也开不了 raw socket。
+
+所以顺序应该是：先验证"这条 91 字节能不能让手机切成 NCM"（能看见的现象是它重新枚举出
+`0xFF/0x02/0x16` 的接口），再解决"谁来给这个接口配地址"。第一步是纯协议、可以立刻试；第二步取决于
+这台车机愿不愿意把网口交给第三方。
