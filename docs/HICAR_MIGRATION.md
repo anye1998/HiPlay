@@ -2497,3 +2497,76 @@ HiSight: 600 H.264 access unit(s), 0 dropped
 - 本次会话的密钥来自绑定阶段（PAKE），还没验证「已配对后重连」那条 `AUTH`（op=2）路径；
   手机这次绑定存下的正是 16 字节 id + `23ee979d…` 这把公钥，重连应当能过，需要实测确认。
 - 后续再改 `local_identity` 都必须重新配对一次。
+
+### 7.48 闭环：重连通过，车机 id 必须是与手机同形的 64 字符
+
+2026-11-20 12:33–12:34 的一次完整会话，**绑定一次 + 重连两次，全部 `END_SUCCESS`，日志中 `errorCode` 出现 0 次**：
+
+```
+12:33:48  PAKE_REQUEST (0x0001)  →  PAKE_CLIENT_CONFIRM  →  EXCHANGE_REQUEST
+12:33:48  HiChain step 3: phase=END_SUCCESS, key=32B      ← 绑定
+12:33:51  HiSight: decoder output 800×480 / 1 access unit
+12:34:17  AUTH_START_REQUEST (0x0011)  →  AUTH_ACK_REQUEST
+12:34:17  sts sign source (192 bytes) …  HiChain step 2: END_SUCCESS, key=16B   ← 重连 1
+12:34:41  AUTH_START_REQUEST  →  sts sign source (192 bytes)  →  END_SUCCESS     ← 重连 2
+12:34:48  HiSight: 600 H.264 access unit(s), 0 dropped
+```
+
+签名源被拆开看是四段，长度正好 32 + 64 + 32 + 64：
+
+```
+car   epk 3254B743…BAA95F   (32)
+car   id  4751B763A806980D15845EA846548537BDA94E5D22B27597FEAD804C13A92F69  (64)
+phone epk 95601C59…3D2654448  (32)
+phone id  01CF830AF5F1583879C72FE80E2C0A4007E84FB547B6B38F7D5B628E158A017E  (64)
+```
+
+车机 id 与手机 id **同形同长**（都是 64 个字符），这正是原厂 `com.huawei.hicarsdk.DeviceId`
+的形状，也是 7.46 从 `com.byd.hicar` 的反汇编里读到的「按字符串拷贝、从不解码」所要求的。
+
+#### 为什么会走过六个错误形状
+
+| 形状 | 签名源 | 结果 | 当时缺的是什么 |
+|---|---|---|---|
+| 8 + 64 字节 | 136 | 17 | 本机 id 少了一半字符 |
+| 16 字符 + 64 字节 | 144 | 17 | 但绑定当时根本没发 `EXCHANGE_RESPONSE`，手机没有我们的公钥 |
+| 8 + 8 字节 | 104 | 17 | 手机 id 被多解码一层 |
+| 16 字符（小写） | 144 | 17 | 形状对，长度只有手机的四分之一 |
+| 16 字符（大写） | 144 | 17 | 同上；大小写不是变量 |
+| **64 字符（大写）** | **192** | **通过** | — |
+
+前五次之所以看起来"自洽却失败"，是因为**别名 = hash(service_id + 本机 id)**，绑定与认证用的是同一组
+字节，所以本地自检（`self-check: 0`）永远通过。手机则用**它自己设备记录里的车机 id** 重建签名消息，
+只要那个 id 与我们的字节不同，查到的就是空，返回 17 —— 同一个码，与"密钥不对"无法区分，
+所以这条路一直伪装成 HUKS 问题。
+
+#### 车机 id 的生成规则（已确认，与参考项目一致）
+
+```
+id = upper_hex( SHA-256( model.toUpperCase() + btMac.replace(":", "").toUpperCase() ) )
+```
+
+- `model` 是 8 位机型码（BLE 广播里的 `00040A04`）；
+- `btMac` 是**接收端（车机）自己的经典蓝牙地址** `98:BB:1E:67:87:ED`；
+- 结果 64 个字符，32 字节。
+
+参考项目 `hicar-ref/app/src/local/hicarlab/WireIdentity.java` 的 `derive()` 是同一份算法，
+其兼容性表把这种身份下的免输码重连标为已实测通过。本次结果与之吻合。
+
+#### 两个必须记住的操作事实
+
+1. **改 id 必须让手机重新绑定。** 手机按自己的设备记录判断"已配对"，改 id 之后它会直接发
+   `AUTH_START_REQUEST`（op=2），用旧公钥验新签名，必然 17。要么在手机上删除该车机记录，
+   要么让这台车对手机变成新车（换 id）。本次两次都是「换 id + 手机删记录」后才走到 `PAKE`。
+2. **`debug.hicar.*` 是 setprop 临时属性，重启即失效。** 所以任何"正确答案"都不能只挂在属性上；
+   目前文本形状已是默认（7.47），而 id 值本身存在 `shared_prefs/hicar-receiver.xml`
+   的 `local_identity` 里，重启不影响。
+
+#### 遗留
+
+- 应用**读不到本机蓝牙 MAC**：只有 `settings get secure bluetooth_address` 能拿到，
+  需要 `BLUETOOTH_PRIVILEGED`；`/sys/class/net/wlan0/address` 也是权限不足。
+  参考项目因此在界面上让用户填地址。下一步是加同样的输入框并据 `SHA256(机型+MAC)` 派生，
+  让身份不再依赖 adb 写配置。
+- 触摸仍无反应（事件已按 18 源映射加密发出，手机侧不响应），协议层未查。
+- 画面 800×480，低于车机屏幕原生 1920×1080。
