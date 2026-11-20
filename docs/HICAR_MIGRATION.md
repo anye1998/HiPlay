@@ -2760,3 +2760,74 @@ module 1 type 503 {"navFocus":"HICAR_STOP",…}
   手机的设备信息帧是 484 字节的 JSON，它在那里面自报版本与能力；
 - speaker 请求里 `audioparameter` 头的**值**会被打印。这是本仓库唯一解析的头，也是唯一可能藏
   每会话 streamType 的地方。
+
+### 7.52 通道 14 被接受了，但同一个喇叭；有线连接从头开始取证
+
+#### 音频：`STREAM_NAVI` 确实存在，14 也确实生效了
+
+`dumpsys audio` 把这台车机的流类型全列出来了：
+
+```
+0 VOICE_CALL / 1 SYSTEM / 2 RING / 3 MUSIC / 4 ALARM / 5 NOTIFICATION / 6 BT_SCO
+7 SYSTEM_ENFORCED / 8 DTMF / 9 TTS / 10 ACCESSIBILITY / 11 FM / 12 AUX
+13 BT_MUSIC / 14 NAVI / 15 MUTE / 16 BTTS
+```
+
+**14 = `STREAM_NAVI`**，就是我们用的那个号。日志也证明切换真的发生了：
+
+```
+15:51:31.928  nav focus: guidance is talking (com.amap.hmapp)
+15:51:32.184  audio: … playback started on stream type 14      ← 新建轨，未被 ROM 拒绝
+15:52:23.451  nav focus: released (com.amap.hmapp)
+15:52:23.618  audio: … playback started on the media route
+```
+
+所以应用侧的分流是成立的：播报期间声音走的是导航流，释放后回到媒体流。用户听到的"都从主驾出来"是**功放/HAL 把两路流都送到同一个物理输出**——这台车机的 `audio_policy_configuration.xml` 里只有 `Speaker` 一类通用设备，
+导航与媒体没有各自的 devicePort，真分开要靠 BYD 的私有功放接口，应用层碰不到。
+
+仍然有用的部分：导航播报现在跟随**导航音量**（`STREAM_NAVI` 有自己的音量曲线），不再跟着音乐音量走，
+手机压低音乐时也不会连带压低播报。
+
+#### 有线连接：先纠正一个误解
+
+"USB 连接"不是把无线那套换个物理层。按华为《建立有线连接》：
+
+- SDK 自己处理 USB 插入事件，**PIN 由 SDK 通过有线通道直接发给手机**，HMI 只处理认证回调；
+- 有线连接完成后，为了后续还能无线连，HMI 要**主动打开蓝牙**。
+
+而底层传输在《有线连接阶段主要场景异常情况说明》里写明了：手机以 **NCM**（Network Control Model）
+设备出现，车机侧要出现一块网卡（多数是 `wwan0`），并且路由表里要有这个网段的地址。这台车机具备条件：
+
+```
+/sys/module/cdc_ncm   ← 已加载
+/sys/module/rndis     ← 已加载
+```
+
+问题在于**上层**。原厂 `com.byd.hicar` 走的是 `com.huawei.nearbysdk`（`NearbySocket`、
+`publishDevice`、`createTCPNearbySocket`），那是华为自带的近场传输层，能把同一套会话同时跑在蓝牙
+和 USB 上。本仓库的无线链路是手写的 BLE 广播 + 两条 RFCOMM，**有线上没有 RFCOMM 可用**，
+近场握手必须跑在 NCM 的 IP 网上——而那一步在公开资料里没有任何描述。
+
+所以这一版只做唯一诚实的事：把链路找出来。
+
+#### 这一版新增（`HiCarUsbLink`）
+
+- 注册 `ACTION_USB_DEVICE_ATTACHED/DETACHED`，把插入设备的 VID/PID 和**接口类别**打进日志
+  （`comm`/`cdc-data`/`storage`/`vendor`…），华为手机的 VID 是 `0x12D1`，能和现在插着的 U 盘区分开；
+- 插入后跟随接口表 60 秒，找 `usb*/wwan*/ncm*/rndis*` 且带 IPv4 的接口，打印名字、地址与掩码；
+- 找到就报 `USB: the wired link is <if> at <addr>`，那正是将来端点要绑定/拨号的地址；
+- 找不到会明确说"60 秒内没有出现手机链路"，而不是静默。
+
+拿到这条日志就能判断下一步：手机是否真的起 NCM、起了之后是主动连车机还是等车机连它。
+
+#### 自动连接：文档要求 vs 本仓库现状
+
+| 文档要求 | 本仓库 | 结论 |
+|---|---|---|
+| 依赖**基础蓝牙回连**，收到 `CONNECTION_STATE_CHANGED` 后调 `startReconnect` | 没有 `startReconnect`（不走 SDK）；接收流程要人工点「开始」 | 未实现 |
+| 回连过程中**不要**再调 `startAdv()`，否则自动连上后手机仍弹发现窗口 | 广播在整个会话期间一直开着 | 与文档相反，但目前不影响手动重连 |
+| 失败原因透传（`REASON_AUTO_CONNECT_SWITCH_OFF` 等） | 无 | 未实现 |
+
+要实现真正的自动连接，需要一个随蓝牙回连自启的前台服务：监听
+`android.bluetooth.headsetclient.profile.action.CONNECTION_STATE_CHANGED` → 确认是已绑定的手机 →
+启动接收（此时**不广播**）。这是一块独立功能，牵涉后台常驻与耗电，建议单独一轮做，先把有线取证跑完。
