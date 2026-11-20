@@ -32,6 +32,14 @@ internal class HiCarHiSightWire(
     private val onLog: (String) -> Unit,
     /** True only when a surface can actually receive touches; otherwise UIBC is not offered. */
     private val withInput: Boolean,
+    /**
+     * The geometry offered to the phone in `his_video_formats`.
+     *
+     * This is an offer, not a promise: the phone may ignore it and encode its own shape, which is
+     * why the decoder's output is what the window and the touch mapping use. Declaring 1080p is
+     * still what makes a phone that honours it send a sharper picture.
+     */
+    private val size: HiCarDisplaySize = HiCarDisplaySize.BASE,
 ) {
     private val cipher = HiCarRecordCipher(sessionKey, MAX_RECORD_BYTES)
     private var buffer = ByteArray(0)
@@ -247,7 +255,8 @@ internal class HiCarHiSightWire(
                 caps["his_version"] = "1.0"
                 caps["his_video_formats"] =
                     "codecs 1;fps 30;gop 30;bitrate 2000000;vbr-min 1000000;vbr-max 3000000;" +
-                        "dpi 160;scr-w $DISPLAY_WIDTH;scr-h $DISPLAY_HEIGHT;width $DISPLAY_WIDTH;height $DISPLAY_HEIGHT"
+                        "dpi ${HiCarDisplaySize.densityFor(size.width)};scr-w ${size.width};" +
+                        "scr-h ${size.height};width ${size.width};height ${size.height}"
                 caps["his_device_type"] = "device_type 4;subtype 0;"
                 if (withInput) {
                     caps["his_uibc_capability"] =
@@ -389,8 +398,6 @@ internal class HiCarHiSightWire(
         const val MAX_BODY_CHARS = 56_000
         const val MAX_HEADERS = 64
         const val MAX_DUMP_CHARS = 400
-        const val DISPLAY_WIDTH = 800
-        const val DISPLAY_HEIGHT = 480
 
         val START_LINE = Regex("[A-Z_]+ \\S+ RTSP/1\\.0|RTSP/1\\.0 [1-5][0-9]{2}( [ -~]+)?")
         val HEADER_NAME = Regex("[a-z][a-z0-9._-]{0,63}")

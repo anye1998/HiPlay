@@ -36,8 +36,8 @@ internal class HiCarInputEvent private constructor(
  * Encodes UIBC events the way the phone expects them on the input socket.
  *
  * `0xFF`-prefixed marker, a big-endian body, then the whole thing AES-CTR encrypted and length
- * prefixed. Touch bodies are 14 bytes, key bodies 12. Coordinates are always in the 800×480 space
- * the display service advertised — sending window pixels would put the cursor somewhere else.
+ * prefixed. Touch bodies are 14 bytes, key bodies 12. Coordinates are in the picture space the
+ * decoder reports — sending window pixels would put the finger somewhere else.
  *
  * Ported from `UiInput` (Aki894/CarLink `hisight_input.py`, MIT).
  */
@@ -47,7 +47,10 @@ internal class HiCarUiInputEncoder(sessionKey: ByteArray) {
     fun encode(event: HiCarInputEvent, elapsedMillis: Long): ByteArray {
         val body: ByteArray = when (event.action) {
             HiCarInputEvent.ACTION_DOWN, HiCarInputEvent.ACTION_UP, HiCarInputEvent.ACTION_MOVE -> {
-                if (event.x !in 0 until DISPLAY_WIDTH || event.y !in 0 until DISPLAY_HEIGHT || elapsedMillis < 0) {
+                // Range is the router's business: it knows the decoded size, which is no longer a
+                // constant. Re-checking against 800×480 here would reject every coordinate of a
+                // 1080p picture.
+                if (event.x < 0 || event.y < 0 || elapsedMillis < 0) {
                     throw HiCarWireException("touch coordinates")
                 }
                 ByteBuffer.allocate(14).order(ByteOrder.BIG_ENDIAN)
@@ -90,8 +93,6 @@ internal class HiCarUiInputEncoder(sessionKey: ByteArray) {
 
     private companion object {
         const val MAX_RECORD_BYTES = 1_500
-        const val DISPLAY_WIDTH = 800
-        const val DISPLAY_HEIGHT = 480
         const val KEY_HOME = 3
         const val KEY_BACK = 4
         val MARKER = byteArrayOf(-1, -1, -1, -1, -1, -1)
@@ -115,6 +116,29 @@ internal class HiCarInputRouter {
     private var x = 0
     private var y = 0
 
+    /**
+     * The coordinate space touches are expressed in.
+     *
+     * Not a constant: a phone may encode any shape it likes, and the decoder's output format is the
+     * only authoritative answer. Coordinates outside it are refused, so a wrong value here means
+     * touches land in the wrong place or are dropped - which is why it follows the picture rather
+     * than the offer.
+     */
+    @Volatile
+    var displayWidth: Int = HiCarDisplaySize.BASE.width
+        private set
+
+    @Volatile
+    var displayHeight: Int = HiCarDisplaySize.BASE.height
+        private set
+
+    @Synchronized
+    fun setDisplaySize(width: Int, height: Int) {
+        if (width <= 0 || height <= 0) return
+        displayWidth = width
+        displayHeight = height
+    }
+
     @Synchronized
     fun attach(next: Sender) {
         sender = next
@@ -135,7 +159,7 @@ internal class HiCarInputRouter {
     @Synchronized
     fun touch(action: Int, nx: Int, ny: Int): Boolean {
         val target = sender ?: return false
-        if (nx !in 0 until DISPLAY_WIDTH || ny !in 0 until DISPLAY_HEIGHT) return false
+        if (nx !in 0 until displayWidth || ny !in 0 until displayHeight) return false
         if (action !in HiCarInputEvent.ACTION_DOWN..HiCarInputEvent.ACTION_MOVE) return false
         if (action == HiCarInputEvent.ACTION_DOWN && pressed) return false
         if (action != HiCarInputEvent.ACTION_DOWN && !pressed) return false
@@ -145,6 +169,10 @@ internal class HiCarInputRouter {
         pressed = action != HiCarInputEvent.ACTION_UP
         return true
     }
+
+    /** Maps view pixels onto [displayWidth]×[displayHeight]; null when outside and not clamped. */
+    fun map(x: Float, y: Float, width: Int, height: Int, clamp: Boolean): IntArray? =
+        map(x, y, width, height, clamp, displayWidth, displayHeight)
 
     /** Releases a finger the phone still thinks is down; called when a session ends. */
     @Synchronized
@@ -163,17 +191,26 @@ internal class HiCarInputRouter {
     }
 
     companion object {
+        /** Defaults for a session whose picture size is not known yet; see [displayWidth]. */
         const val DISPLAY_WIDTH = 800
         const val DISPLAY_HEIGHT = 480
         const val KEY_HOME = 3
         const val KEY_BACK = 4
 
-        /** Maps view pixels onto the advertised 800×480 space; null when outside and not clamped. */
-        fun map(x: Float, y: Float, width: Int, height: Int, clamp: Boolean): IntArray? {
+        /** Maps view pixels onto [displayWidth]×[displayHeight]; null when outside and not clamped. */
+        fun map(
+            x: Float,
+            y: Float,
+            width: Int,
+            height: Int,
+            clamp: Boolean,
+            displayWidth: Int = DISPLAY_WIDTH,
+            displayHeight: Int = DISPLAY_HEIGHT,
+        ): IntArray? {
             if (width < 1 || height < 1 || x.isNaN() || x.isInfinite() || y.isNaN() || y.isInfinite()) return null
             if (!clamp && (x < 0f || x >= width || y < 0f || y >= height)) return null
-            val px = (x * DISPLAY_WIDTH / width).toInt().coerceIn(0, DISPLAY_WIDTH - 1)
-            val py = (y * DISPLAY_HEIGHT / height).toInt().coerceIn(0, DISPLAY_HEIGHT - 1)
+            val px = (x * displayWidth / width).toInt().coerceIn(0, displayWidth - 1)
+            val py = (y * displayHeight / height).toInt().coerceIn(0, displayHeight - 1)
             return intArrayOf(px, py)
         }
     }

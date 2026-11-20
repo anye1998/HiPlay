@@ -129,6 +129,15 @@ class HiCarController(
     /** The H.264 sink, created on first use so the phone can be offered the display service. */
     private var video: HiCarVideoSink? = null
 
+    /**
+     * What this receiver asks the phone for. 1080p unless the screen cannot show it.
+     *
+     * A copy is kept here as well as in [input] because a session can start before any sink exists,
+     * and the wire needs it at the moment the capability is answered.
+     */
+    @Volatile
+    private var displaySize: HiCarDisplaySize = HiCarDisplaySize.BASE
+
     /** Touches and keys for the phone; only the current HiSight session ever attaches to it. */
     private val input = HiCarInputRouter()
 
@@ -387,12 +396,45 @@ class HiCarController(
         }
     }
 
-    /** The sink the screen attaches its `TextureView` to; safe to call before [start]. */
+    /**
+     * The sink the screen attaches its `TextureView` to; safe to call before [start].
+     *
+     * The sink is told the geometry this session offers, and reports back what the phone actually
+     * encodes; the touch space follows that report, so a phone that ignores the offer still maps
+     * correctly.
+     */
     fun videoSink(): HiCarVideoSink = synchronized(this) {
-        video ?: HiCarVideoSink(onLog).also { video = it }
+        video ?: HiCarVideoSink(onLog, displaySize).also { video = it }
     }
 
-    /** Sends one touch in the 800×480 space the display service advertised. */
+    /**
+     * Registers what happens when the picture's real size becomes known.
+     *
+     * The touch space is updated here rather than by the screen: a caller that only wants to lay out
+     * its window must not be able to leave touches mapping onto the wrong geometry by forgetting to
+     * forward the size.
+     */
+    fun onPictureSize(listener: (Int, Int) -> Unit) {
+        videoSink().onDisplaySize = { width, height ->
+            input.setDisplaySize(width, height)
+            listener(width, height)
+        }
+    }
+
+    /**
+     * The geometry offered to the phone.
+     *
+     * Set from the screen this receiver is presented on, before [start]. 1080p is the ceiling; the
+     * decoder's output is authoritative afterwards, so this only decides what is asked for.
+     */
+    fun setDisplaySize(size: HiCarDisplaySize) {
+        synchronized(this) {
+            displaySize = size
+            input.setDisplaySize(size.width, size.height)
+        }
+    }
+
+    /** Sends one touch in the picture's coordinate space, whatever size that turned out to be. */
     fun sendTouch(action: Int, x: Int, y: Int): Boolean = input.touch(action, x, y)
 
     /**
@@ -402,7 +444,7 @@ class HiCarController(
      * the edge still releases the one the phone believes is down.
      */
     fun sendTouchAt(x: Float, y: Float, width: Int, height: Int, action: Int): Boolean {
-        val mapped = HiCarInputRouter.map(x, y, width, height, action != 0)
+        val mapped = input.map(x, y, width, height, action != 0)
         if (mapped == null) {
             onLog("touch: dropped, (${x.toInt()},${y.toInt()}) is outside the ${width}x$height window")
             return false
@@ -419,8 +461,8 @@ class HiCarController(
             }
             onLog(
                 "touch: $name view=${width}x$height at (${x.toInt()},${y.toInt()}) " +
-                    "-> (${mapped[0]},${mapped[1]}) of ${HiCarInputRouter.DISPLAY_WIDTH}x" +
-                    "${HiCarInputRouter.DISPLAY_HEIGHT} sent=$sent",
+                    "-> (${mapped[0]},${mapped[1]}) of ${input.displayWidth}x" +
+                    "${input.displayHeight} sent=$sent",
             )
         }
         return sent
@@ -854,6 +896,7 @@ class HiCarController(
             active = { running.get() },
             onLog = onLog,
             onVideoConnected = { report(HiCarStatus.Streaming) },
+            displaySize = displaySize,
         )
         key.fill(0)
         hisight = client

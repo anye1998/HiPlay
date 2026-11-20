@@ -319,12 +319,41 @@ class HiCarAudioAndInputTest {
     }
 
     @Test
-    fun `a coordinate outside the advertised display is refused`() {
+    fun `the encoder refuses a negative coordinate`() {
         val encoder = HiCarUiInputEncoder(key)
         val failure = runCatching {
-            encoder.encode(HiCarInputEvent.touch(HiCarInputEvent.ACTION_MOVE, 800, 10), 0)
+            encoder.encode(HiCarInputEvent.touch(HiCarInputEvent.ACTION_MOVE, -1, 10), 0)
         }.exceptionOrNull()
         assertEquals("touch coordinates", failure?.message)
+    }
+
+    @Test
+    fun `the router refuses a coordinate outside the picture it was told`() {
+        val router = HiCarInputRouter()
+        val sent = ArrayList<Int>()
+        router.attach(object : HiCarInputRouter.Sender {
+            override fun send(event: HiCarInputEvent): Boolean {
+                sent.add(event.action)
+                return true
+            }
+        })
+        // A 1080p picture: 800 would have been out of range at the old fixed size but is inside one.
+        router.setDisplaySize(1920, 1080)
+        assertTrue(router.touch(HiCarInputEvent.ACTION_DOWN, 800, 10))
+        assertTrue(router.touch(HiCarInputEvent.ACTION_MOVE, 1919, 1079))
+        assertTrue(!router.touch(HiCarInputEvent.ACTION_MOVE, 1920, 10))
+        assertTrue(!router.touch(HiCarInputEvent.ACTION_MOVE, 10, 1080))
+        assertTrue(router.touch(HiCarInputEvent.ACTION_UP, 10, 10))
+        assertEquals(listOf(0, 2, 1), sent)
+    }
+
+    @Test
+    fun `the router maps view pixels onto whatever size the picture is`() {
+        val router = HiCarInputRouter()
+        router.setDisplaySize(1920, 1080)
+        assertArrayEquals(intArrayOf(960, 540), router.map(50f, 50f, 100, 100, clamp = false))
+        assertEquals(null, router.map(120f, 50f, 100, 100, clamp = false))
+        assertArrayEquals(intArrayOf(1919, 1079), router.map(120f, 120f, 100, 100, clamp = true))
     }
 
     @Test

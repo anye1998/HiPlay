@@ -51,6 +51,7 @@ import com.shilapi.xcertplay.hicar.HiCarAdvertisementProbe
 import com.shilapi.xcertplay.hicar.HiCarController
 import com.shilapi.xcertplay.hicar.HiCarPermissions
 import com.shilapi.xcertplay.hicar.HiCarRuntimeConfig
+import com.shilapi.xcertplay.hicar.HiCarDisplaySize
 import com.shilapi.xcertplay.hicar.HiCarVideoSink
 import com.shilapi.xcertplay.hicar.HiCarStatus
 import java.security.MessageDigest
@@ -83,6 +84,14 @@ class HiCarHostActivity : ComponentActivity() {
     private var status by mutableStateOf<HiCarStatus>(HiCarStatus.Idle)
     private var model by mutableStateOf("")
     private var btAddress by mutableStateOf("")
+
+    /**
+     * The picture's real aspect ratio, used to lay out its window.
+     *
+     * Follows the decoder's output rather than the geometry offered to the phone: a handset may
+     * ignore the offer, and a window at the wrong ratio both looks wrong and puts every touch off.
+     */
+    private var videoAspect by mutableStateOf(16f / 9f)
     private var pin by mutableStateOf("")
     private var running by mutableStateOf(false)
     private val log = mutableStateListOf<String>()
@@ -539,6 +548,16 @@ class HiCarHostActivity : ComponentActivity() {
             return
         }
         controller = next
+        // Ask for the sharpest geometry this screen can actually show; the phone may answer with a
+        // different one, and the window ratio follows whatever it really sends.
+        val screen = resources.displayMetrics
+        val requested = HiCarDisplaySize.best(screen.widthPixels, screen.heightPixels)
+        next.setDisplaySize(requested)
+        videoAspect = requested.aspect
+        appendLog(
+            "display: offering ${requested.width}×${requested.height} at " +
+                "${HiCarDisplaySize.densityFor(requested.width)} dpi to the phone",
+        )
         next.start()
         // The view already exists on this screen; attach it so the first frame has somewhere to go.
         attachVideo()
@@ -555,11 +574,19 @@ class HiCarHostActivity : ComponentActivity() {
         val view = videoView ?: return
         val texture = videoTexture ?: return
         val sink: HiCarVideoSink = controller?.videoSink() ?: return
+        // The picture's real shape decides the window's shape. Without this a 1080p session would be
+        // squeezed into the 5:3 box that 800×480 happened to fit, and every touch would land off.
+        controller?.onPictureSize { width, height ->
+            runOnUiThread {
+                videoAspect = width.toFloat() / height.toFloat()
+                appendLog("video: window follows the picture, ${width}×${height}")
+            }
+        }
         sink.attach(view, texture)
         appendLog("video: window attached to the decoder (${sink.stats})")
     }
 
-    /** Maps a touch on the window into the 800×480 space the display service advertised. */
+    /** Maps a touch on the window into the picture's own coordinate space. */
     private fun videoTouch(view: View, event: MotionEvent): Boolean {
         val active = controller ?: return false
         val action = when (event.actionMasked) {
@@ -922,7 +949,7 @@ class HiCarHostActivity : ComponentActivity() {
      * `AndroidView` rather than a Compose canvas: the decoder writes into a `SurfaceTexture`, and a
      * `TextureView` is the one way to show that texture without copying frames through the GPU
      * pipeline. Touches are handled by the view itself so `MotionEvent` coordinates — not Compose
-     * pointer positions — are what gets mapped into the phone's 800×480 space.
+     * pointer positions — are what gets mapped into the phone's picture space.
      */
     @Composable
     private fun VideoPanel() {
@@ -956,7 +983,7 @@ class HiCarHostActivity : ComponentActivity() {
             },
             modifier = Modifier
                 .fillMaxWidth()
-                .aspectRatio(800f / 480f)
+                .aspectRatio(videoAspect)
                 .background(Color.Black),
         )
     }

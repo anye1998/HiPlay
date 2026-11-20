@@ -24,12 +24,34 @@ import java.util.concurrent.TimeUnit
  * Ported from `VideoSink` in huducat586/hicar-android-receiver (MIT): bounded queue, drop rather
  * than block, never record.
  */
-class HiCarVideoSink(private val onLog: (String) -> Unit) : AutoCloseable {
+class HiCarVideoSink(
+    private val onLog: (String) -> Unit,
+    /**
+     * The geometry offered to the phone. Only a starting point: once the decoder reports its output
+     * format, [outputWidth] and [outputHeight] describe what is actually being decoded, and the
+     * window and the touch mapping follow those.
+     */
+    private val offered: HiCarDisplaySize = HiCarDisplaySize.BASE,
+) : AutoCloseable {
     private val frames = ArrayBlockingQueue<Frame>(QUEUE_FRAMES)
     private var worker: Thread? = null
     private var codec: MediaCodec? = null
     private var surface: Surface? = null
     private var texture: SurfaceTexture? = null
+
+    /** What the picture really is, in pixels; starts at [offered] until the decoder says otherwise. */
+    @Volatile var outputWidth: Int = offered.width
+        private set
+    @Volatile var outputHeight: Int = offered.height
+        private set
+
+    /**
+     * Called when the decoded size differs from what was assumed.
+     *
+     * A phone may ignore the offered geometry entirely, and the window's aspect ratio and every
+     * touch coordinate depend on the real one, so the screen is told rather than left to guess.
+     */
+    @Volatile var onDisplaySize: ((Int, Int) -> Unit)? = null
 
     /**
      * The texture this sink created itself, if any.
@@ -79,7 +101,7 @@ class HiCarVideoSink(private val onLog: (String) -> Unit) : AutoCloseable {
         ownedTexture = null
         return try {
             val created = SurfaceTexture(false)
-            created.setDefaultBufferSize(DISPLAY_WIDTH, DISPLAY_HEIGHT)
+            created.setDefaultBufferSize(outputWidth, outputHeight)
             ownedTexture = created
             texture = created
             surface = Surface(created)
@@ -121,7 +143,7 @@ class HiCarVideoSink(private val onLog: (String) -> Unit) : AutoCloseable {
         if (ours != null && ours !== available) runCatching { ours.release() }
         ownedTexture = null
         texture = available
-        available.setDefaultBufferSize(DISPLAY_WIDTH, DISPLAY_HEIGHT)
+        available.setDefaultBufferSize(outputWidth, outputHeight)
         surface = Surface(available)
         visible = true
         startDecoder()
@@ -188,7 +210,7 @@ class HiCarVideoSink(private val onLog: (String) -> Unit) : AutoCloseable {
         val target = surface ?: return
         try {
             val decoder = MediaCodec.createDecoderByType(MIME)
-            val format = MediaFormat.createVideoFormat(MIME, DISPLAY_WIDTH, DISPLAY_HEIGHT)
+            val format = MediaFormat.createVideoFormat(MIME, outputWidth, outputHeight)
             format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, MAX_ACCESS_UNIT)
             format.setInteger("low-latency", 1)
             decoder.configure(format, target, null, 0)
@@ -204,7 +226,7 @@ class HiCarVideoSink(private val onLog: (String) -> Unit) : AutoCloseable {
                 it.isDaemon = true
                 it.start()
             }
-            onLog("HiSight: H.264 decoder ready (${DISPLAY_WIDTH}×$DISPLAY_HEIGHT)")
+            onLog("HiSight: H.264 decoder ready (${outputWidth}×$outputHeight)")
         } catch (failure: IOException) {
             onDecoderFailure("start", failure)
         } catch (failure: RuntimeException) {
@@ -243,10 +265,19 @@ class HiCarVideoSink(private val onLog: (String) -> Unit) : AutoCloseable {
                     if (show) rendered++
                 } else if (output == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                     val actual = decoder.outputFormat
-                    onLog(
-                        "HiSight: decoder output " + actual.getInteger(MediaFormat.KEY_WIDTH) + "×" +
-                            actual.getInteger(MediaFormat.KEY_HEIGHT),
-                    )
+                    val width = actual.getInteger(MediaFormat.KEY_WIDTH)
+                    val height = actual.getInteger(MediaFormat.KEY_HEIGHT)
+                    onLog("HiSight: decoder output $width×$height")
+                    // The phone decides the real shape; the window and every touch coordinate are
+                    // derived from it, so a differ from the offer has to be propagated, not logged
+                    // and forgotten.
+                    if (width > 0 && height > 0 && (width != outputWidth || height != outputHeight)) {
+                        outputWidth = width
+                        outputHeight = height
+                        runCatching { texture?.setDefaultBufferSize(width, height) }
+                        onLog("HiSight: picture is $width×$height (offered ${offered.width}×${offered.height}); window and touches follow it")
+                        onDisplaySize?.invoke(width, height)
+                    }
                 }
             }
         } catch (failure: IOException) {
@@ -298,8 +329,6 @@ class HiCarVideoSink(private val onLog: (String) -> Unit) : AutoCloseable {
 
     private companion object {
         const val MIME = "video/avc"
-        const val DISPLAY_WIDTH = 800
-        const val DISPLAY_HEIGHT = 480
         const val MAX_ACCESS_UNIT = 2 * 1024 * 1024
         const val QUEUE_FRAMES = 8
 
