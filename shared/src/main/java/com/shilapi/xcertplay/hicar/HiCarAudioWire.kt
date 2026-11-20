@@ -115,6 +115,16 @@ internal class HiCarAudioMedia {
         return ready
     }
 
+    /**
+     * The SSRC-derived stream ids this session has carried, for diagnostics.
+     *
+     * The phone can send several: navigation guidance and music are separate streams on the same
+     * UDP port, told apart only by the low twelve bits of the RTP SSRC. Nothing in the session
+     * setup says which is which, so the ids have to be observed before they can be routed.
+     */
+    @Synchronized
+    fun streamIds(): List<Int> = streams.keys.sorted()
+
     @Synchronized
     fun reset() {
         for (stream in streams.values) {

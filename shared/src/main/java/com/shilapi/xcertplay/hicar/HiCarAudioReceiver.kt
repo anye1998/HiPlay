@@ -105,9 +105,11 @@ internal class HiCarAudioReceiver(
                         for (frame in media.receive(plain)) sink.offer(frame)
                     }
                     if (received <= 3 || received % 500 == 0L) {
+                        val ids = media.streamIds()
                         onLog(
                             "audio: $received datagram(s), ${media.frames} AAC frame(s), " +
-                                "${media.lost} lost, ${media.duplicates} duplicate",
+                                "${media.lost} lost, ${media.duplicates} duplicate, " +
+                                "${ids.size} stream(s) [${ids.joinToString(",")}]",
                         )
                     }
                 } catch (failure: IOException) {

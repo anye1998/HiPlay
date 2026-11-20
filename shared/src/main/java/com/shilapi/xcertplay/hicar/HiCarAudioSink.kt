@@ -39,6 +39,15 @@ internal class HiCarAudioSink(context: Context, private val onLog: (String) -> U
     private var channels = 0
     private var decoded = 0L
 
+    /**
+     * Frames per RTP stream, keyed by the SSRC-derived id.
+     *
+     * The phone may carry navigation guidance and music as two streams on one UDP port. They are
+     * currently decoded into the same track, which is exactly the complaint this map exists to
+     * answer: it shows whether a second stream is even arriving before anything is routed.
+     */
+    private val streamFrames = java.util.concurrent.ConcurrentHashMap<Int, Long>()
+
     @Volatile private var closed = false
     @Volatile private var focused = true
     @Volatile private var paused = false
@@ -62,6 +71,7 @@ internal class HiCarAudioSink(context: Context, private val onLog: (String) -> U
     }
 
     fun offer(frame: HiCarAudioFrame) {
+        streamFrames.merge(frame.stream, 1L, Long::plus)
         if (closed || !focused) {
             frame.wipe()
             return
@@ -235,7 +245,11 @@ internal class HiCarAudioSink(context: Context, private val onLog: (String) -> U
         }
         if (written > 0) {
             decoded++
-            if (decoded <= 3 || decoded % 400 == 0L) onLog("audio: $decoded PCM block(s) written to the output device")
+            if (decoded <= 3 || decoded % 400 == 0L) {
+                val lanes = streamFrames.entries.sortedBy { it.key }
+                    .joinToString(", ") { "${it.key}=${it.value}" }
+                onLog("audio: $decoded PCM block(s) written to the output device; frames by stream: $lanes")
+            }
         }
     }
 
