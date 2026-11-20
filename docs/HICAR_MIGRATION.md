@@ -2693,3 +2693,70 @@ video: window follows the picture, 1600×912
 
 改成 `Display.getRealMetrics()` 取面板尺寸，于是声明 1920×1080 @ 384 dpi。dpi 与宽度同比例变化，
 手机看到的 dp 宽度恒为 800，元素物理尺寸不变，多出来的只是每 dp 背后的像素——也就是清晰度。
+
+### 7.51 音频分流：协议层走不通，改用导航焦点路由
+
+需求是把导航播报从音乐通道里分出来，走车机的通道 14。
+
+#### 先确认手机到底送了几路
+
+`debug.hicar.audio` 打出的 RTP 头，1600 个包全部是同一个：
+
+```
+audio rtp: ssrc=1003 csrc=0 extension=false marker=false payloadType=96
+audio: 1500 datagram(s), …, 1 stream(s) [1003]
+```
+
+一路流、无 CSRC、无扩展头，逐包标记里也没有藏用途的地方。**手机是把导航和音乐混成一路送下来的**，
+所以按 SSRC 分轨这条路从一开始就不成立。
+
+#### 两次尝试让手机分开，都没用
+
+华为文档《处理音频分流策略》写得很明确：分流能力要放在 `DMSDPAudioCapabilities` 的**保留字段**
+`reserveds` 里，Key-Value 形如 `1000=true / 1001=8:4096:1 / 1002=1.0`（策略串是**位掩码分组**，
+`8` = 1<<3 = 音乐，`4096` = 1<<12 = 导航播报，与文档里的 StreamType 表一致）。
+
+两次都发了，两次都无效：
+
+| 尝试 | 发给手机的内容 | 结果 |
+|---|---|---|
+| 放在 speaker 公告 `properties` 顶层 | `"1000"/"1001"/"1002"` | 仍 1 路 |
+| 放在 `2102` 里 | `{"profiles":[],"extendInfo":{…}}` | 仍 1 路 |
+
+原因在车机固件自己的 SDK 里就能看到：`HwDMSDPDevice` 里 `2102` 的值是
+`com.huawei.common.audio.AudioProfile`，字段只有 `codecs` 和 `profiles`，**没有 `reserveds`**；
+整个 APK 里也检索不到 `reserveds`、`extendInfo`（序列化名）、`8:4096` 任何一处。也就是说这台车机
+随附的 DMSDP 实现（2020 年前后的 Java 版）根本早于音频分流特性——**原厂车机自己也分不了**。
+第三方盒子能分，是因为它们实现的是新版协议，而新版协议的线格式不在这台设备上。
+
+#### 采用的办法：按导航焦点切换音频通道
+
+手机每次导航播报都会发一条入口模块帧，内容就是：
+
+```
+module 1 type 503 {"navFocus":"HICAR","navPackageName":"com.amap.h…"}
+module 1 type 503 {"navFocus":"HICAR_STOP",…}
+```
+
+这正是车机用来给导航让路的信号。于是：
+
+- 导航持有焦点期间 → `AudioTrack` 用本车机的导航通道 `14` 建轨（`AudioTrack(streamType, …)` 旧构造，
+  这是唯一能给平台不认识的通道号命名的方式）；
+- 焦点释放 → 回到原来的 usage 媒体轨（通道号 0，即本仓库一直用的那条路）。
+
+`setprop debug.hicar.navstream <n>` 可以改这个号；ROM 若拒绝该号，会打一行
+`audio: stream type N is not usable on this ROM; the media route stays` 并保持媒体轨，
+不会静默丢音。
+
+#### 边界说明
+
+分流没做成，所以**导航播报期间音乐也会跟着走通道 14**（手机对音乐是压低音量而不是静音）。
+要让二者真正独立，必须由手机分路；这台车机的协议栈做不到，除非把 DMSDP 音频能力换成新版线格式
+（目前没有可靠依据能猜对那个 JSON 结构，继续试的期望值很低）。
+
+#### 顺带补的两处诊断
+
+- `debug.hicar.frames` 现在把 JSON 帧体**按文本整段打印**（上限 2 KB），不再是 48 字节 hex——
+  手机的设备信息帧是 484 字节的 JSON，它在那里面自报版本与能力；
+- speaker 请求里 `audioparameter` 头的**值**会被打印。这是本仓库唯一解析的头，也是唯一可能藏
+  每会话 streamType 的地方。
