@@ -2562,11 +2562,23 @@ id = upper_hex( SHA-256( model.toUpperCase() + btMac.replace(":", "").toUpperCas
    目前文本形状已是默认（7.47），而 id 值本身存在 `shared_prefs/hicar-receiver.xml`
    的 `local_identity` 里，重启不影响。
 
+#### 身份现在由界面派生（f0935fff 起）
+
+应用**读不到本机蓝牙 MAC**：`BluetoothAdapter.getAddress` 对普通应用返回固定值，
+`/sys/class/net/*` 需要更高 uid，`bluetooth_address` 需要 `BLUETOOTH_PRIVILEGED`。
+所以主界面加了一个「本机蓝牙地址」输入框和一个「按蓝牙地址派生本机标识」按钮，
+按下后写入 `local_identity` 并明确提示「这台车对手机来说是新的，要去手机上删掉再配对一次」。
+
+2026-11-20 12:58 在车机上验过：填入 `98:BB:1E:67:87:ED` 后按按钮，日志是
+
+```
+Identity is already what this address derives: 4751B763A806980D15845EA846548537BDA94E5D22B27597FEAD804C13A92F69
+```
+
+即界面算法与本次成功会话所用的 id 完全一致，且因为值相同，身份没有被改动，已验证的链路不受影响。
+`rotateIdentity` 也从 8 字节随机改成了 32 字节 —— 16 字符这种形状本身就是失败原因之一。
+
 #### 遗留
 
-- 应用**读不到本机蓝牙 MAC**：只有 `settings get secure bluetooth_address` 能拿到，
-  需要 `BLUETOOTH_PRIVILEGED`；`/sys/class/net/wlan0/address` 也是权限不足。
-  参考项目因此在界面上让用户填地址。下一步是加同样的输入框并据 `SHA256(机型+MAC)` 派生，
-  让身份不再依赖 adb 写配置。
 - 触摸仍无反应（事件已按 18 源映射加密发出，手机侧不响应），协议层未查。
 - 画面 800×480，低于车机屏幕原生 1920×1080。
