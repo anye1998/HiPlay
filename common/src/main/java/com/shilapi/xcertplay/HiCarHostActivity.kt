@@ -801,7 +801,7 @@ class HiCarHostActivity : ComponentActivity() {
     private fun derivedIdentity(): String {
         val seed = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID).orEmpty()
         val digest = MessageDigest.getInstance("SHA-256").digest(seed.toByteArray())
-        return digest.copyOf(8).joinToString("") { "%02x".format(it) }
+        return digest.copyOf(8).joinToString("") { "%02X".format(it) }
     }
 
     /**
@@ -816,7 +816,7 @@ class HiCarHostActivity : ComponentActivity() {
     private fun rotateIdentity() {
         if (running) stopReceiver()
         val next = ByteArray(8).also { java.security.SecureRandom().nextBytes(it) }
-            .joinToString("") { "%02x".format(it) }
+            .joinToString("") { "%02X".format(it) }
         getSharedPreferences(PREFERENCES, MODE_PRIVATE).edit().putString(KEY_IDENTITY, next).apply()
         appendLog("Identity rotated: $next (this car looks new to the phone; press Start, then pair once)")
     }
@@ -914,7 +914,7 @@ class HiCarHostActivity : ComponentActivity() {
         val MODEL_PATTERN = Regex("[0-9A-F]{8}")
 
         /** Sixteen lowercase hex digits: what the phone keys its stored trust against. */
-        val IDENTITY_PATTERN = Regex("[0-9a-f]{16}")
+        val IDENTITY_PATTERN = Regex("[0-9a-fA-F]{16}")
 
         /** The longest value the system accepts; bring-up sessions are short anyway. */
         const val DISCOVERABLE_SECONDS = 300
