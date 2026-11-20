@@ -504,7 +504,11 @@ class HiCarController(
             return
         }
         report(HiCarStatus.PreparingNetwork)
-        usb = HiCarUsbLink(appContext, onLog) { name, address ->
+        usb = HiCarUsbLink(
+            context = appContext,
+            onLog = onLog,
+            model = config.model,
+        ) { name, address ->
             onLog("USB: the wired link is $name at $address; a phone on this cable is reachable there")
         }.also { it.start() }
         setup.execute {

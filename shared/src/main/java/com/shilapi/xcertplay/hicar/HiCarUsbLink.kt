@@ -29,12 +29,17 @@ import java.util.Collections
 internal class HiCarUsbLink(
     context: Context,
     private val onLog: (String) -> Unit,
+    /** The model id the phone is told about; it is part of the wired switch message. */
+    model: String = "",
+    /** The port the switch message advertises, and the one the endpoints listen on. */
+    port: Int = HiCarCodes.DEFAULT_CONTROL_PORT,
     /** Called once per USB attach with the interface and address the phone brought up. */
     private val onLink: (String, String) -> Unit = { _, _ -> },
 ) : AutoCloseable {
 
     private val appContext = context.applicationContext
     private val manager = appContext.getSystemService(UsbManager::class.java)
+    private val probe = HiCarUsbProbe(context, model, port, onLog)
 
     @Volatile private var closed = false
     private var watcher: Thread? = null
@@ -45,6 +50,7 @@ internal class HiCarUsbLink(
                 UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
                     val device = intent.getParcelableExtra<android.hardware.usb.UsbDevice>(UsbManager.EXTRA_DEVICE)
                     onLog("USB: device attached${device?.let { describe(it) } ?: ""}")
+                    device?.let { probe.offer(it) }
                     watchForNetwork()
                 }
                 UsbManager.ACTION_USB_DEVICE_DETACHED -> {
@@ -69,6 +75,7 @@ internal class HiCarUsbLink(
             onLog("USB: nothing on the host port; wired HiCar would start when a phone is plugged in")
         } else {
             present.forEach { onLog("USB: already attached${describe(it)}") }
+            present.forEach { probe.offer(it) }
             if (present.any { it.vendorId == HUAWEI_VID }) watchForNetwork()
         }
     }
@@ -158,6 +165,7 @@ internal class HiCarUsbLink(
         if (closed) return
         closed = true
         runCatching { appContext.unregisterReceiver(receiver) }
+        runCatching { probe.close() }
         runCatching { watcher?.join(200) }
         watcher = null
     }
