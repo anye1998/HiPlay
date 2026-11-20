@@ -2831,3 +2831,73 @@ module 1 type 503 {"navFocus":"HICAR_STOP",…}
 要实现真正的自动连接，需要一个随蓝牙回连自启的前台服务：监听
 `android.bluetooth.headsetclient.profile.action.CONNECTION_STATE_CHANGED` → 确认是已绑定的手机 →
 启动接收（此时**不广播**）。这是一块独立功能，牵涉后台常驻与耗电，建议单独一轮做，先把有线取证跑完。
+
+### 7.53 有线取证第二轮：手机肯给网卡了，车机没有那个驱动
+
+上一轮的 60 秒盯梢超时后，插着的手机一直只报 `MTP + Mass Storage`。这一轮把手机的「USB 共享网络」
+打开，手机确实换了配置——问题也随之暴露在一个更底层的环节上。
+
+#### 手机侧：换配置成功
+
+| | 仅充电 | 打开 USB 共享网络 |
+|---|---|---|
+| PID | `0x107E` | `0x108A` |
+| 配置名 | `hisuite_mass_storage` | `rndis` |
+| 接口 | 0: MTP (6/1/1)、1: Mass Storage (8/6/80) | 0: RNDIS 控制 (224/1/3)、1: RNDIS 数据 (10/0/0) |
+
+`dumpsys usb` 里这两条配置抓得清清楚楚，说明手机愿意把网络交出来——只是交的是 **RNDIS**。
+
+#### 车机侧：没有 `rndis_host`
+
+`/sys/bus/usb/drivers` 下现有的主机侧驱动是：
+
+```
+asix  cdc_ether  cdc_ncm  cdc_subset  cdc_wdm  huawei_cdc_ncm
+r8152  smsc9500  usb-storage  usbhid  usb  usbfs  hub
+```
+
+**没有 `rndis_host`**。`/sys/module/rndis` 那个是 **gadget 侧**的函数驱动（车机自己当 U 盘/网卡时用），
+跟"车机去读一台 RNDIS 手机"是两件事。RNDIS 是微软私有协议，不在 CDC 规范里，`cdc_ether`（CDC ECM）
+和 `cdc_ncm` 都绑不了它。
+
+于是结果和配置无关：接口一个都没出来。
+
+```
+$ ip -4 addr            # 车机
+inet 127.0.0.1/8        lo
+inet 192.168.43.97/24   wlan0      # 手机热点
+inet 192.168.49.1/24    p2p0
+```
+
+没有 `usb0`/`rndis0`，`HiCarUsbLink` 那边也就继续报"没等到链路"。
+
+#### 补 `.ko` 这条路也不通
+
+内核 `4.14.117-perf`，`/vendor/lib/modules` 与 `/system/lib/modules` 都读不到内容，`adb shell id` 是
+`uid=2000(shell)`，`adb root` 不可用（user 版）。没有 root 就 `insmod` 不了，而且还得有与这颗内核
+`vermagic` 完全匹配的 `rndis_host.ko`——两样都不具备。
+
+#### HiCar 要的不是 RNDIS，是 NCM
+
+`huawei_cdc_ncm` 只绑 `VID 0x12D1` + 接口 `0xFF/0x02/0x16`（另含 `0x46`、`0x76`、`0x03/0x16`）。
+RNDIS 配置里没有这个形状的接口，所以即便驱动齐了，也还是要等手机被"那条 USB 控制信息"切到 HiCar
+自己的 NCM 配置。这条信息依旧只在 NDA 版 SDK 的 `driver_usb.c` 里。
+
+顺手把两个可能藏答案的包翻了：
+
+| 包 | 结果 |
+|---|---|
+| `/system/app/HiCar/HiCar.apk`（车机自带 SDK 封装） | Java 层只有 `HiCarAdapter`/`DmsdpAdapter`/`CarAuthentication` 等薄封装，**没有** `UsbDeviceConnection`/`controlTransfer`；USB 分支在 native，`.so` 里也搜不到 `ncm`/`192.168` 字样（已 strip） |
+| `cn.manstep.phonemirrorBox`（用户 24 年买的盒子 AutoKit） | 是 CarPlay/Android Auto 的 AOA 盒子协议（`BoxProtocol`、`CMD_OPEN`、`CPlay`），全包搜不到 `ncm`/`192.168.66`，与 HiCar 有线无关 |
+
+#### 结论
+
+有线这条路，当前卡点不在车机的 USB 主机能力，也不在手机意愿，而在**那条 NDA 控制信息**：
+
+1. 手机能给出 RNDIS —— 车机没驱动，用不了；
+2. 手机愿意给 NCM —— 但要先收到控制信息，而它的字节是未知的；
+3. 靠 `HiCarUsbProbe` 盲扫 0x40 厂商请求去撞这条信息，命中概率极低，且需要车机弹窗点「允许」。
+
+在拿到那条信息（NDA 文档或真实 HiCar 车机的 USB 抓包）之前，有线连接无法继续推进；无线链路
+（BLE 广播 + RFCOMM + Wi-Fi 上的 HiSight）已经是可用形态。下一步应回到无线侧：蓝牙回连自启（7.52
+末尾的前台服务）与导航/音乐共用一个功放的问题。
