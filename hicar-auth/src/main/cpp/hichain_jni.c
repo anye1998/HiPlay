@@ -207,7 +207,10 @@ static int32_t hardware_udid(uint8_t *out, uint32_t len)
 
 static struct hks_file_callbacks g_files = { storage_read, storage_write, storage_size };
 
+struct engine_ops;
+
 struct session {
+    const struct engine_ops *ops;
     hc_handle handle;
     struct operation_parameter params;
     struct hc_pin pin;
@@ -919,6 +922,8 @@ struct vendor_api {
     int32_t (*receive_data)(hc_handle, struct uint8_buff *);
     int32_t (*delete_local_auth_info)(hc_handle, struct hc_user_info *);
     void (*destroy)(hc_handle *);
+    int32_t (*register_files)(struct hks_file_callbacks *);
+    int32_t (*hks_init)(void);
 };
 
 static struct vendor_api g_vendor;
@@ -993,9 +998,23 @@ static int32_t vendor_size(const char *name)
 static struct hks_file_callbacks g_vendor_files = { vendor_read, vendor_write, vendor_size };
 
 /* Loads the vendor stack in dependency order and points its key store at its own directory. */
-static int vendor_load(const char *directory)
+static int vendor_load(const char *directory, int share_store)
 {
     if (g_vendor_state != 0) {
+        /* Already loaded, possibly against its own private store. The real pairing has to see the
+         * car's, or it would generate a key the phone has never been told about. */
+        if (g_vendor_state > 0 && share_store && g_root_fd >= 0 &&
+            g_vendor.register_files != NULL && g_vendor.hks_init != NULL) {
+            if (g_vendor_root_fd >= 0) {
+                close(g_vendor_root_fd);
+            }
+            g_vendor_root_fd = dup(g_root_fd);
+            if (g_vendor_root_fd < 0) {
+                return 0;
+            }
+            (void)g_vendor.register_files(&g_vendor_files);
+            (void)g_vendor.hks_init();
+        }
         return g_vendor_state > 0;
     }
     g_vendor_state = -1;
@@ -1035,11 +1054,19 @@ static int vendor_load(const char *directory)
     if (register_files == NULL || init == NULL) {
         return 0;
     }
+    g_vendor.register_files = register_files;
+    g_vendor.hks_init = init;
 
-    char store[512];
-    (void)snprintf(store, sizeof(store), "%s/keystore", directory);
-    (void)mkdir(store, 0700);
-    g_vendor_root_fd = open(store, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (share_store && g_root_fd >= 0) {
+        /* The car's own store, so a pairing made by this module is visible to the vendor engine
+         * without asking the driver to pair again. Same huks_lite file layout either way. */
+        g_vendor_root_fd = dup(g_root_fd);
+    } else {
+        char store[512];
+        (void)snprintf(store, sizeof(store), "%s/keystore", directory);
+        (void)mkdir(store, 0700);
+        g_vendor_root_fd = open(store, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    }
     if (g_vendor_root_fd < 0) {
         return 0;
     }
@@ -1369,7 +1396,7 @@ Java_com_shilapi_xcertplay_hicarauth_HiChainNative_probeVendorAuthenticate(JNIEn
     if (directory != NULL) {
         const char *dir = (*env)->GetStringUTFChars(env, directory, NULL);
         if (dir != NULL) {
-            if (vendor_load(dir)) {
+            if (vendor_load(dir, 0)) {
                 struct engine_ops vendor = { "vendor", g_vendor.get_instance, g_vendor.start_pake,
                     g_vendor.authenticate_peer, g_vendor.receive_data,
                     g_vendor.delete_local_auth_info, g_vendor.destroy };
@@ -1391,6 +1418,64 @@ Java_com_shilapi_xcertplay_hicarauth_HiChainNative_probeVendorAuthenticate(JNIEn
 
     (*env)->ReleaseStringUTFChars(env, pin, code);
     return (*env)->NewStringUTF(env, report);
+}
+
+/*
+ * Which engine a real pairing uses.
+ *
+ * The firmware's SDK is the only implementation on this car that a Huawei phone is known to accept,
+ * so it can be put behind the real flow with one property: `setprop debug.hicar.vendor 1`. It shares
+ * this app's key store, so turning it on does not invalidate an existing pairing - and two runs with
+ * only that property changed say directly whether the phone's refusal is about our engine or about
+ * something neither engine provides.
+ */
+static const struct engine_ops *engine_for_session(void)
+{
+    static int decided; /* 0 unknown, 1 ours, 2 vendor */
+    static struct engine_ops vendor;
+    if (decided != 0) {
+        return (decided == 2) ? &vendor : &g_ours;
+    }
+    decided = 1;
+    char flag[PROP_VALUE_MAX] = { 0 };
+    __system_property_get("debug.hicar.vendor", flag);
+    if (flag[0] != '1' || g_root_fd < 0) {
+        return &g_ours;
+    }
+    char link[64];
+    char path[512] = { 0 };
+    (void)snprintf(link, sizeof(link), "/proc/self/fd/%d", g_root_fd);
+    ssize_t length = readlink(link, path, sizeof(path) - 1);
+    if (length <= 0) {
+        return &g_ours;
+    }
+    path[length] = '\0';
+    char *slash = strrchr(path, '/');
+    if (slash == NULL) {
+        return &g_ours;
+    }
+    *slash = '\0';
+    char abi[PROP_VALUE_MAX] = { 0 };
+    __system_property_get("ro.product.cpu.abi", abi);
+    char directory[600];
+    (void)snprintf(directory, sizeof(directory), "%s/vendor-%s", path,
+        (abi[0] != '\0') ? abi : "arm64-v8a");
+    if (!vendor_load(directory, 1)) {
+        __android_log_print(ANDROID_LOG_INFO, "HiCar",
+            "debug.hicar.vendor is set but the firmware SDK did not start; using this engine");
+        return &g_ours;
+    }
+    vendor.name = "vendor";
+    vendor.get_instance = g_vendor.get_instance;
+    vendor.start_pake = g_vendor.start_pake;
+    vendor.authenticate_peer = g_vendor.authenticate_peer;
+    vendor.receive_data = g_vendor.receive_data;
+    vendor.delete_local_auth_info = g_vendor.delete_local_auth_info;
+    vendor.destroy = g_vendor.destroy;
+    decided = 2;
+    __android_log_print(ANDROID_LOG_INFO, "HiCar",
+        "pairing runs on the firmware's authentication SDK (debug.hicar.vendor=1)");
+    return &vendor;
 }
 
 JNIEXPORT jlong JNICALL
@@ -1436,7 +1521,9 @@ Java_com_shilapi_xcertplay_hicarauth_HiChainNative_create(JNIEnv *env, jclass cl
     session->callbacks.set_service_result = on_service_result;
     session->callbacks.confirm_receive_request = on_confirm;
 
-    session->handle = get_instance(&session->identity, (enum hc_type)role, &session->callbacks);
+    session->ops = engine_for_session();
+    session->handle = session->ops->get_instance(&session->identity, (enum hc_type)role,
+        &session->callbacks);
     if (session->handle == NULL) {
         memset(session, 0, sizeof(*session));
         free(session);
@@ -1465,7 +1552,7 @@ Java_com_shilapi_xcertplay_hicarauth_HiChainNative_step(JNIEnv *env, jclass claz
 
     int32_t code;
     if (data == NULL) {
-        code = start_pake(session->handle, &session->params);
+        code = session->ops->start_pake(session->handle, &session->params);
     } else {
         jsize length = (*env)->GetArrayLength(env, data);
         if (length <= 0 || length > (jsize)MAX_PACKET_BYTES) {
@@ -1478,7 +1565,7 @@ Java_com_shilapi_xcertplay_hicarauth_HiChainNative_step(JNIEnv *env, jclass claz
         (*env)->GetByteArrayRegion(env, data, 0, length, (jbyte *)packet);
         packet[length] = 0;
         struct uint8_buff buffer = { packet, (uint32_t)length, (uint32_t)length };
-        code = receive_data(session->handle, &buffer);
+        code = session->ops->receive_data(session->handle, &buffer);
         memset(packet, 0, (size_t)length);
         free(packet);
     }
@@ -1563,7 +1650,7 @@ Java_com_shilapi_xcertplay_hicarauth_HiChainNative_forgetPeer(JNIEnv *env, jclas
     if (info.auth_id.length == 0) {
         return -1;
     }
-    return delete_local_auth_info(session->handle, &info);
+    return session->ops->delete_local_auth_info(session->handle, &info);
 }
 
 JNIEXPORT void JNICALL
@@ -1575,7 +1662,7 @@ Java_com_shilapi_xcertplay_hicarauth_HiChainNative_close(JNIEnv *env, jclass cla
         return;
     }
     if (session->handle != NULL) {
-        destroy(&session->handle);
+        session->ops->destroy(&session->handle);
     }
     for (uint32_t index = 0; index < session->count; index++) {
         if (session->packets[index] != NULL) {
