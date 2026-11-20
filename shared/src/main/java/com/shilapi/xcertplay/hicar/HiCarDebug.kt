@@ -15,6 +15,13 @@ internal object HiCarDebug {
         (get.invoke(null, name) as? String)?.trim() == "1"
     }.getOrDefault(false)
 
+    /** A textual property, for a value the platform will not hand to a third-party app. */
+    fun text(name: String): String = runCatching {
+        val properties = Class.forName("android.os.SystemProperties")
+        val get = properties.getMethod("get", String::class.java)
+        (get.invoke(null, name) as? String)?.trim().orEmpty()
+    }.getOrDefault("")
+
     /** A numeric property, for a value that differs between head units rather than being a switch. */
     fun number(name: String, fallback: Int): Int = runCatching {
         val properties = Class.forName("android.os.SystemProperties")

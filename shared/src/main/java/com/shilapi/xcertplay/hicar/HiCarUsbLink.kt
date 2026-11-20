@@ -44,12 +44,18 @@ internal class HiCarUsbLink(
     @Volatile private var closed = false
     private var watcher: Thread? = null
 
+    /** Incremented per attach; a poller from an older attach sees a stale token and exits. */
+    @Volatile private var generation = 0
+
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.action) {
                 UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
                     val device = intent.getParcelableExtra<android.hardware.usb.UsbDevice>(UsbManager.EXTRA_DEVICE)
                     onLog("USB: device attached${device?.let { describe(it) } ?: ""}")
+                    device?.takeIf { inNcmConfiguration(it) }?.let {
+                        onLog("USB: the phone arrived already in the HiCar NCM configuration")
+                    }
                     device?.let { probe.offer(it) }
                     watchForNetwork()
                 }
@@ -81,21 +87,21 @@ internal class HiCarUsbLink(
     }
 
     /**
-     * Follows the interface table for a minute after an attach.
+     * Follows the interface table for three minutes after an attach.
      *
-     * The NCM interface does not exist at attach time - the phone enumerates, then the host driver
-     * binds, then DHCP or a static assignment appears - so a single read would report nothing and
-     * look like "USB does not work here". A minute is long enough for any of those paths and short
-     * enough not to leave a thread polling forever.
+     * The NCM interface does not exist at attach time - the phone enumerates, the host driver binds,
+     * then the address appears - and a phone that was told to switch re-enumerates again, which is a
+     * second attach a few seconds later. So each attach restarts the window instead of the first one
+     * owning it: the switch that matters happens after the second enumeration, not the first.
      */
     private fun watchForNetwork() {
         if (closed) return
-        if (watcher?.isAlive == true) return
+        val token = ++generation
         watcher = Thread({
             val seen = HashSet<String>()
             val deadline = System.currentTimeMillis() + WATCH_MILLIS
             var reported = false
-            while (!closed && System.currentTimeMillis() < deadline) {
+            while (!closed && generation == token && System.currentTimeMillis() < deadline) {
                 for ((name, address) in interfaces()) {
                     if (!seen.add(name)) continue
                     val kind = if (isPhoneLink(name)) "wired link" else "interface"
@@ -139,6 +145,21 @@ internal class HiCarUsbLink(
     private fun isPhoneLink(name: String): Boolean =
         PHONE_LINK_PREFIXES.any { name.startsWith(it) }
 
+    /**
+     * The shape `huawei_cdc_ncm` binds, which is the only evidence that the switch actually landed.
+     *
+     * The phone's other USB modes (MTP, RNDIS tethering) never present this triple, and this head
+     * unit has no `rndis_host`, so a network interface can only appear from a phone that took the
+     * HiCar NCM configuration.
+     */
+    private fun inNcmConfiguration(device: android.hardware.usb.UsbDevice): Boolean =
+        (0 until device.interfaceCount).any { index ->
+            val contract = device.getInterface(index)
+            contract.interfaceClass == UsbConstants.USB_CLASS_VENDOR_SPEC &&
+                contract.interfaceSubclass == NCM_SUBCLASS &&
+                contract.interfaceProtocol in NCM_PROTOCOLS
+        }
+
     private fun prefixOf(nic: NetworkInterface): Int = runCatching {
         nic.interfaceAddresses.firstOrNull { it.address is Inet4Address }?.networkPrefixLength?.toInt() ?: 24
     }.getOrDefault(24)
@@ -146,15 +167,19 @@ internal class HiCarUsbLink(
     private fun describe(device: android.hardware.usb.UsbDevice): String {
         val vendor = if (device.vendorId == HUAWEI_VID) " (Huawei)" else ""
         val classes = (0 until device.interfaceCount).joinToString(",") { index ->
-            when (device.getInterface(index).interfaceClass) {
+            val contract = device.getInterface(index)
+            when (contract.interfaceClass) {
                 UsbConstants.USB_CLASS_COMM -> "comm"
                 UsbConstants.USB_CLASS_CDC_DATA -> "cdc-data"
                 UsbConstants.USB_CLASS_MASS_STORAGE -> "storage"
                 UsbConstants.USB_CLASS_HID -> "hid"
                 UsbConstants.USB_CLASS_AUDIO -> "audio"
                 UsbConstants.USB_CLASS_MISC -> "misc"
-                UsbConstants.USB_CLASS_VENDOR_SPEC -> "vendor"
-                else -> "class${device.getInterface(index).interfaceClass}"
+                // A vendor interface is the interesting one: print the triple so the NCM shape is
+                // readable straight from the log instead of guessed at.
+                UsbConstants.USB_CLASS_VENDOR_SPEC ->
+                    "vendor/%02X/%02X".format(contract.interfaceSubclass, contract.interfaceProtocol)
+                else -> "class${contract.interfaceClass}"
             }
         }
         return ": ${device.deviceName} vid=0x%04X pid=0x%04X%s interfaces=[%s]"
@@ -172,9 +197,18 @@ internal class HiCarUsbLink(
 
     private companion object {
         const val HUAWEI_VID = 0x12D1
-        /** Long enough for enumerate → bind → address assignment, short enough to give up visibly. */
-        const val WATCH_MILLIS = 60_000L
+
+        /**
+         * Long enough to cover enumerate -> switch (a second enumeration) -> bind -> address.
+         * Restarted by every attach, so the second enumeration gets its own full window.
+         */
+        const val WATCH_MILLIS = 180_000L
         const val POLL_MILLIS = 1_500L
+
+        /** The triple `huawei_cdc_ncm` binds; see [inNcmConfiguration]. */
+        const val NCM_SUBCLASS = 0x02
+        val NCM_PROTOCOLS = setOf(0x16, 0x46, 0x76)
+
         val PHONE_LINK_PREFIXES = listOf("usb", "wwan", "ncm", "rndis", "eth")
     }
 }

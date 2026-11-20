@@ -1,6 +1,7 @@
 package com.shilapi.xcertplay.hicar
 
 import android.app.PendingIntent
+import android.bluetooth.BluetoothAdapter
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -8,29 +9,46 @@ import android.content.IntentFilter
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
 import android.os.Build
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.security.MessageDigest
+import kotlin.random.Random
 
 /**
  * Asks a plugged-in phone to switch to the NCM configuration HiCar uses on a cable.
  *
- * Huawei's wired flow is documented up to one step: the car sends "一条 USB 控制信息，包含当前的车辆
- * 信息、是否支持 NCM、IP 和端口", and the phone answers by re-enumerating with a vendor-specific NCM
- * interface. That message is specified only in the NDA copy of the SDK (`driver_usb.c`), so its bytes
- * are not available here.
+ * This request used to be the one part of the wired flow without a public description. It is not
+ * missing any more: this head unit ships Huawei's own car-side stack (`com.huawei.nearby`, i.e.
+ * `HwNearbyCar.apk`), and that Java is neither packed nor encrypted. `com.huawei.nearby.c.e` - log
+ * tag `CarInfoHandler` - builds a 91-byte car-info block and hands it straight to
+ * `UsbDeviceConnection.controlTransfer(0x40, 0x34, 0, 0xA0, data, 91, 2000)`.
  *
- * What *is* available is a clean oracle. This head unit's kernel carries `huawei_cdc_ncm`, which
- * binds nothing but VID 0x12D1 interfaces of class 0xff/0x02/0x16 (and 0x46, 0x76, 0x03/0x16) — the
- * exact shape HiCar's wired mode presents. So "did the message land" is not a guess: the phone either
- * re-appears with that interface, or it does not.
+ * The block is little-endian and self-describing:
  *
- * The search is therefore run as evidence rather than belief. First every vendor request code is
- * offered with a one-byte body and the return value recorded: Android's composite gadget stalls
- * whatever it does not implement, so the codes that answer are the ones worth talking to. Then each
- * accepted code is given the vehicle information in the several shapes a car could plausibly send.
- * Anything that makes the phone re-enumerate ends the search and is logged as the answer.
+ * | offset | content |
+ * |---|---|
+ * | 0 | `"hwnearby"` |
+ * | 8 | total length, `0x005B` |
+ * | 10 | `0x0001`, `0x0100`, `0x0001`, then `00 01 01` |
+ * | 19 | tag 1, len 3, model id |
+ * | 24 | tag 2, len 1, sub-model id |
+ * | 27 | tag 3, len 32, device id |
+ * | 61 | tag 4, len 6, the head unit's Bluetooth address |
+ * | 69 | tag 6, len 14, the address the phone should dial |
+ * | 85 | tag 7, len 4, the port it should dial |
  *
- * Everything here is behind `setprop debug.hicar.usbprobe 1`: firing vendor requests at the phone's
- * gadget is not something to do on every plug-in, and a request the phone half-handles is best
- * followed by a deliberate replug rather than a surprise.
+ * The device id is `SHA256(model id ‖ sub-model id ‖ Bluetooth address)`; the address is
+ * `192.168.66.` plus a number in 100..254, and the port comes from a `ServerSocket(0)` the real
+ * implementation opens just before sending - the car listens and the phone dials. This build
+ * advertises the control port it already listens on instead, which is what the phone would reach if
+ * the interface could be brought up.
+ *
+ * The oracle for "did it land" stays the same: `huawei_cdc_ncm` binds nothing but interfaces of
+ * class 0xff / subclass 0x02 / protocol 0x16 (and 0x46, 0x76), so the phone either re-enumerates
+ * with that interface or it does not.
+ *
+ * Everything here is behind `setprop debug.hicar.usbprobe 1`: firing vendor requests at a phone's
+ * gadget is not something to do on every plug-in.
  */
 internal class HiCarUsbProbe(
     context: Context,
@@ -95,48 +113,19 @@ internal class HiCarUsbProbe(
             return stop()
         }
         try {
-            // Step one: which vendor request codes does this phone answer at all?
-            val accepted = ArrayList<Int>()
-            for (code in 1..MAX_REQUEST) {
-                val result = connection.controlTransfer(REQUEST_OUT, code, 0, 0, ByteArray(1), 1, TIMEOUT_MS)
-                if (result >= 0) accepted.add(code)
-                if (switched(usb, serial)) {
-                    onLog("USB probe: the phone switched during the roll-call (request 0x%02X)".format(code))
-                    return
-                }
-            }
-            onLog(
-                "USB probe: ${accepted.size} of $MAX_REQUEST vendor request codes answered" +
-                    if (accepted.isEmpty()) "" else ": ${accepted.joinToString(",") { "0x%02X".format(it) }}",
-            )
-            if (accepted.isEmpty()) {
-                onLog("USB probe: the phone stalls every vendor request, so the switch is not driven from here")
+            val packet = carInfo()
+            onLog("USB probe: car info ${packet.size} bytes: ${HiCarDebug.hex(packet, packet.size)}")
+            val sent = connection.controlTransfer(REQUEST_OUT, REQUEST_CODE, 0, REQUEST_INDEX, packet, packet.size, TIMEOUT_MS)
+            onLog("USB probe: control transfer 0x40/0x34 index 0xA0 -> $sent (expected ${packet.size})")
+            if (sent < 0) {
+                onLog("USB probe: the phone stalled the request; nothing else to try from here")
                 return
             }
-
-            // Step two: give each answered code the vehicle information in the shapes a car could send.
-            val payloads = payloads()
-            for (code in accepted) {
-                for ((index, payload) in payloads.withIndex()) {
-                    val result = connection.controlTransfer(
-                        REQUEST_OUT, code, 0, 0, payload, payload.size, TIMEOUT_MS,
-                    )
-                    onLog(
-                        "USB probe: 0x%02X payload %d/%d (%d bytes) -> %d".format(
-                            code, index + 1, payloads.size, payload.size, result,
-                        ),
-                    )
-                    if (switched(usb, serial)) {
-                        onLog(
-                            "USB probe: the phone switched to the HiCar NCM configuration with " +
-                                "request 0x%02X and payload %d".format(code, index + 1),
-                        )
-                        return
-                    }
-                    Thread.sleep(PAUSE_MS)
-                }
+            if (switched(usb, serial, SWITCH_WAIT_MS)) {
+                onLog("USB probe: the phone switched to the HiCar NCM configuration")
+                return
             }
-            onLog("USB probe: no combination made the phone switch; the format is not among these guesses")
+            onLog("USB probe: the request was accepted but the phone stayed in its current configuration")
         } catch (failure: Exception) {
             onLog("USB probe: stopped (${failure.javaClass.simpleName})")
         } finally {
@@ -150,18 +139,118 @@ internal class HiCarUsbProbe(
     }
 
     /**
+     * The 91 bytes of car info, in the order and encoding the stock stack uses.
+     *
+     * The model id is the same eight hexadecimal digits the advertisement carries, split the same
+     * way the beacon splits them: three bytes plus a one-byte sub-model. A model that is not eight
+     * hex digits is a configuration error, and sending zeros is more honest than sending a guess -
+     * the log says so either way.
+     */
+    private fun carInfo(): ByteArray {
+        val modelBytes = ByteArray(3)
+        var subModel = 0.toByte()
+        if (MODEL.matches(model)) {
+            for (index in 0 until 3) {
+                modelBytes[index] = model.substring(index * 2, index * 2 + 2).toInt(16).toByte()
+            }
+            subModel = model.substring(6, 8).toInt(16).toByte()
+        } else {
+            onLog("USB probe: model '$model' is not eight hex digits; sending zeros")
+        }
+        val address = bluetoothAddress()
+        val deviceId = MessageDigest.getInstance("SHA-256").run {
+            update(modelBytes)
+            update(subModel)
+            update(address)
+            digest()
+        }
+        val host = "192.168.66." + Random.nextInt(ADDRESS_MIN, ADDRESS_MAX + 1)
+        val dialPort = HiCarDebug.number(PORT_PROP, port)
+
+        val buffer = ByteBuffer.allocate(PACKET_SIZE).order(ByteOrder.LITTLE_ENDIAN)
+        buffer.put(MAGIC.toByteArray(Charsets.US_ASCII))
+        buffer.putShort(PACKET_SIZE.toShort())
+        buffer.putShort(1.toShort())
+        buffer.putShort(VERSION)
+        buffer.putShort(1.toShort())
+        buffer.put(0.toByte())
+        buffer.put(1.toByte())
+        buffer.put(1.toByte())
+        buffer.put(MODEL_ID_TAG)
+        buffer.put(3.toByte())
+        buffer.put(modelBytes)
+        buffer.put(SUB_MODEL_TAG)
+        buffer.put(1.toByte())
+        buffer.put(subModel)
+        buffer.put(DEVICE_ID_TAG)
+        buffer.put(DEVICE_ID_BYTES.toByte())
+        buffer.put(deviceId)
+        buffer.put(BLUETOOTH_TAG)
+        buffer.put(6.toByte())
+        buffer.put(address)
+        buffer.put(HOST_TAG)
+        buffer.put(HOST_BYTES.toByte())
+        buffer.put(host.toByteArray(Charsets.US_ASCII))
+        buffer.put(PORT_TAG)
+        buffer.put(4.toByte())
+        buffer.putInt(dialPort)
+        return buffer.array()
+    }
+
+    /**
+     * The head unit's Bluetooth address, which the phone folds into the device id it remembers.
+     *
+     * Apps cannot read the real address on modern Android - the framework hands out
+     * `02:00:00:00:00:00` - so `debug.hicar.btmac` exists for the value the settings screen already
+     * knows. A wrong address does not break the switch, but it makes the phone see a new car.
+     */
+    private fun bluetoothAddress(): ByteArray {
+        val override = HiCarDebug.text(BTMAC_PROP)
+        val text = override.ifEmpty {
+            runCatching { BluetoothAdapter.getDefaultAdapter()?.address }.getOrNull().orEmpty()
+        }
+        val bytes = parseAddress(text)
+        if (bytes == null) {
+            onLog("USB probe: no usable Bluetooth address ('$text'); sending zeros. setprop $BTMAC_PROP aa:bb:cc:dd:ee:ff")
+            return ByteArray(6)
+        }
+        return bytes
+    }
+
+    private fun parseAddress(text: String): ByteArray? {
+        val parts = text.split(':', '-')
+        if (parts.size != 6) return null
+        val bytes = ByteArray(6)
+        for (index in 0 until 6) {
+            val value = parts[index].toIntOrNull(16) ?: return null
+            if (value !in 0..255) return null
+            bytes[index] = value.toByte()
+        }
+        return bytes
+    }
+
+    /**
      * The phone re-appears with a vendor-specific interface when it accepts the switch.
      *
      * The serial is kept because the device object itself is replaced by re-enumeration; matching on
      * vendor alone would also match a second Huawei device on a hub.
      */
-    private fun switched(usb: UsbManager, serial: String): Boolean {
-        val devices = runCatching { usb.deviceList.values.toList() }.getOrNull() ?: return false
-        return devices.any { device ->
-            device.vendorId == HUAWEI_VID &&
-                (serial.isEmpty() || runCatching { device.serialNumber }.getOrNull() == serial) &&
-                inNcmConfiguration(device)
+    private fun switched(usb: UsbManager, serial: String, waitMillis: Long): Boolean {
+        val deadline = System.currentTimeMillis() + waitMillis
+        while (System.currentTimeMillis() < deadline) {
+            val devices = runCatching { usb.deviceList.values.toList() }.getOrNull().orEmpty()
+            val match = devices.firstOrNull { device ->
+                device.vendorId == HUAWEI_VID &&
+                    (serial.isEmpty() || runCatching { device.serialNumber }.getOrNull() == serial) &&
+                    inNcmConfiguration(device)
+            }
+            if (match != null) {
+                onLog("USB probe: phone now reports ${describe(match)}")
+                return true
+            }
+            Thread.sleep(POLL_MS)
         }
+        return false
     }
 
     private fun inNcmConfiguration(device: UsbDevice): Boolean =
@@ -172,23 +261,14 @@ internal class HiCarUsbProbe(
                 contract.interfaceProtocol in NCM_PROTOCOLS
         }
 
-    /**
-     * The vehicle information, in the shapes a car-side implementation could plausibly serialise.
-     *
-     * The documented content is fixed - model, NCM support, IP, port - so only the encoding varies
-     * between them. JSON in two key spellings, a flat variant, and a delimited one, which is what a
-     * C implementation writing straight to a buffer tends to produce.
-     */
-    private fun payloads(): List<ByteArray> {
-        val address = NCM_ADDRESS
-        val bodies = listOf(
-            """{"modelId":"$model","supportNcm":1,"ip":"$address","port":$port}""",
-            """{"modelId":"$model","supportNcm":true,"ip":"$address","port":$port}""",
-            """{"deviceModel":"$model","supportNcm":true,"ip":"$address","port":$port}""",
-            """{"modelId":"$model","ncm":true,"ipv4":"$address","port":$port}""",
-            "$model;1;$address;$port",
-        )
-        return bodies.map { it.toByteArray(Charsets.US_ASCII) }
+    private fun describe(device: UsbDevice): String {
+        val interfaces = (0 until device.interfaceCount).joinToString(",") { index ->
+            val contract = device.getInterface(index)
+            "%02X/%02X/%02X".format(
+                contract.interfaceClass, contract.interfaceSubclass, contract.interfaceProtocol,
+            )
+        }
+        return "vid=0x%04X pid=0x%04X interfaces=[%s]".format(device.vendorId, device.productId, interfaces)
     }
 
     private fun register() {
@@ -213,19 +293,39 @@ internal class HiCarUsbProbe(
 
     private companion object {
         const val PROP = "debug.hicar.usbprobe"
+        const val BTMAC_PROP = "debug.hicar.btmac"
+        const val PORT_PROP = "debug.hicar.usbport"
         const val HUAWEI_VID = 0x12D1
+
+        const val MAGIC = "hwnearby"
+        const val PACKET_SIZE = 91
+        const val VERSION: Short = 0x0100
+
+        val MODEL_ID_TAG: Byte = 1
+        val SUB_MODEL_TAG: Byte = 2
+        val DEVICE_ID_TAG: Byte = 3
+        val BLUETOOTH_TAG: Byte = 4
+        val HOST_TAG: Byte = 6
+        val PORT_TAG: Byte = 7
+        const val DEVICE_ID_BYTES = 32
+        const val HOST_BYTES = 14
+
+        const val ADDRESS_MIN = 100
+        const val ADDRESS_MAX = 254
+
+        val MODEL = Regex("[0-9a-fA-F]{8}")
+
         const val USB_CLASS_VENDOR = 0xFF
         const val NCM_SUBCLASS = 0x02
         val NCM_PROTOCOLS = setOf(0x16, 0x46, 0x76)
 
         /** Vendor, host to device: the only direction that can carry a command. */
         const val REQUEST_OUT = 0x40
-        const val MAX_REQUEST = 0xFF
-        const val TIMEOUT_MS = 300
-        const val PAUSE_MS = 150L
-
-        /** Where the car takes its address from, per the wired-connection guide's 192.168.66.0/24. */
-        const val NCM_ADDRESS = "192.168.66.100"
+        const val REQUEST_CODE = 0x34
+        const val REQUEST_INDEX = 0xA0
+        const val TIMEOUT_MS = 2000
+        const val SWITCH_WAIT_MS = 8_000L
+        const val POLL_MS = 250L
 
         const val ACTION_PERMISSION = "com.shilapi.xcertplay.hicar.USB_PERMISSION"
     }
