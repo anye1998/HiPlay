@@ -2582,3 +2582,57 @@ Identity is already what this address derives: 4751B763A806980D15845EA846548537B
 
 - 触摸仍无反应（事件已按 18 源映射加密发出，手机侧不响应），协议层未查。
 - 画面 800×480，低于车机屏幕原生 1920×1080。
+
+### 7.49 触摸通了：能力声明在通道存在之前就被问掉了
+
+现象是"点画面毫无反应"，而日志一直显示事件发出去了：
+
+```
+touch: down view=1872x1123 at (10,585) -> (4,250) of 800x480 sent=true
+UIBC: 1 encrypted input event(s) sent
+```
+
+不报错、不断连、手机静默丢弃。
+
+#### 根因
+
+```kotlin
+HiCarHiSightWire(sessionKey, onLog, withInput = input.ready())
+```
+
+`input.ready()` 问的是"输入通道建好了吗"，而输入通道在 `openMedia()` 里才创建 —— 那是在
+`ANNOUNCE → OPTIONS → GET_PARAMETER → SET_PARAMETER(SETUP) → 200` 全部走完之后。
+所以协商能力时它**必然**是 false，`his_uibc_capability` 从未出现在 GET_PARAMETER 的回复里。
+
+手机仍然在 `Transport` 头里给了 `remotectl_port`（它总是给），于是我们连上了、写了、以为通了，
+而手机没有理由路由这些事件。**"端口连上了"不等于"被允许输入"**，这条坑值得单独记住。
+
+#### 修复与证据
+
+能力改为恒声明（与参考项目 `inputEnabled = router != null` 同语义），每次触摸仍问路由器，
+没有画面时不发。修复后同一台车机、同一部手机：
+
+```
+13:25:18  GET_PARAMETER, 297-byte body
+13:25:18  capability answer for 15 request(s): his_version,his_video_formats,his_device_type,his_uibc_capability
+13:25:18  video port negotiated; input port also offered
+13:25:18  UIBC input connected to 192.168.49.2:40719
+13:25:25  touch: down view=1872x1123 at (117,346) -> (50,147) of 800x480 sent=true
+```
+
+手机请求了 15 项、我们答了 4 项，`his_uibc_capability` 第一次出现在答案里，随后的点按、滑动
+全部生效，用户确认位置准确（视图 1872×1123 与 800×480 同为 5:3，等比映射无偏移）。
+
+顺带加了两个诊断点，避免下一次再靠推理：
+- `capability answer for N request(s): …` 打印手机真正请求了哪些、我们真正答了哪些；
+- `UIBC input connected to <ip>:<port>` 打印实际连上的输入端口（之前只有一句"also offered"）。
+
+#### 现在这条链路的完整状态
+
+画面、声音、点按/滑动/返回/主页、绑定后免码重连，均已在真机实测通过。
+
+#### 遗留
+
+- 画面 800×480，低于车机屏幕原生 1920×1080。
+- 车机侧 `module 1` 的若干应用帧（type 17/500/502/503/504/519/523）仍只记录不处理，
+  目前不影响已通的功能。
