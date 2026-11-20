@@ -914,7 +914,15 @@ class HiCarHostActivity : ComponentActivity() {
         val MODEL_PATTERN = Regex("[0-9A-F]{8}")
 
         /** Sixteen lowercase hex digits: what the phone keys its stored trust against. */
-        val IDENTITY_PATTERN = Regex("[0-9a-fA-F]{16}")
+        /**
+         * 16 or 64 upper-case hex characters.
+         *
+         * 64 is the shape the car's own HiCar SDK uses: `com.huawei.hicarsdk.DeviceId` formats
+         * `byte2HexFormatted` for a 32-byte id and its `DEFAULT_DEVICE_ID` placeholder is exactly
+         * 64 characters, the same length a phone reports. The 16-character form is kept because
+         * every build before 7.48 advertised it.
+         */
+        val IDENTITY_PATTERN = Regex("[0-9a-fA-F]{16}|[0-9a-fA-F]{64}")
 
         /** The longest value the system accepts; bring-up sessions are short anyway. */
         const val DISCOVERABLE_SECONDS = 300
