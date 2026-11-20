@@ -255,9 +255,19 @@ internal class HiCarHiSightWire(
                             "left_point_up, left_move, left_key_down, left_key_up;"
                 }
                 val answer = StringBuilder()
+                val answered = ArrayList<String>()
                 for ((name, value) in caps) {
-                    if (requested.contains(name)) answer.append(name).append(": ").append(value).append("\r\n")
+                    if (requested.contains(name)) {
+                        answer.append(name).append(": ").append(value).append("\r\n")
+                        answered.add(name)
+                    }
                 }
+                // Which capabilities the phone actually asked for decides whether it will route
+                // touches at all, so the answer is logged by name rather than left to inference.
+                onLog(
+                    "HiSight: capability answer for ${requested.size} request(s): " +
+                        if (answered.isEmpty()) "none matched" else answered.joinToString(","),
+                )
                 replies.add(pack(message("RTSP/1.0 200 OK", seq, answer.toString())))
             }
 

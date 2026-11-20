@@ -53,7 +53,12 @@ internal class HiCarHiSightClient(
         try {
             val sessionKey = synchronized(this) { key?.copyOf() } ?: throw HiCarWireException("video key unavailable")
             protocol = try {
-                HiCarHiSightWire(sessionKey, onLog, withInput = input.ready())
+                // Always offered: the capability question is asked during ANNOUNCE/GET_PARAMETER,
+                // long before the input socket exists, so asking the router here is guaranteed to
+                // answer false. That was the defect - the phone was never told this receiver can
+                // take touches, so it offered `remotectl_port` (it always does) and then dropped
+                // every encrypted event written to it. The router is consulted per touch instead.
+                HiCarHiSightWire(sessionKey, onLog, withInput = true)
             } finally {
                 sessionKey.fill(0)
             }
@@ -114,11 +119,13 @@ internal class HiCarHiSightClient(
             val inputKey = synchronized(this) { key?.copyOf() }
             if (inputKey != null) {
                 try {
-                    val channel = HiCarInputChannel(connect(protocol.inputPort), inputKey, input, active, onLog)
+                    val channel = HiCarInputChannel(
+                        connect(protocol.inputPort), inputKey, input, active, onLog,
+                    )
                     inputKey.fill(0)
                     channel.start()
                     inputChannel = channel
-                    onLog("HiSight: UIBC input connected; only touches inside the video window are sent")
+                    onLog("HiSight: UIBC input connected to $peer:${protocol.inputPort}")
                 } catch (failure: IOException) {
                     inputKey.fill(0)
                     onLog("HiSight: input channel unavailable (${failure.javaClass.simpleName}); the picture continues")
