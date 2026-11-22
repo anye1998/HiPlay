@@ -19,16 +19,24 @@ import android.view.TextureView
 import android.view.View
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.systemBars
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
@@ -42,36 +50,49 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.core.content.pm.PackageInfoCompat
 import com.shilapi.xcertplay.hicar.HiCarAdvertisementProbe
 import com.shilapi.xcertplay.hicar.HiCarController
+import com.shilapi.xcertplay.hicar.HiCarDisplaySettings
 import com.shilapi.xcertplay.hicar.HiCarPermissions
 import com.shilapi.xcertplay.hicar.HiCarRuntimeConfig
 import com.shilapi.xcertplay.hicar.HiCarDisplaySize
 import com.shilapi.xcertplay.hicar.HiCarVideoSink
+import com.shilapi.xcertplay.hicar.HiCarSpeedVolumeSettings
 import com.shilapi.xcertplay.hicar.HiCarStatus
+import com.shilapi.xcertplay.hicar.HiCarVideoFit
+import com.shilapi.xcertplay.hicar.HiCarWindowMode
 import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
 /**
- * Experimental HiCar receiver screen.
+ * The HiCar receiver: the only screen this app has.
  *
- * It is deliberately a separate, non-launcher activity: the chain has no media stage yet, so it is a
- * diagnostic surface rather than a feature the driver should reach from the CarPlay home screen.
- * The log can be written to a file from here, because the run that fails is usually over before
- * anyone can read the screen. Start it from a shell during bring-up:
+ * Three surfaces, one activity:
  *
- * ```
- * adb shell am start -n com.shihab.diplay/com.shilapi.xcertplay.HiCarHostActivity
- * ```
+ * - the **setup page** — the connection code, Start, and the tail of the log, for the moments before
+ *   a phone is present;
+ * - the **session page** — the phone's picture, fitted rather than stretched, with Stop, the two
+ *   navigation keys, the microphone and a settings entry that works *while* connected;
+ * - the **settings page** — a full-screen overlay over whichever of the two is behind it, so opening
+ *   it never tears the session down. Connection details, display mode, speed-linked music gain and
+ *   the diagnostic probes live here.
+ *
+ * Everything is drawn by this activity rather than by a second one: a settings activity in front
+ * would pause this one, and a paused surface is where a mirrored picture goes black.
  *
  * Copy is Simplified Chinese on purpose, and hardcoded rather than taken from `strings.xml`: this is
  * a bring-up surface for the person holding the head unit, and the labels must read the same no matter
@@ -108,6 +129,18 @@ class HiCarHostActivity : ComponentActivity() {
 
     /** Whether the car's microphone is offered; off unless the driver turns it on. */
     private var microphoneEnabled by mutableStateOf(false)
+
+    /** Whether the settings page is drawn over the receiver; the session keeps running either way. */
+    private var settingsOpen by mutableStateOf(false)
+
+    /** The window mode in force; loaded once and re-applied whenever the settings page changes it. */
+    private var windowMode by mutableStateOf(HiCarWindowMode.FULLSCREEN)
+
+    /** The speed-volume values the settings page edits; the controller gets them on every change. */
+    private var speedSettings by mutableStateOf(HiCarSpeedVolumeSettings())
+
+    /** The session overlay's log panel starts closed: the picture is the point of that screen. */
+    private var sessionLogVisible by mutableStateOf(false)
 
     /** Longer than [log]: the screen keeps a readable tail, the export keeps the whole attempt. */
     private val history = ArrayList<String>()
@@ -166,6 +199,10 @@ class HiCarHostActivity : ComponentActivity() {
         btAddress = storedBluetoothAddress()
         pin = storedPin()
         microphoneEnabled = storedMicrophone()
+        windowMode = HiCarDisplaySettings.load(this)
+        speedSettings = HiCarSpeedVolumeSettings.load(this)
+        // Before the first frame, so the activity never appears with the wrong bars and then jumps.
+        applyWindowMode()
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
@@ -183,31 +220,212 @@ class HiCarHostActivity : ComponentActivity() {
         super.onDestroy()
     }
 
+    /**
+     * Which layout the screen shows.
+     *
+     * The diagnostic page is what a driver needs before a connection (the code, the start button);
+     * once the phone is authenticated the picture is what they need, and a settings entry has to stay
+     * reachable without stopping the session. So the two are different layouts, and the settings page
+     * is an overlay on top of either.
+     */
+    private val inSession: Boolean
+        get() = running && when (status) {
+            is HiCarStatus.Authenticated,
+            is HiCarStatus.ControlChannelReady,
+            is HiCarStatus.Streaming,
+            -> true
+            else -> false
+        }
+
     @Composable
     private fun Content() {
+        // With `decorFitsSystemWindows` off, the padding that keeps content out from under a bar is
+        // ours to add. It follows the mode exactly: a hidden bar must not leave a gap, and a visible
+        // one must not overlap the picture.
+        val insets = when {
+            !windowMode.showsStatusBar && !windowMode.showsNavigationBar -> WindowInsets(0, 0, 0, 0)
+            windowMode.showsNavigationBar -> WindowInsets.systemBars
+            else -> WindowInsets.statusBars
+        }
+        // Back closes the settings page first: leaving the receiver by accident, mid-session, is the
+        // more expensive mistake of the two.
+        BackHandler(enabled = settingsOpen) { settingsOpen = false }
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .windowInsetsPadding(insets)
+                .background(if (inSession) Color.Black else MaterialTheme.colorScheme.background),
+        ) {
+            if (inSession) SessionScreen() else SetupScreen()
+            // Drawn over the running picture rather than instead of it: the activity, its decoder
+            // and the session all stay alive while the driver changes a setting.
+            if (settingsOpen) {
+                HiCarSettingsScreen(
+                    windowMode = windowMode,
+                    onWindowMode = ::selectWindowMode,
+                    speed = speedSettings,
+                    onSpeed = ::applySpeedSettings,
+                    onClose = { settingsOpen = false },
+                    connection = { ConnectionSection() },
+                    diagnostics = { DiagnosticsSection() },
+                )
+            }
+        }
+    }
+
+    /** The page a driver sees before connecting: the code, the start button, and what happened. */
+    @Composable
+    private fun SetupScreen() {
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .verticalScroll(rememberScrollState())
-                .padding(16.dp),
+                .padding(20.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Text("HiCar 接收端（实验）", style = MaterialTheme.typography.headlineSmall)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text("HiCar 接收端", style = MaterialTheme.typography.headlineSmall)
+                TextButton(onClick = { settingsOpen = true }) { Text("设置") }
+            }
+            Text("状态：${describe(status)}", style = MaterialTheme.typography.titleSmall)
+            Text("连接码", style = MaterialTheme.typography.bodyMedium)
             Text(
-                "连接链路：热点 → RFCOMM 记录 → 0xFDEE 广播 → 通道协商 → HiChain 认证 → " +
-                    "DMSDP 控制通道 → 画面、声音与触控。方向盘按键和 HUD 尚未实现；" +
-                    "画面与声音在真车上的效果仍待验证。",
-                style = MaterialTheme.typography.bodyMedium,
+                pin,
+                style = MaterialTheme.typography.displayMedium,
+                fontFamily = FontFamily.Monospace,
             )
-            // The reference receiver's README makes this a prerequisite on some devices, and it is
-            // the opposite of the advice we had been giving (delete the phone's record / rotate the
-            // identity). Put it above every button so a first-run driver cannot miss it.
             Text(
-                "首次使用：先在车机和手机的「系统蓝牙设置」里完成一次普通配对，再回来点「开始」。\n" +
-                    "手机弹出 HiCar 提示后连接，输入上面这 6 位即可。配好之后不要反复删配对记录或按「重置配对」——" +
-                    "重置只清车机，清不掉手机里的记录，两边状态不一致会一直报认证失败。",
+                "手机弹出 HiCar 提示后输入这 6 位。每按一次「重置配对」连接码就会换新，" +
+                    "以这里显示的为准。",
                 style = MaterialTheme.typography.bodySmall,
             )
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Button(onClick = ::toggle, enabled = model.length == 8) {
+                    Text(if (running) "停止" else "开始")
+                }
+            }
+            // The reference receiver's README makes this a prerequisite on some devices, and it is
+            // the opposite of the advice we had been giving (delete the phone's record / rotate the
+            // identity), so it goes where a first-run driver cannot miss it.
+            Text(
+                "首次使用：先在车机和手机的「系统蓝牙设置」里完成一次普通配对，再回来点「开始」。" +
+                    "配对成功之后不要反复删记录或按「重置配对」——重置只清车机，清不掉手机里的记录，" +
+                    "两边状态不一致会一直报认证失败。",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Section("最近日志")
+            // A plain column, not a lazy list: this screen already scrolls as a whole, and a nested
+            // lazy list inside a vertical scroll would be measured with an infinite height.
+            for (line in log.takeLast(SETUP_LOG_LINES)) {
+                Text(line, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
+            }
+        }
+    }
+
+    /**
+     * The connected screen: the phone's picture, with the controls that have to stay reachable.
+     *
+     * The picture is fitted into the space the chosen window mode leaves ([HiCarVideoFit]) and the
+     * rest of the screen stays black. Stretching it to fill would both look wrong and put every touch
+     * off, because the touch mapping uses the view's own size.
+     */
+    @Composable
+    private fun SessionScreen() {
+        Box(modifier = Modifier.fillMaxSize()) {
+            FitVideo(modifier = Modifier.fillMaxSize())
+            Text(
+                describe(status),
+                style = MaterialTheme.typography.bodySmall,
+                color = Color.White.copy(alpha = 0.9f),
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(8.dp)
+                    .background(Color.Black.copy(alpha = 0.45f))
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
+            )
+            Row(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(6.dp)
+                    .background(Color.Black.copy(alpha = 0.45f)),
+            ) {
+                // The entry the driver needs *during* a connection: the page is an overlay, so the
+                // session keeps running while a setting is changed.
+                TextButton(onClick = { settingsOpen = true }) { Text("设置", color = Color.White) }
+                TextButton(onClick = ::stopReceiver) { Text("停止", color = Color.White) }
+            }
+            Column(
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .padding(6.dp)
+                    .background(Color.Black.copy(alpha = 0.45f)),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                if (sessionLogVisible) {
+                    Column(modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)) {
+                        for (line in log.takeLast(SESSION_LOG_LINES)) {
+                            Text(
+                                line,
+                                style = MaterialTheme.typography.bodySmall,
+                                fontFamily = FontFamily.Monospace,
+                                color = Color.White.copy(alpha = 0.85f),
+                            )
+                        }
+                    }
+                }
+                Row {
+                    // The two keys a phone screen cannot be driven without once it is mirrored: the
+                    // system back and home. They go through the same encrypted UIBC channel as
+                    // touches.
+                    TextButton(onClick = { sendKey(KEY_BACK, "返回") }) { Text("返回", color = Color.White) }
+                    TextButton(onClick = { sendKey(KEY_HOME, "主页") }) { Text("主页", color = Color.White) }
+                    TextButton(onClick = ::toggleMicrophone) {
+                        Text(if (microphoneEnabled) "麦克风：开" else "麦克风：关", color = Color.White)
+                    }
+                    TextButton(onClick = { sessionLogVisible = !sessionLogVisible }) {
+                        Text(if (sessionLogVisible) "隐藏日志" else "日志", color = Color.White)
+                    }
+                }
+            }
+        }
+    }
+
+    /** The picture, sized to the largest rectangle with the stream's own shape that fits. */
+    @Composable
+    private fun FitVideo(modifier: Modifier = Modifier) {
+        BoxWithConstraints(modifier = modifier, contentAlignment = Alignment.Center) {
+            val fit = HiCarVideoFit.fit(
+                videoAspect = videoAspect,
+                containerWidth = constraints.maxWidth.toFloat(),
+                containerHeight = constraints.maxHeight.toFloat(),
+            )
+            if (!fit.isEmpty) {
+                val width = with(LocalDensity.current) { fit.width.toDp() }
+                val height = with(LocalDensity.current) { fit.height.toDp() }
+                VideoSurface(
+                    modifier = Modifier
+                        .width(width)
+                        .height(height)
+                        .background(Color.Black),
+                )
+            }
+        }
+    }
+
+    /**
+     * The connection block of the settings page.
+     *
+     * Everything a phone keys its trust against: the advertised model, the head unit's Bluetooth
+     * address (the identity is derived from both), and the code. Each sentence next to a destructive
+     * button says what it costs, because the driver presses these before every attempt.
+     */
+    @Composable
+    private fun ConnectionSection() {
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedTextField(
                 value = model,
                 onValueChange = { value ->
@@ -222,8 +440,7 @@ class HiCarHostActivity : ComponentActivity() {
             )
             // The model id is the one payload field that can be varied without a rebuild, and it is
             // the first thing a phone can reject: Huawei allocates these ids per product, so a random
-            // one is not a head unit any phone has ever seen. 00040A04 is the value a real Mate 80
-            // prompts on, so it is the default rather than a button that has to be found first.
+            // one is not a head unit any phone has ever seen.
             TextButton(
                 onClick = {
                     model = if (model == TEST_MODEL) experimentalModel() else TEST_MODEL
@@ -238,9 +455,6 @@ class HiCarHostActivity : ComponentActivity() {
                     },
                 )
             }
-            // The id the phone keys its stored trust against is derived from this model and the
-            // head unit's own Bluetooth address. That address cannot be read from an app uid, so it
-            // is typed once and remembered - the same trade the reference receiver makes.
             OutlinedTextField(
                 value = btAddress,
                 onValueChange = { value ->
@@ -252,103 +466,106 @@ class HiCarHostActivity : ComponentActivity() {
                 modifier = Modifier.fillMaxWidth(),
             )
             Text(
-                "本机标识 = SHA-256(机型码 + 蓝牙地址) 的 64 位大写十六进制，与手机自己的设备号同形。" +
+                "本机标识 = SHA-256(机型码 + 蓝牙地址) 的 64 位大写十六进制。" +
                     "手机按这个字符串索引存下的公钥：长度少一半，绑定照样能过，但每次重连都会被拒（错误码 17）。",
                 style = MaterialTheme.typography.bodySmall,
             )
-            TextButton(onClick = { applyBluetoothIdentity() }) {
-                Text("按蓝牙地址派生本机标识")
-            }
-            Text(
-                "当前标识：${identity()}",
-                style = MaterialTheme.typography.bodySmall,
-                fontFamily = FontFamily.Monospace,
-            )
-            Text(
-                "连接码：$pin",
-                style = MaterialTheme.typography.headlineSmall,
-                fontFamily = FontFamily.Monospace,
-            )
-            // The code is the only shared secret in the handshake, and it changes whenever the trust
-            // store is wiped. Saying so next to the digits is cheaper than a failed pairing run.
-            Text(
-                "手机首次连接时会要求输入这 6 位数字。每按一次「重置配对」，连接码就会变，" +
-                    "弹窗出现时以这里显示的为准。",
-                style = MaterialTheme.typography.bodySmall,
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                Button(onClick = ::toggle, enabled = model.length == 8) {
-                    Text(if (running) "停止" else "开始")
-                }
-                Button(onClick = ::clearLog) { Text("清空日志") }
+            MonoLine("当前标识：${identity()}")
+            TextButton(onClick = { applyBluetoothIdentity() }) { Text("按蓝牙地址派生本机标识") }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Button(onClick = ::resetPairing) { Text("重置配对") }
                 Button(onClick = ::requestDiscoverable) { Text("允许被发现") }
-                // The key store is what the bind exchange signs with, and a broken one is invisible
-                // until a phone is present. This runs the same calls without a phone.
-                Button(onClick = ::cryptoSelfTest) { Text("加密自检") }
+                Button(onClick = ::rotateIdentity) { Text("换一个本机标识") }
             }
-            // Drivers keep pressing this before every attempt. It is the one control that invalidates
-            // a working pairing, so the cost belongs next to it rather than in a comment.
             Text(
-                "只有配对出错时才按「重置配对」：它会清掉已保存的信任关系并换发一个新的连接码，" +
-                    "之前已经配对成功的手机需要重新配对。连接码本身重启后仍保留。",
+                "「重置配对」只清车机这一侧的信任关系和连接码，清不掉手机里的记录：两边都清干净才重新配对。" +
+                    "只有手机反复报「认证失败」、而车机已经重置过时，才用「换一个本机标识」——" +
+                    "手机认的就是这个标识，换了它就等于一台没连过的新车。",
                 style = MaterialTheme.typography.bodySmall,
             )
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        }
+    }
+
+    /** The diagnostic block: every probe the bring-up needs, on the page a driver can reach while connected. */
+    @Composable
+    private fun DiagnosticsSection() {
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                // The key store is what the bind exchange signs with, and a broken one is invisible
+                // until a phone is present. This runs the same calls without a phone.
+                Button(onClick = ::cryptoSelfTest, enabled = !probing) { Text("加密自检") }
+                Button(onClick = ::showAudit) { Text("设备体检") }
+                // Explicitly triggered, read-only, and it says so: reading bt_config.conf needs su.
+                Button(onClick = ::rootProbe, enabled = !probing) { Text("root 探针") }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 // The export survives the session: a failed attempt is usually over by the time the
                 // driver decides to report it, and a screenshot loses the part above the fold.
                 Button(onClick = ::exportLog, enabled = !exporting) {
                     Text(if (exporting) "导出中…" else "导出日志")
                 }
-                Button(onClick = ::shareLog, enabled = exportUri != null) { Text("分享") }
+                // Only offered once there is a file: a permanently grey button reads as broken.
+                if (exportUri != null) Button(onClick = ::shareLog) { Text("分享") }
                 // One press, sixty seconds, no advertisement of our own: the only way to read what a
                 // real head unit actually puts on the air.
-                Button(onClick = ::sniff) { Text("嗅探 0xFDEE（60 秒）") }
+                Button(onClick = ::sniff) { Text("嗅探 0xFDEE") }
             }
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                // The same block the export carries, printed on screen: on a head unit without a
-                // file manager, reading it here and photographing it is faster than exporting.
-                Button(onClick = ::showAudit) { Text("设备体检") }
-                // Explicitly triggered, read-only, and it says so: reading bt_config.conf needs su.
-                Button(onClick = ::rootProbe) { Text("root 探针") }
-                // The escape hatch for a phone that still believes it is paired with us: a new
-                // identity is a car it has no record of, so the next attempt binds from scratch.
-                Button(onClick = ::rotateIdentity) { Text("换一个本机标识") }
-            }
+            if (exportNotice.isNotEmpty()) MonoLine(exportNotice)
+            TextButton(onClick = ::clearLog) { Text("清空屏幕日志") }
             Text(
-                "只有手机反复报「认证失败」、而车机这边已经重置过配对时，才用「换一个本机标识」：" +
-                    "手机认的就是这个标识，换了它，手机就会把这台车当成一台没连过的新车，重新问你一次连接码。",
+                "运行日志（最近 ${SETTINGS_LOG_LINES} 行；完整内容用「导出日志」）",
                 style = MaterialTheme.typography.bodySmall,
             )
-            if (exportNotice.isNotEmpty()) {
-                Text(exportNotice, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
+            for (line in log.takeLast(SETTINGS_LOG_LINES)) {
+                Text(line, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
             }
-            Text("状态：${describe(status)}", style = MaterialTheme.typography.titleSmall)
-            // The picture sits directly under the status line: it is the one thing the driver looks
-            // at, and on a head unit the log below is not worth scrolling past to find it.
-            VideoPanel()
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                // The two keys a phone screen cannot be driven without once it is mirrored: the
-                // system back and home. They go through the same encrypted UIBC channel as touches.
-                TextButton(onClick = { sendKey(KEY_BACK, "返回") }) { Text("返回") }
-                TextButton(onClick = { sendKey(KEY_HOME, "主页") }) { Text("主页") }
-                TextButton(onClick = ::toggleMicrophone) {
-                    Text(if (microphoneEnabled) "麦克风：开" else "麦克风：关")
-                }
-            }
-            Text(
-                "画面上的触控会发送给手机。麦克风默认关闭：打开后手机会把车里的声音当作语音输入，" +
-                    "并且每次连接都需要你在手机上允许一次。",
-                style = MaterialTheme.typography.bodySmall,
-            )
-            Text("本机标识：${identity()}", style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
-            // A plain column, not a lazy list: this screen already scrolls as a whole, and a nested
-            // lazy list inside a vertical scroll would be measured with an infinite height.
-            Column(modifier = Modifier.fillMaxWidth()) {
-                for (line in log) {
-                    Text(line, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace)
-                }
-            }
+        }
+    }
+
+    /** Applies a window mode to the live window, not just to preferences. */
+    private fun selectWindowMode(mode: HiCarWindowMode) {
+        if (windowMode == mode) return
+        windowMode = mode
+        HiCarDisplaySettings.save(this, mode)
+        applyWindowMode()
+        appendLog("display: window mode ${mode.stored} (${mode.title})")
+    }
+
+    /** Persists the speed-volume values and pushes them into the audio path that is running now. */
+    private fun applySpeedSettings(next: HiCarSpeedVolumeSettings) {
+        speedSettings = next
+        HiCarSpeedVolumeSettings.save(this, next)
+        // A session may be running: the monitor is rebuilt so the new curve is in force immediately.
+        controller?.refreshSpeedVolume()
+        appendLog(
+            "speed volume: ${if (next.enabled) "on" else "off"}, " +
+                "${next.startKmh.toInt()}–${next.fullKmh.toInt()} km/h, +${next.maxGainDb.toInt()} dB, " +
+                "source ${next.source.name.lowercase()}",
+        )
+    }
+
+    /**
+     * Turns [windowMode] into visible and hidden system bars.
+     *
+     * `decorFitsSystemWindows = false` in every mode, so the bars never resize the content behind our
+     * back: the content's own inset padding (in [Content]) decides how much space a visible bar gets.
+     * Full screen still allows a swipe to reveal the bars — a head unit without a home button must
+     * never be left with no way out.
+     */
+    private fun applyWindowMode() {
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        val bars = WindowCompat.getInsetsController(window, window.decorView)
+        bars.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        val mode = windowMode
+        if (mode.showsStatusBar) {
+            bars.show(WindowInsetsCompat.Type.statusBars())
+        } else {
+            bars.hide(WindowInsetsCompat.Type.statusBars())
+        }
+        if (mode.showsNavigationBar) {
+            bars.show(WindowInsetsCompat.Type.navigationBars())
+        } else {
+            bars.hide(WindowInsetsCompat.Type.navigationBars())
         }
     }
 
@@ -974,11 +1191,11 @@ class HiCarHostActivity : ComponentActivity() {
      * `AndroidView` rather than a Compose canvas: the decoder writes into a `SurfaceTexture`, and a
      * `TextureView` is the one way to show that texture without copying frames through the GPU
      * pipeline. Touches are handled by the view itself so `MotionEvent` coordinates — not Compose
-     * pointer positions — are what gets mapped into the phone's picture space.
+     * pointer positions — are what gets mapped into the phone's picture space, which is only correct
+     * because the view is exactly the picture ([FitVideo] sizes it that way, never stretching it).
      */
     @Composable
-    private fun VideoPanel() {
-        Text("手机画面（可直接触控）", style = MaterialTheme.typography.bodySmall)
+    private fun VideoSurface(modifier: Modifier = Modifier) {
         AndroidView(
             factory = { context ->
                 TextureView(context).apply {
@@ -1006,10 +1223,7 @@ class HiCarHostActivity : ComponentActivity() {
                     setOnTouchListener { view, event -> videoTouch(view, event) }
                 }.also { videoView = it }
             },
-            modifier = Modifier
-                .fillMaxWidth()
-                .aspectRatio(videoAspect)
-                .background(Color.Black),
+            modifier = modifier,
         )
     }
 
@@ -1032,6 +1246,11 @@ class HiCarHostActivity : ComponentActivity() {
     private companion object {
         const val MAX_LOG_LINES = 200
         const val MAX_HISTORY_LINES = 5_000
+
+        /** How much of the log each surface shows; the export always carries all of it. */
+        const val SETUP_LOG_LINES = 12
+        const val SESSION_LOG_LINES = 6
+        const val SETTINGS_LOG_LINES = 40
 
         /** `adb logcat -s HiCar` on a head unit: short, and stable across sessions. */
         const val LOG_TAG = "HiCar"

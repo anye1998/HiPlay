@@ -57,6 +57,8 @@ HiCar 的依赖是干净的（`shared/.../hicar/*` 只 import 了热点 6 个类
 - [x] 启动入口切到 HiCar：`DiPlayActivity` 不再是 LAUNCHER，`HiCarLauncherAlias` 标签改为 `HiCar`
 - [x] 车速音量：曲线 / 平滑 / PCM 软限幅 / 双源 / 隧道保持（128 个单测通过）
 - [x] 音频 SSRC 语义：低 16 位 bus、高 16 位 usage，音乐帧单独增益
+- [x] HiCar 设置页：显示（全屏/状态栏/状态栏+导航栏）、声音（车速增益）、连接、诊断、关于
+- [x] 设置页作为叠加层，连接中可改；显示模式即时生效，画面按比例适配（见 `docs/HICAR_UI.md`）
 - [ ] 热点解耦
 - [ ] 协议层删除
 - [ ] HUD 与界面删除

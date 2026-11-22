@@ -1,0 +1,281 @@
+package com.shilapi.xcertplay
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Button
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.RadioButton
+import androidx.compose.material3.Slider
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.unit.dp
+import com.shilapi.xcertplay.hicar.HiCarSpeedVolumeSettings
+import com.shilapi.xcertplay.hicar.HiCarWindowMode
+import kotlin.math.roundToInt
+
+/**
+ * The receiver's settings page.
+ *
+ * Two things make this page different from the CarPlay-era one it replaces:
+ *
+ * 1. it is reachable **while the phone is connected** — the entry sits on the session overlay, and
+ *    the page is drawn over the running picture instead of replacing the activity, so opening it
+ *    does not drop the connection;
+ * 2. every change is applied on the spot. The window mode re-lays out the picture around the bars,
+ *    and the speed-volume values are pushed into the audio path of the session that is running.
+ *
+ * The connection and diagnostic blocks are slots: they hold state (the pin, the log) that belongs to
+ * the activity, and copying it here would mean two places to keep in step.
+ */
+@Composable
+internal fun HiCarSettingsScreen(
+    windowMode: HiCarWindowMode,
+    onWindowMode: (HiCarWindowMode) -> Unit,
+    speed: HiCarSpeedVolumeSettings,
+    onSpeed: (HiCarSpeedVolumeSettings) -> Unit,
+    onClose: () -> Unit,
+    connection: @Composable ColumnScope.() -> Unit,
+    diagnostics: @Composable ColumnScope.() -> Unit,
+) {
+    Surface(modifier = Modifier.fillMaxSize()) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 20.dp, vertical = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text("设置", style = MaterialTheme.typography.headlineSmall)
+                Button(onClick = onClose) { Text("返回") }
+            }
+            Text(
+                "这里的改动立即生效：改显示方式，画面会重新缩放；改车速音量，正在播放的音乐马上按新参数处理，" +
+                    "不需要断开重连。",
+                style = MaterialTheme.typography.bodySmall,
+            )
+
+            Section("显示")
+            for (mode in HiCarWindowMode.values()) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onWindowMode(mode) }
+                        .padding(vertical = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    RadioButton(selected = windowMode == mode, onClick = { onWindowMode(mode) })
+                    Column {
+                        Text(mode.title, style = MaterialTheme.typography.bodyLarge)
+                        Text(mode.detail, style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            }
+            Text(
+                "画面始终按手机的分辨率等比缩放，只在多出来的地方留黑边，不会被拉伸。" +
+                    "选择保留系统栏时，画面会被挤小一点，但不会被系统栏盖住。",
+                style = MaterialTheme.typography.bodySmall,
+            )
+
+            Section("声音")
+            SpeedVolume(speed = speed, onChange = onSpeed)
+
+            Section("连接")
+            connection()
+
+            Section("诊断")
+            diagnostics()
+
+            Section("关于")
+            Text(
+                "HiCar 接收端（实验）。画面、声音与触控链路已连通，方向盘按键与 HUD 尚未实现；" +
+                    "无线连接为 5 GHz 热点，车机不需要前装 HiCar。",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Box(Modifier.height(16.dp))
+        }
+    }
+}
+
+/**
+ * Music gain that follows the car's speed.
+ *
+ * The three numbers are the whole feature: below [HiCarSpeedVolumeSettings.startKmh] nothing is
+ * added, the gain rises linearly to [HiCarSpeedVolumeSettings.maxGainDb] at
+ * [HiCarSpeedVolumeSettings.fullKmh], and past that it stays there. The gain is applied to the music
+ * channel's samples inside the receiver, so neither the head unit's nor the phone's volume is
+ * touched — the driver's own volume setting keeps meaning what it says.
+ */
+@Composable
+private fun SpeedVolume(
+    speed: HiCarSpeedVolumeSettings,
+    onChange: (HiCarSpeedVolumeSettings) -> Unit,
+) {
+    // Local state so a slider drag is smooth; every settle writes through to preferences.
+    var local by remember(speed) { mutableStateOf(speed) }
+    fun apply(next: HiCarSpeedVolumeSettings) {
+        local = next
+        onChange(next)
+    }
+
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text("音乐随车速增大", style = MaterialTheme.typography.bodyLarge)
+            Text(
+                "只调音乐通道的增益，导航与通话不跟着变",
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+        Switch(
+            checked = local.enabled,
+            onCheckedChange = { apply(local.copy(enabled = it)) },
+        )
+    }
+
+    if (!local.enabled) {
+        Text(
+            "开启后：低速不增益，${local.startKmh.roundToInt()} km/h 起逐渐变响，" +
+                "${local.fullKmh.roundToInt()} km/h 达到 +${local.maxGainDb.roundToInt()} dB。",
+            style = MaterialTheme.typography.bodySmall,
+        )
+        return
+    }
+
+    SliderRow(
+        label = "起始速度",
+        value = local.startKmh.toFloat(),
+        range = HiCarSpeedVolumeSettings.MIN_START_KMH.toFloat()..
+            HiCarSpeedVolumeSettings.MAX_START_KMH.toFloat(),
+        suffix = "km/h",
+        detail = "低于这个速度不增益：等红灯、倒车、停车时音乐保持原样",
+    ) { value ->
+        val start = value.roundToInt().toDouble()
+        // The ceiling has to stay above the start, or the curve's own check would throw.
+        apply(local.copy(startKmh = start, fullKmh = maxOf(local.fullKmh, start + 10.0)))
+    }
+
+    SliderRow(
+        label = "满档速度",
+        value = local.fullKmh.toFloat(),
+        range = HiCarSpeedVolumeSettings.MIN_FULL_KMH.toFloat()..
+            HiCarSpeedVolumeSettings.MAX_FULL_KMH.toFloat(),
+        suffix = "km/h",
+        detail = "到这里增益达到上限，再快也不会更响",
+    ) { value ->
+        apply(local.copy(fullKmh = maxOf(value.roundToInt().toDouble(), local.startKmh + 10.0)))
+    }
+
+    SliderRow(
+        label = "最大增益",
+        value = local.maxGainDb.toFloat(),
+        range = 0f..HiCarSpeedVolumeSettings.MAX_GAIN_DB.toFloat(),
+        suffix = "dB",
+        detail = "10 dB 大约是听感上响一倍；超过 12 dB 容易掩盖导航提示",
+    ) { value ->
+        apply(local.copy(maxGainDb = value.roundToInt().toDouble()))
+    }
+
+    Text("速度来源", style = MaterialTheme.typography.bodyLarge)
+    val sources = listOf(
+        HiCarSpeedVolumeSettings.Source.AUTO to "自动（优先车机总线，取不到就用定位）",
+        HiCarSpeedVolumeSettings.Source.VEHICLE to "只用车辆总线（隧道里也有效）",
+        HiCarSpeedVolumeSettings.Source.LOCATION to "只用定位（不需要 root 或 adb）",
+    )
+    for ((source, label) in sources) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { apply(local.copy(source = source)) },
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            RadioButton(selected = local.source == source, onClick = { apply(local.copy(source = source)) })
+            Text(label, style = MaterialTheme.typography.bodyMedium)
+        }
+    }
+    Text(
+        "定位在隧道、地下车库没有卫星信号。接收端会保持最后一次读到的速度约 45 秒，" +
+            "之后按每秒 4 km/h 淡回不增益，而不是把速度当成 0 —— 否则一出隧道就会突兀地变响。",
+        style = MaterialTheme.typography.bodySmall,
+    )
+}
+
+@Composable
+private fun SliderRow(
+    label: String,
+    value: Float,
+    range: ClosedFloatingPointRange<Float>,
+    suffix: String,
+    detail: String,
+    onChange: (Float) -> Unit,
+) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Text("$label：${value.roundToInt()} $suffix", style = MaterialTheme.typography.bodyMedium)
+        }
+        Slider(
+            value = value.coerceIn(range.start, range.endInclusive),
+            onValueChange = onChange,
+            valueRange = range,
+        )
+        Text(detail, style = MaterialTheme.typography.bodySmall)
+    }
+}
+
+/** A heading with a rule under it: the sections have no cards, so the rule is what separates them. */
+@Composable
+internal fun Section(title: String) {
+    Column(modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) {
+        Text(title, style = MaterialTheme.typography.titleMedium)
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 4.dp)
+                .height(1.dp)
+                .background(MaterialTheme.colorScheme.outlineVariant),
+        )
+    }
+}
+
+/** Monospaced text for the values a report has to quote verbatim. */
+@Composable
+internal fun MonoLine(text: String, color: Color = Color.Unspecified) {
+    Text(
+        text,
+        style = MaterialTheme.typography.bodySmall,
+        fontFamily = FontFamily.Monospace,
+        color = color,
+    )
+}

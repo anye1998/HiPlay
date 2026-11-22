@@ -153,6 +153,15 @@ class HiCarController(
     private var speaker: HiCarAudioSink? = null
 
     /**
+     * The speed-linked music gain of the current session, if it is on.
+     *
+     * Kept at controller level rather than inside the media object because the settings page can be
+     * opened *during* a connection: [refreshSpeedVolume] has to reach the running audio path, and
+     * the media object is not reachable from the screen.
+     */
+    private var speedMonitor: HiCarSpeedMonitor? = null
+
+    /**
      * Watches the USB host port while the receiver runs.
      *
      * Wired HiCar arrives over a network interface the phone brings up on the cable, so the first
@@ -567,6 +576,10 @@ class HiCarController(
         mediaBusy.set(false)
         dmsdp?.close()
         dmsdp = null
+        // Belt and braces: the media object closes this too, but a round that never built one (a
+        // control socket refused after the speaker was opened) must not leave a 1 Hz tick behind.
+        runCatching { speedMonitor?.close() }
+        speedMonitor = null
         // The key outlives the RFCOMM channel by design; it stops existing with the round.
         liveKey?.fill(0)
         liveKey = null
@@ -837,17 +850,8 @@ class HiCarController(
         val handlers = ArrayList<HiCarControlSession.TextHandler>()
         val sink = HiCarAudioSink(appContext, onLog)
         var receiver: HiCarAudioReceiver? = null
-        var speedMonitor: HiCarSpeedMonitor? = null
         if (sink.ready) {
             sink.start()
-            // The gain is applied inside this sink, so the monitor lives exactly as long as the
-            // audio path it drives. It never changes the head unit's or the phone's volume.
-            val speedSettings = HiCarSpeedVolumeSettings.load(appContext)
-            if (speedSettings.enabled) {
-                speedMonitor = HiCarSpeedMonitor(appContext, speedSettings, onLog) { db ->
-                    sink.setSpeedGain(db)
-                }.also { it.start() }
-            }
             try {
                 val created = HiCarAudioReceiver(
                     owner = offer.ownerAddress,
@@ -861,6 +865,9 @@ class HiCarController(
                 handlers.add(HiCarSpeakerControl(created, onLog))
                 speaker = sink
                 audioReady = true
+                // The gain is applied inside this sink, so the monitor lives exactly as long as the
+                // audio path it drives. It never changes the head unit's or the phone's volume.
+                refreshSpeedVolume()
             } catch (failure: IOException) {
                 sink.close()
                 onLog("audio: UDP receiver could not open (${failure.javaClass.simpleName}); no speaker this session")
@@ -889,7 +896,6 @@ class HiCarController(
         if (handlers.isEmpty()) return null
         val audio = receiver
         val mic = microphone
-        val speed = speedMonitor
         return object : HiCarDmsdpEndpoints.Media, HiCarDmsdpEndpoints.Clocked {
             override fun textHandlers(): List<HiCarControlSession.TextHandler> = handlers
 
@@ -901,11 +907,39 @@ class HiCarController(
                 audioReady = false
                 microphoneReady = false
                 if (speaker === sink) speaker = null
-                runCatching { speed?.close() }
+                runCatching { speedMonitor?.close() }
+                speedMonitor = null
                 runCatching { audio?.close() }
                 runCatching { mic?.close() }
             }
         }
+    }
+
+    /**
+     * Applies the saved speed-volume settings to the audio path that is running right now.
+     *
+     * The settings page is reachable while the phone is connected — that is why it exists — so a
+     * change must not wait for the next connection. Rebuilding the monitor is deliberate: swapping a
+     * curve and a smoother mid-tick is where "why did it jump to full gain" bugs come from, and a new
+     * monitor always starts from 0 dB.
+     */
+    fun refreshSpeedVolume() {
+        val sink = speaker
+        runCatching { speedMonitor?.close() }
+        speedMonitor = null
+        if (sink == null) {
+            onLog("speed volume: no speaker in this session; the setting is saved for the next one")
+            return
+        }
+        val settings = HiCarSpeedVolumeSettings.load(appContext)
+        if (!settings.enabled) {
+            sink.setSpeedGain(0.0)
+            onLog("speed volume: off; music is played at its own level")
+            return
+        }
+        speedMonitor = HiCarSpeedMonitor(appContext, settings, onLog) { db ->
+            sink.setSpeedGain(db)
+        }.also { it.start() }
     }
 
     /**

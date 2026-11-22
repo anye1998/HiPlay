@@ -8,7 +8,7 @@ import android.content.Context
  * Kept in `SharedPreferences` rather than a settings framework so a car update cannot silently
  * change how loud the music gets: every value has an explicit default and an explicit range.
  */
-internal data class HiCarSpeedVolumeSettings(
+data class HiCarSpeedVolumeSettings(
     val enabled: Boolean = false,
     /** Below this speed nothing is added; a car park is not a motorway. */
     val startKmh: Double = HiCarSpeedGainCurve.DEFAULT_START_KMH,
@@ -21,7 +21,7 @@ internal data class HiCarSpeedVolumeSettings(
 ) {
     enum class Source { AUTO, VEHICLE, LOCATION }
 
-    fun curve(): HiCarSpeedGainCurve = HiCarSpeedGainCurve(
+    internal fun curve(): HiCarSpeedGainCurve = HiCarSpeedGainCurve(
         startKmh = startKmh.coerceIn(0.0, 200.0),
         fullKmh = fullKmh.coerceIn(startKmh + 1.0, 300.0),
         maxGainDb = maxGainDb.coerceIn(0.0, HiCarSpeedGainCurve.MAX_ALLOWED_DB),
@@ -34,6 +34,13 @@ internal data class HiCarSpeedVolumeSettings(
         private const val KEY_FULL = "full_kmh"
         private const val KEY_MAX_GAIN = "max_gain_db"
         private const val KEY_SOURCE = "source"
+
+        /** The range the settings page may offer; outside it the curve is clamped anyway. */
+        const val MIN_START_KMH = 10.0
+        const val MAX_START_KMH = 90.0
+        const val MIN_FULL_KMH = 50.0
+        const val MAX_FULL_KMH = 160.0
+        const val MAX_GAIN_DB = 18.0
 
         fun load(context: Context): HiCarSpeedVolumeSettings {
             val prefs = context.applicationContext.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
