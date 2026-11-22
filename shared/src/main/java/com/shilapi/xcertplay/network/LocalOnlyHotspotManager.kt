@@ -276,11 +276,11 @@ class LocalOnlyHotspotManager(context: Context, private val onDiagnostic: (Strin
                         throw IOException("LocalOnlyHotspot: Android ${Build.VERSION.SDK_INT} cannot read the AP channel (${reading.error ?: "radio did not settle"}); choose a 5 GHz Car hotspot or Wi-Fi Direct")
                     }
                 } else {
-                    throw IOException("LocalOnlyHotspot: $it; cannot advertise automatic channel 0 to CarPlay")
+                    throw IOException("LocalOnlyHotspot: $it; cannot advertise automatic channel 0 to the phone")
                 }
             }
             val remaining = deadlineNanos - System.nanoTime()
-            if (remaining <= 0) throw IOException("LocalOnlyHotspot did not report its live channel; cannot advertise automatic channel 0 to CarPlay")
+            if (remaining <= 0) throw IOException("LocalOnlyHotspot did not report its live channel; cannot advertise automatic channel 0 to the phone")
             try {
                 TimeUnit.NANOSECONDS.sleep(minOf(remaining, INTERFACE_POLL_NANOS))
             } catch (interrupted: InterruptedException) {

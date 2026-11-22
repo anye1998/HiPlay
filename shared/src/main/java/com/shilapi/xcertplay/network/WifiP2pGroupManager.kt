@@ -57,7 +57,7 @@ class WifiP2pGroupManager(
     private val configurationMemory = P2pConfigurationMemory(appContext)
     private var rememberedAttempt: P2pConfigurationMemory.Record? = null
     private var pendingSuccess: (() -> Boolean)? = null
-    private var carPlayConfirmed = false
+    private var linkConfirmed = false
     private val ownership = appContext.getSharedPreferences("carplay_wifi_p2p", Context.MODE_PRIVATE)
     private val ssidPrefix by lazy {
         // ANDROID_ID is scoped to the signing key, user and device on our supported OS versions.
@@ -309,13 +309,13 @@ class WifiP2pGroupManager(
         }
     }
 
-    override fun onCarPlayConfirmed() = synchronized(stateLock) {
-        if (closed || !created || carPlayConfirmed) return@synchronized
+    override fun onLinkConfirmed() = synchronized(stateLock) {
+        if (closed || !created || linkConfirmed) return@synchronized
         val save = pendingSuccess ?: return@synchronized
-        // Storage failure must not interrupt a working CarPlay session.
-        carPlayConfirmed = true
+        // Storage failure must not interrupt a working session.
+        linkConfirmed = true
         val saved = runCatching { save() }.getOrDefault(false)
-        diagnostic("Wi-Fi P2P remembered saved=$saved proof=authenticated_first_frame")
+        diagnostic("Wi-Fi P2P remembered saved=$saved proof=authenticated")
     }
 
     override fun close() {
@@ -326,7 +326,7 @@ class WifiP2pGroupManager(
         synchronized(stateLock) {
             if (closed) return
             closed = true
-            if (!carPlayConfirmed) rememberedAttempt?.let {
+            if (!linkConfirmed) rememberedAttempt?.let {
                 if (configurationMemory.forget(it)) diagnostic("Wi-Fi P2P remembered cleared=session_unconfirmed")
             }
             pendingSuccess = null

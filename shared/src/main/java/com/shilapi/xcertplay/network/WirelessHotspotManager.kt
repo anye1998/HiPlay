@@ -55,7 +55,14 @@ interface WirelessHotspotManager : Closeable {
     fun validateReady() {}
 
     /** The authenticated wireless session has rendered CarPlay; AP creation alone is insufficient. */
-    fun onCarPlayConfirmed() {}
+    /**
+     * The phone actually used this access point.
+     *
+     * Called once the session is authenticated, not when the group is created: a group that was
+     * brought up but never reached is not evidence that its channel works, and remembering it would
+     * make the next attempt fail the same way.
+     */
+    fun onLinkConfirmed() {}
 
     /** Counts reported by the framework, when available; never contains station identities. */
     fun connectionDiagnosticSnapshot(): String = "association=not_exposed"

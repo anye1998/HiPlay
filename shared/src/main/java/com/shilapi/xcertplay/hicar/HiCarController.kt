@@ -1192,6 +1192,10 @@ class HiCarController(
                             // authenticator wipes its copy with the session.
                             liveKey = key.copyOf()
                             liveNetwork?.authenticated = true
+                            // The phone is through the handshake on this access point, so the
+                            // channel that carried it is worth remembering; a group that never got
+                            // this far is forgotten when the round ends.
+                            hotspot?.onLinkConfirmed()
                             onLog(
                                 "HiChain finished: ${key.size}-byte session key; TCP endpoints are " +
                                     "serving this key, so DMSDP can start on the access point",
