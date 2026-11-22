@@ -11,6 +11,8 @@ internal class HiCarAudioFrame(
     val channels: Int,
     val samples: Int,
     val stream: Int,
+    /** What the phone says this sound is for, from the RTP SSRC. */
+    val route: HiCarAudioRoute = HiCarAudioRoute.MEDIA,
 ) {
     fun wipe() = data.fill(0)
 }
@@ -59,6 +61,13 @@ internal class HiCarAudioMedia(private val onLog: (String) -> Unit = {}) {
         val sequence = ((rtp[2].toInt() and 0xFF) shl 8) or (rtp[3].toInt() and 0xFF)
         var timestamp = 0L
         for (index in 4..7) timestamp = (timestamp shl 8) or (rtp[index].toLong() and 0xFF)
+        // The whole SSRC carries two fields the phone fills in: the audio bus in the low half and
+        // the Android usage in the high half. The old code kept only twelve bits for reordering,
+        // which was enough to split streams but threw the "what is this sound for" part away.
+        var ssrc = 0L
+        for (index in 8..11) ssrc = (ssrc shl 8) or (rtp[index].toLong() and 0xFF)
+        val bus = HiCarAudioBus.busOf(ssrc)
+        val route = HiCarAudioRoute.of(HiCarAudioBus.usageOf(ssrc), bus)
         // The native stream key is the low twelve bits of the SSRC.
         val streamId = ((rtp[10].toInt() and 0x0F) shl 8) or (rtp[11].toInt() and 0xFF)
         var start = RTP_HEADER_BYTES + (rtp[0].toInt() and 0x0F) * 4
@@ -84,7 +93,7 @@ internal class HiCarAudioMedia(private val onLog: (String) -> Unit = {}) {
                     "payloadType=${rtp[1].toInt() and 0x7F}",
             )
         }
-        val decoded = adts(rtp, start, end, streamId)
+        val decoded = adts(rtp, start, end, streamId, route)
         val state = streams.getOrPut(streamId) {
             if (streams.size >= MAX_STREAMS) throw HiCarWireException("audio stream limit")
             Stream(sequence)
@@ -144,7 +153,13 @@ internal class HiCarAudioMedia(private val onLog: (String) -> Unit = {}) {
         streams.clear()
     }
 
-    private fun adts(payload: ByteArray, start: Int, end: Int, streamId: Int): List<HiCarAudioFrame> {
+    private fun adts(
+        payload: ByteArray,
+        start: Int,
+        end: Int,
+        streamId: Int,
+        route: HiCarAudioRoute,
+    ): List<HiCarAudioFrame> {
         val output = ArrayList<HiCarAudioFrame>()
         var at = start
         while (at < end) {
@@ -171,6 +186,7 @@ internal class HiCarAudioMedia(private val onLog: (String) -> Unit = {}) {
                     channels = channels,
                     samples = 1024,
                     stream = streamId,
+                    route = route,
                 ),
             )
             at += length

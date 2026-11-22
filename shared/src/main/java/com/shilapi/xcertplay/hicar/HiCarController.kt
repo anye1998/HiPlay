@@ -837,8 +837,17 @@ class HiCarController(
         val handlers = ArrayList<HiCarControlSession.TextHandler>()
         val sink = HiCarAudioSink(appContext, onLog)
         var receiver: HiCarAudioReceiver? = null
+        var speedMonitor: HiCarSpeedMonitor? = null
         if (sink.ready) {
             sink.start()
+            // The gain is applied inside this sink, so the monitor lives exactly as long as the
+            // audio path it drives. It never changes the head unit's or the phone's volume.
+            val speedSettings = HiCarSpeedVolumeSettings.load(appContext)
+            if (speedSettings.enabled) {
+                speedMonitor = HiCarSpeedMonitor(appContext, speedSettings, onLog) { db ->
+                    sink.setSpeedGain(db)
+                }.also { it.start() }
+            }
             try {
                 val created = HiCarAudioReceiver(
                     owner = offer.ownerAddress,
@@ -880,6 +889,7 @@ class HiCarController(
         if (handlers.isEmpty()) return null
         val audio = receiver
         val mic = microphone
+        val speed = speedMonitor
         return object : HiCarDmsdpEndpoints.Media, HiCarDmsdpEndpoints.Clocked {
             override fun textHandlers(): List<HiCarControlSession.TextHandler> = handlers
 
@@ -891,6 +901,7 @@ class HiCarController(
                 audioReady = false
                 microphoneReady = false
                 if (speaker === sink) speaker = null
+                runCatching { speed?.close() }
                 runCatching { audio?.close() }
                 runCatching { mic?.close() }
             }

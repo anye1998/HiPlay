@@ -66,6 +66,12 @@ internal class HiCarAudioSink(context: Context, private val onLog: (String) -> U
     @Volatile private var focused = true
     @Volatile private var paused = false
 
+    /**
+     * Speed-linked gain for music, in dB. Only frames the phone labels as media are multiplied:
+     * navigation prompts and calls must not get louder just because the car is on a motorway.
+     */
+    @Volatile private var speedGainDb = 0.0
+
     /** True when the platform has an AAC decoder; without one, the speaker stays unannounced. */
     val ready: Boolean
 
@@ -118,6 +124,19 @@ internal class HiCarAudioSink(context: Context, private val onLog: (String) -> U
         if (type != wantedStreamType) wantedStreamType = type
     }
 
+    /**
+     * Sets the gain applied to music, in dB; 0 leaves the samples untouched.
+     *
+     * The value is applied at write time on the playback thread, so a speed update never races a
+     * buffer. Non-media routes ignore it entirely.
+     */
+    fun setSpeedGain(db: Double) {
+        speedGainDb = if (db.isFinite()) db.coerceIn(0.0, HiCarSpeedGainCurve.MAX_ALLOWED_DB) else 0.0
+    }
+
+    /** The gain currently applied to music, for the settings screen. */
+    val currentSpeedGainDb: Double get() = speedGainDb
+
     override fun close() {
         if (closed) return
         closed = true
@@ -144,6 +163,9 @@ internal class HiCarAudioSink(context: Context, private val onLog: (String) -> U
     private fun run() {
         var decoder: MediaCodec? = null
         var pending: HiCarAudioFrame? = null
+        // The route travels with the frame that produced the PCM being written. A decoder can hold a
+        // frame for one buffer, so the value is updated on input rather than guessed at output.
+        var currentRoute = HiCarAudioRoute.MEDIA
         val info = MediaCodec.BufferInfo()
         try {
             while (!closed) {
@@ -161,6 +183,7 @@ internal class HiCarAudioSink(context: Context, private val onLog: (String) -> U
                 if (pending == null) pending = queue.poll()
                 val frame = pending
                 if (frame != null) {
+                    currentRoute = frame.route
                     if (decoder == null || frame.sampleRate != rate || frame.channels != channels) {
                         decoder?.let { old -> runCatching { old.stop() }; runCatching { old.release() } }
                         decoder = createDecoder(frame.sampleRate, frame.rateIndex, frame.channels)
@@ -198,7 +221,7 @@ internal class HiCarAudioSink(context: Context, private val onLog: (String) -> U
 
                     output >= 0 -> {
                         try {
-                            if (info.size > 0) write(decoder?.getOutputBuffer(output))
+                            if (info.size > 0) write(decoder?.getOutputBuffer(output), currentRoute)
                         } finally {
                             decoder?.releaseOutputBuffer(output, false)
                         }
@@ -298,23 +321,52 @@ internal class HiCarAudioSink(context: Context, private val onLog: (String) -> U
         onLog("audio: AAC $sampleRate Hz, $channelCount channel(s); playback started on $route")
     }
 
-    private fun write(buffer: ByteBuffer?) {
+    private fun write(buffer: ByteBuffer?, route: HiCarAudioRoute) {
         val audio = track ?: return
         val pcm = buffer ?: return
         if (!focused || paused) return
+        val gain = if (route == HiCarAudioRoute.MEDIA) speedGainDb else 0.0
         var written = 0
-        while (pcm.hasRemaining() && !closed && focused && !paused) {
-            val count = audio.write(pcm, pcm.remaining(), AudioTrack.WRITE_BLOCKING)
-            if (count < 0) throw IOException("audio write failed")
-            if (count == 0) break
-            written += count
+        if (gain != 0.0 && pcm.hasRemaining()) {
+            // AudioTrack can only multiply through a byte array: the buffer has to be copied out,
+            // changed, and written back. This is the one allocation on the audio path that the gain
+            // feature adds, and it only happens while the car is moving.
+            val samples = ByteArray(pcm.remaining())
+            pcm.get(samples)
+            val stats = HiCarPcmGain.applyPcm16(samples, 0, samples.size, gain)
+            if (stats.limited > 0 && (decoded <= 3 || decoded % 400 == 0L)) {
+                onLog(
+                    "audio: speed gain +%.1f dB, limiter engaged on %d of %d samples".format(
+                        gain, stats.limited, stats.samples,
+                    ),
+                )
+            }
+            var offset = 0
+            while (offset < samples.size && !closed && focused && !paused) {
+                val count = audio.write(samples, offset, samples.size - offset, AudioTrack.WRITE_BLOCKING)
+                if (count < 0) throw IOException("audio write failed")
+                if (count == 0) break
+                offset += count
+                written += count
+            }
+        } else {
+            while (pcm.hasRemaining() && !closed && focused && !paused) {
+                val count = audio.write(pcm, pcm.remaining(), AudioTrack.WRITE_BLOCKING)
+                if (count < 0) throw IOException("audio write failed")
+                if (count == 0) break
+                written += count
+            }
         }
         if (written > 0) {
             decoded++
             if (decoded <= 3 || decoded % 400 == 0L) {
                 val lanes = streamFrames.entries.sortedBy { it.key }
                     .joinToString(", ") { "${it.key}=${it.value}" }
-                onLog("audio: $decoded PCM block(s) written to the output device; frames by stream: $lanes")
+                onLog(
+                    "audio: $decoded PCM block(s) written on ${route.name.lowercase()}" +
+                        (if (gain != 0.0) " (+%.1f dB)".format(gain) else "") +
+                        "; frames by stream: $lanes",
+                )
             }
         }
     }
