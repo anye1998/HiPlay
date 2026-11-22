@@ -27,6 +27,12 @@ internal class HiCarSpeedMonitor(
     private val onLog: (String) -> Unit,
     /** Called about once a second with the gain to apply, in dB. */
     private val onGainDb: (Double) -> Unit,
+    /**
+     * Called with the source that produced this tick's fix, so the settings page can say which one
+     * is actually answering rather than which one is allowed. Also called once on [start] and on
+     * [close], so the page never keeps showing a reading from a session that has ended.
+     */
+    private val onStatus: (HiCarSpeedStatus) -> Unit = {},
 ) : AutoCloseable {
     private val appContext = context.applicationContext
     private val estimator = HiCarSpeedEstimator()
@@ -41,6 +47,9 @@ internal class HiCarSpeedMonitor(
     @Volatile private var vehicleAtMillis = 0L
     @Volatile private var locationKmh: Double? = null
     @Volatile private var locationAtMillis = 0L
+
+    private var vehicleError: String? = null
+    private var locationError: String? = null
 
     private var started = false
     private var lastSource = ""
@@ -69,6 +78,7 @@ internal class HiCarSpeedMonitor(
             val speed = estimator.speedKmh(now)
             val applied = smoother.next(curve.gainDb(speed), TICK_MILLIS)
             onGainDb(applied)
+            onStatus(statusOf(source, speed, applied))
             logIfChanged(source, speed, applied, now)
             if (started) handler.postDelayed(this, TICK_MILLIS)
         }
@@ -78,11 +88,15 @@ internal class HiCarSpeedMonitor(
         if (started) return
         if (!settings.enabled) {
             onLog("speed volume: off; music is played at its own level")
+            onStatus(HiCarSpeedStatus())
             return
         }
         started = true
         if (settings.source != HiCarSpeedVolumeSettings.Source.LOCATION) startVehicle()
         if (settings.source != HiCarSpeedVolumeSettings.Source.VEHICLE) startLocation()
+        // Nothing has arrived yet, but the page should say the feature is running and what it is
+        // waiting for, rather than keeping the "not running" line from the previous session.
+        onStatus(statusOf("none", 0.0, 0.0))
         handler.post(tick)
         onLog(
             "speed volume: start %.0f km/h → 0 dB, %.0f km/h → +%.1f dB, source ${settings.source.name.lowercase()}".format(
@@ -98,6 +112,7 @@ internal class HiCarSpeedMonitor(
                 vehicleAtMillis = SystemClock.elapsedRealtime()
             }
         }.onFailure {
+            vehicleError = it.javaClass.simpleName
             onLog("speed volume: the car's wheel-speed channel is unavailable (${it.javaClass.simpleName}); location will be used")
         }.getOrNull()
     }
@@ -113,9 +128,28 @@ internal class HiCarSpeedMonitor(
             location = created
         } else {
             created.close()
+            locationError = "定位不可用"
             onLog("speed volume: no location provider could be started; the gain stays at 0 dB")
         }
     }
+
+    /** The snapshot the settings page prints; [source] is the same word the log uses. */
+    private fun statusOf(source: String, speed: Double, gain: Double): HiCarSpeedStatus =
+        HiCarSpeedStatus(
+            running = started,
+            source = when (source) {
+                "vehicle" -> HiCarSpeedStatus.Source.VEHICLE
+                "location" -> HiCarSpeedStatus.Source.LOCATION
+                "held" -> HiCarSpeedStatus.Source.HELD
+                else -> HiCarSpeedStatus.Source.NONE
+            },
+            speedKmh = speed,
+            gainDb = gain,
+            vehicleAvailable = vehicleKmh != null,
+            vehicleError = vehicleError,
+            locationAvailable = location != null,
+            locationError = locationError,
+        )
 
     private fun logIfChanged(source: String, speed: Double, gain: Double, now: Long) {
         val changedSource = source != lastSource
@@ -139,6 +173,7 @@ internal class HiCarSpeedMonitor(
         location = null
         estimator.reset()
         smoother.reset()
+        onStatus(HiCarSpeedStatus())
     }
 
     private companion object {

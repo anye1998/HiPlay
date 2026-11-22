@@ -78,10 +78,16 @@ internal class HiCarAudioSink(
     @Volatile private var paused = false
 
     /**
-     * Speed-linked gain for music, in dB. Only the media lane is multiplied: navigation prompts and
-     * calls must not get louder just because the car is on a motorway.
+     * Speed-linked gain per purpose, in dB.
+     *
+     * Music, guidance and calls each have their own value because the driver can hand the curve to
+     * one and not the others (a call already has the phone's own processing, and a unit whose
+     * navigation speaker is loud enough needs no help). Prompts, ringtones and everything else stay
+     * at 0 dB: they are short cues whose level the phone chose deliberately.
      */
-    @Volatile private var speedGainDb = 0.0
+    @Volatile private var mediaGainDb = 0.0
+    @Volatile private var navigationGainDb = 0.0
+    @Volatile private var callGainDb = 0.0
 
     /** Until this instant (nanoTime) the media lane plays attenuated. */
     private val duckedUntil = AtomicLong(0)
@@ -145,17 +151,35 @@ internal class HiCarAudioSink(
     }
 
     /**
-     * Sets the gain applied to music, in dB; 0 leaves the samples untouched.
+     * Sets the gain for the three lanes the speed curve may drive, in dB.
      *
-     * The value is applied at write time on the playback thread, so a speed update never races a
-     * buffer. Non-media routes ignore it entirely.
+     * Values are applied at write time on each playback thread, so a speed update never races a
+     * buffer. A lane whose switch is off is passed 0 dB rather than left at its previous value,
+     * which is what makes "turn it off during a session" take effect on the next block.
      */
-    fun setSpeedGain(db: Double) {
-        speedGainDb = if (db.isFinite()) db.coerceIn(0.0, HiCarSpeedGainCurve.MAX_ALLOWED_DB) else 0.0
+    fun setSpeedGains(mediaDb: Double, navigationDb: Double, callDb: Double) {
+        mediaGainDb = sanitize(mediaDb)
+        navigationGainDb = sanitize(navigationDb)
+        callGainDb = sanitize(callDb)
+    }
+
+    /** Convenience for the music lane alone, used by tests and by "stop the whole feature". */
+    fun setSpeedGain(mediaDb: Double) {
+        mediaGainDb = sanitize(mediaDb)
+    }
+
+    private fun sanitize(db: Double): Double =
+        if (db.isFinite()) db.coerceIn(0.0, HiCarSpeedGainCurve.MAX_ALLOWED_DB) else 0.0
+
+    private fun gainFor(route: HiCarAudioRoute): Double = when (route) {
+        HiCarAudioRoute.MEDIA -> mediaGainDb
+        HiCarAudioRoute.NAVIGATION -> navigationGainDb
+        HiCarAudioRoute.CALL -> callGainDb
+        else -> 0.0
     }
 
     /** The gain currently applied to music, for the settings screen. */
-    val currentSpeedGainDb: Double get() = speedGainDb
+    val currentSpeedGainDb: Double get() = mediaGainDb
 
     /** Plays a short tone on the music channel; false when there is nothing to play it through. */
     fun previewMedia(): Boolean = preview(HiCarAudioRoute.MEDIA)
@@ -377,7 +401,7 @@ internal class HiCarAudioSink(
             val audio = track ?: return
             val pcm = buffer ?: return
             if (route == HiCarAudioRoute.MEDIA && (paused || !focused)) return
-            val gain = if (route == HiCarAudioRoute.MEDIA) speedGainDb else 0.0
+            val gain = gainFor(route)
             // A non-media lane making a sound is what the music has to make room for.
             if (route != HiCarAudioRoute.MEDIA) holdDuck()
             var written = 0
@@ -390,7 +414,7 @@ internal class HiCarAudioSink(
                 val stats = HiCarPcmGain.applyPcm16(samples, 0, samples.size, gain)
                 if (stats.limited > 0 && (decoded <= 3 || decoded % 400 == 0L)) {
                     onLog(
-                        "audio: speed gain +%.1f dB, limiter engaged on %d of %d samples".format(
+                        "audio: ${route.name.lowercase()} speed gain +%.1f dB, limiter engaged on %d of %d samples".format(
                             gain, stats.limited, stats.samples,
                         ),
                     )

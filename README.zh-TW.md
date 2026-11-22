@@ -1,80 +1,128 @@
-# DiPlay
+# Android 車機上的 HiCar 接收端
 
-> **这个构建不再是 CarPlay 客户端。** CarPlay/AirPlay/iAP2 协议栈、HUD 与仪表盘输出、CarPlay 首页
-> 与相关设置已经从代码里删除，剩下的是一个给「没有前装 HiCar 的车机」用的 HiCar 接收端。下面的
-> 内容仍然是 CarPlay 时期的产品说明，只作历史保留；当前功能见
-> [docs/HICAR_UI.md](docs/HICAR_UI.md) 与 [docs/HICAR_MIGRATION.md](docs/HICAR_MIGRATION.md)。
+DiPlay 現在是一個 **HiCar 接收端**：讓一台沒有前裝 HiCar 的 Android 車機，扮演華為 HiCar 工作階段裡
+「車」的那一側。CarPlay / AirPlay / iAP2 通訊協定堆疊、HUD 與儀表板輸出、CarPlay 首頁都已從程式碼
+刪除，剩下的是接收端本體、它的設定頁，以及在一台沒人試過的車機上把鏈路拉起來所需的診斷。
 
-[English](README.md) · [简体中文](README.zh-CN.md) · [繁體中文](README.zh-TW.md)
+套件名稱 `com.shihab.diplay` · Android 7.0+（API 24）· GPL-3.0 · [English](README.md) ·
+[简体中文](README.zh-CN.md)
 
-為相容的比亞迪 Android 車機提供有線與無線 CarPlay，採用熟悉的 DiAuto 介面。DiPlay 是獨立應用程式，正式版套件名稱為 `com.shihab.diplay`。
+![設定頁：車速增益、依用途分開關、即時速度來源](docs/screenshots/hicar-settings-speed.png)
 
-> 專案以比亞迪汽車為主要支援對象。其他品牌可能可以執行，但不在一般支援範圍內；特定韌體的個別整合不代表整個品牌受到支援。
+## 現況
 
-[下載與繁體中文網站](https://shihabal3amri.github.io/DiPlay/zh-Hant/) · [0.2.22 版本](https://github.com/shihabal3amri/DiPlay/releases/tag/v0.2.22) · [回報問題](https://github.com/shihabal3amri/DiPlay/issues/new/choose)
+這是實驗性的接收端，以下把「有證據的」和「只在測試裡跑過的」分開寫。
 
-![DiPlay 主畫面](site/assets/home.png)
+- **無線鏈路已在開發車上跑通。** 比亞迪宋 Plus（Android 10）+ Mate 80 Pro Max：手機跳出 HiCar
+  提示、六位數連線碼被接受、有畫面、有聲音、點按/滑動/返回/主頁可用、配對過一次後免碼回連。那次
+  的日誌在 [docs/HICAR_MIGRATION.md](docs/HICAR_MIGRATION.md) §7.49。
+- **之後新增的功能只在編譯和單元測試裡跑過，還沒有上車。** 多指觸控、清晰度/影格率檔位、音訊依用途
+  分路與聲道選擇、掃碼配對、熱點延後開啟、車機主動回連、還原車機自己的 Wi-Fi、隨車速增益（音樂/
+  導航/通話）、有線 NCM 通路，都是「編譯通過 + 單元測試涵蓋」。哪些還沒上車，設定頁的「關於」一節
+  寫明了。
+- **有線 HiCar 沒有端對端驗證。** 還沒有一次與手機的完整有線工作階段，見
+  [docs/HICAR_WIRED.md](docs/HICAR_WIRED.md)。
+- **HUD 與儀表板輸出沒有實作。** 它們屬於 CarPlay 時期的功能，隨那套程式碼一起刪除了。
 
-## 開始使用
+## 它能做什麼
 
-請將 DiPlay 安裝在**車機上，而非 iPhone**。車機需要允許安裝 APK，且 Android 版本須為 7.0 以上（API 24+）；Android 7.0–8.1 的有線 CarPlay 已在一台實車上確認，無線連線尚待實車驗證。使用時無須越獄、轉接盒、Mac、帳號或遠端認證伺服器。
+### 連線
 
-有線與無線 CarPlay 的核心功能不需要 ADB。部分儀表板、車輛資料、方向盤或停車影片功能需要相容韌體及已授權的網路 ADB，請依各設定的說明操作。
+1. 車機在 BLE 上廣播 HiCar 服務（`0xFDEE`），螢幕顯示六位數連線碼。
+2. 手機發現車機並跳出提示，駕駛在手機上輸入連線碼。
+3. RFCOMM `0xFE35` 上跑 HiChain。車機用連線碼證明自己 —— 不需要華為簽發的配件憑證，也不需要
+   任何帳號伺服器。
+4. 驗證通過後車機開 5 GHz 熱點，手機接入，控制通道轉到 TCP `4005`/`4006`/`4007`。
+5. 畫面走 HiSight/RTSP，H.264 解碼後畫進 `TextureView`；觸控與按鍵走一條 AES-128-CTR 加密的
+   UIBC 通道回傳。
 
-1. 停車後安裝 APK，開啟 DiPlay 並授予所需權限。
-2. 無線模式可選車載熱點、Wi-Fi Direct 或現有 Wi-Fi／同一區域網路；有線模式請使用支援資料傳輸的 USB 連接埠與傳輸線。
-3. 在 iPhone 上接受 CarPlay 提示。連線前先關閉其他手機投影應用程式。
+連線頁上還有一個 QR code，帶車機的藍牙位址、機型碼和連線碼，手機掃碼即可，不必手輸；位址還是
+預留值時只顯示一句原因，不畫一個「掃了也連不上」的碼。
 
-完整步驟請見[安裝與連線指南](docs/INSTALL.zh-TW.md)。
+### 連線中
 
-## 切換為繁體中文
+- **顯示方式**：全螢幕、狀態列、狀態列+導覽列。畫面依手機的解析度等比縮放到剩下的空間，永不拉伸；
+  切換模式不需要中斷連線。
+- **連線中改設定**：設定頁是**疊在**工作階段畫面上的一層，和接收端在同一個 Activity 裡。第二個
+  Activity 會讓畫面所在的 surface 暫停，鏡像就黑了 —— 這是它不做成獨立頁面的原因。
+- **方向盤與媒體鍵**轉給手機（播放/暫停、上一首、下一首及其餘標準媒體鍵）：手機在能力回應裡聲明
+  接受時才轉送；關掉開關，按鍵立刻歸車機。
+- **多指觸控**：一個觸控封包攜帶全部手指的快照，手機地圖上的雙指縮放可用。
+- **畫面品質**：三檔清晰度，影格率可跟隨螢幕或固定 30/60。這兩項在連線建立時一次性回覆手機，變更
+  從下次連線生效，設定頁寫明了這點。
+- **依用途分路的聲音**：音樂、導航、提示音、通話、鈴聲各自有解碼器、佇列和 `AudioTrack`，導航
+  播報可以走車機自己的導航聲道，音樂仍留在音樂聲道。每條通道可以釘到一個舊式 stream number
+  （0 = 自動），並用一段短音試聽。
+- **隨車速增益**：音樂、導航、通話可以各自跟隨同一條速度曲線（起始速度、滿檔速度、上限 dB），增益
+  直接乘在接收端解出來的 PCM 取樣上，不動車機和手機的系統音量。設定頁會顯示**目前真正在用的
+  來源** —— 車輛匯流排、定位、訊號中斷時的保持、或沒有 —— 以及目前速度和增益。導航與通話各有
+  獨立開關。
+- **桌面上第二個入口**：「HiCar 设置」圖示開啟同一個 Activity 並直接展開設定頁，連線中想改設定
+  不必在畫面上找那個小入口。
 
-開啟 **設定 → 語言 → 應用程式語言**，選擇 **繁體中文**，再按 **套用**。也可選擇 **跟隨系統**。
+### 收尾
 
-Android 13 以上會與 Android 的個別應用程式語言設定同步；Android 7.0–12 由 DiPlay 儲存語言選擇。繁體中文使用臺灣用語；香港、澳門及明確指定 `Hant` 的語言選擇共用這份翻譯，並未提供獨立的地區版本。DiPlay 的語言選擇控制其自身介面，CarPlay 內的應用程式語言則由 iPhone 及各應用程式管理。
+- 熱點在手機驗證通過之後才開：車裡沒有手機時，接收端不會白佔車機的 Wi-Fi。
+- 已知手機的藍牙鏈路一上來，車機可以主動回撥它 —— 這是對「手機自己不會撥」的唯一答案。
+- 停止接收端時，會把車機自己的 Wi-Fi 要回來。
+- 可選的無障礙服務替使用者按系統 USB 授權視窗上的「允許」；它只認同時提到 USB 且有確認按鈕的視窗。
+- **有線 HiCar** 在使用者空間實作（CDC-NCM 介面、NTB16 組框、自答 ARP、`VpnService` TUN、兩條傳輸
+  執行緒），因為這台車機的核心沒有 `rndis_host`。預設關閉，未驗證。
 
-選用的 **DiPlay Home** 啟動器與 **DiPlay map host** 範例也提供繁體中文，依各自的 Android 系統語言顯示，不共用主要 DiPlay 應用程式的語言偏好。第三方小工具與應用程式名稱由提供者決定。
+## 環境需求
 
-## 主要功能與 0.2.22 更新
-
-- 有線 USB 與無線 CarPlay，使用本機認證。
-- 相容韌體上的比亞迪抬頭顯示器（HUD）與儀表板導航提示。
-- 解析度、影格率、圖示與文字大小調整；依設定說明，在重新連線後套用。
-- 0.2.22 修正 0.2.21 在比亞迪 DiLink 3.0／4.0 等車機上透過車機熱點無線連線時一直停在「正在開啟 CarPlay」的問題，之前填寫的「熱點網路介面（選填）」可以清空；透過 Wi-Fi 播放音樂時恢復 iPhone 的原始速度，不再先快 1.5% 再卡頓。
-- USB 連線時，微信語音、語音備忘錄和聽寫能錄到聲音；插著線重新連線時，有線 CarPlay 第一次就能連上；連線失敗時，CarPlay 畫面和主畫面會說明原因與修改方式。新增韓文與土耳其文。新選項預設關閉：在桌面卡片中保留 CarPlay、導航提示音請求音訊焦點、依通話本身的取樣率通話、DiLink 3.0 全螢幕儀表地圖，以及騰勢 N9 的儀表地圖。
-- 可在 **設定 → 關於 → 在手機上備份或還原** 透過 QR 碼備份設定，更新時可選其他安裝程式。
-- 本機診斷報告匯出，只有在你選擇分享後才會傳送。
-- 實驗性選項預設關閉，請停車後依說明測試。
-
-[英文版本說明](docs/RELEASE-NOTES-0.2.22.md)與[驗證紀錄](docs/VALIDATION.md)記錄完整變更、已知限制及尚待實車測試的項目。自動化測試通過不代表所有車型、iOS、Siri 或通話情境都已驗證。
-
-## 繁體中文文件
-
-| 文件 | 內容 |
+| | |
 | --- | --- |
-| [安裝與連線](docs/INSTALL.zh-TW.md) | 首次使用、權限、USB、熱點及 Wi-Fi 模式 |
-| [設定與疑難排解](docs/SETTINGS.zh-TW.md) | 設定分類、重新連線、畫面與聲音、診斷回報 |
-| [隱私權與診斷](docs/PRIVACY.zh-TW.md) | 資料儲存、權限、報告分享及更新檢查 |
-| [從原始碼建置](docs/BUILD.zh-TW.md) | Windows／Android Studio、建置環境、APK 路徑及認證素材 |
-| [翻譯維護](docs/LOCALIZATION.zh-TW.md) | 臺灣用語、資源檢查與文件同步方式 |
-| [本次繁體中文驗證紀錄](docs/VALIDATION.zh-TW.md) | 測試、建置結果及完整 CI 的未解失敗 |
+| 車機 | Android 7.0+（API 24），允許安裝 APK，藍牙 4.0+ 且能發 BLE 廣播，Wi-Fi 能開 5 GHz 熱點 |
+| 手機 | 支援 HiCar 的華為手機。開發機是 Mate 80 Pro Max |
+| 車速（車輛匯流排） | 廠商自己的輪速通道。比亞迪上是 `autoservice`，需要 adb 或 root；取不到就用定位 |
+| 車速（定位） | 精確定位權限，且能看見天空。隧道裡保持最後速度約 45 秒，然後淡回不增益 |
 
-進階車型整合可參考[比亞迪導航](docs/BYD_NAVIGATION.md)、[Wi-Fi Direct 舊版限制](docs/ANDROID9_WIFI_DIRECT.md)及[現有 Wi-Fi 指南](docs/EXISTING_WIFI.md)；這些深入文件目前為英文。
+## 安裝
 
-## 相容性與公開預覽版限制
+裝在**車機**上，不是手機。debug 套件帶後綴 `.hudtest`（`com.shihab.diplay.hudtest`），可以和正式版
+並存；兩者偏好設定檔名相同，但資料目錄各自獨立。
 
-這是**未經 Apple 認證的公開預覽版**。公開 APK 包含從公開 Carlinkit 韌體取得的實驗性配件身分，並非為 DiPlay 新核發的 MFi 身分；內含私密金鑰可被擷取。未來 iOS 是否接受、各車機的可靠性及該身分是否適合公開散布，仍有未解問題。
+1. 把 APK 拷到車機並安裝（檔案管理器或 `adb install`）。
+2. 開啟 **HiCar**，同意它申請的權限（藍牙廣播/連線、Wi-Fi、定位）。
+3. 先在車機和手機的「系統藍牙設定」裡完成一次一般配對 —— 參考接收端要求這一步，配過之後再連
+   成功率高得多。
+4. 點 **开始**，在手機上輸入六位數連線碼，或掃 QR code。
 
-Wi-Fi Direct 在 Android 7.0–9 使用依賴韌體的舊版路徑，無法驗證實際協商頻率；Android 10 以上可驗證。車機支援連上 5 GHz Wi-Fi，不代表能建立 5 GHz Wi-Fi Direct 群組。遇到卡頓可先使用車載熱點、30 fps、預設圖示大小及較低解析度，保留 HEVC 關閉。
+連線失敗時，螢幕和匯出的日誌會說明停在哪一步。從 **設定 → 診斷 → 匯出日誌** 匯出；Android 10+
+寫到 `Downloads/DiPlay`。報告裡故意包含連線碼（「碼被拒」本身就是被排查的失敗）。
 
-更新時使用相同套件與相符簽章才能保留設定及配對資料；請勿只憑 APK 檔名判斷更新相容性。安裝限制取決於車機韌體。
+## 建置
 
-## 回報問題
+```bash
+export JAVA_HOME=/path/to/jdk-21-or-newer
+./gradlew :shared:testDebugUnitTest :common:compileDebugKotlin :mobile:assembleDebug
+```
 
-重現問題後，開啟 **設定 → 診斷 → 儲存診斷報告**，記錄故障時間並檢查 TXT 內容，再附到[相關問題](https://github.com/shihabal3amri/DiPlay/issues)或[新增問題](https://github.com/shihabal3amri/DiPlay/issues/new/choose)。請提供車型／車機、Android／DiLink／完整韌體版本、iPhone／iOS、連線方式、相關設定與重現步驟。不要公開熱點密碼或認證檔案。詳見[診斷回報步驟](docs/SETTINGS.zh-TW.md#匯出診斷報告與回報問題)。
+`mobile` 是 APK，`samples/*` 是無關的示範應用。debug 套件在
+`mobile/build/outputs/apk/debug/mobile-debug-unsigned.apk`，裝之前用你自己的金鑰簽章。release
+建置只有舊的 CarPlay 身分需要 `DIPLAY_AUTH_ASSETS_DIR`，這個接收端不用它。
 
-## 原始碼與授權
+`automotive` 與地圖範例是 CarPlay 時期的遺留，不屬於接收端。
 
-專案基於 [xcertplay](https://github.com/shilapi/xcertplay)（GPL-3.0）。主畫面、設定介面及網站改編自 [DiAuto](https://github.com/shihabal3amri/DiAuto)（AGPL-3.0）；相關授權位於 `docs/licenses`。散布修改版本時請保留[第三方聲明與授權](docs/THIRD_PARTY_NOTICES.md)。CarPlay 與其圖示屬於 Apple Inc.；專案不代表 Apple 或比亞迪的認可。
+## 文件
 
-一般原始碼／CI 建置預設不包含執行時認證素材；獨立連線測試需要外部素材。Git 與公開原始碼壓縮檔排除認證私密金鑰、Android 簽章金鑰及本機設定；將認證素材打包進 APK 後，接收者仍可擷取。詳見[建置指南](docs/BUILD.zh-TW.md)。
+- [介面、顯示模式與桌面上的兩個入口](docs/HICAR_UI.md)
+- [通訊協定偵察與車機能力邊界](docs/HICAR_RECON.md)
+- [遷移日誌：每一次真實嘗試，附日誌行](docs/HICAR_MIGRATION.md)
+- [方向盤按鍵](docs/HICAR_KEYS.md) · [有線 HiCar](docs/HICAR_WIRED.md) · [車機 adb 判定清單](docs/HICAR_ADB.md)
+- [從 OpenHC 借鏡了什麼、明確不做什麼](docs/OPENHC_COMPARISON.md)
+- [CarPlay 刪除：邊界與進度](docs/CARPLAY_REMOVAL.md)
+- [變更日誌](CHANGELOG.md) · [第三方聲明](docs/THIRD_PARTY_NOTICES.md)
+
+## 來源與授權
+
+基於 [xcertplay](https://github.com/shilapi/xcertplay)，GPL-3.0。接收端移植了
+[huducat586/hicar-android-receiver](https://github.com/huducat586/hicar-android-receiver)（MIT）與
+[GGBondLab/OpenHC](https://github.com/GGBondLab/OpenHC)（GPL-3.0-only）的做法：媒體鍵轉送、多指
+觸控快照、畫面檔位、音訊分路、QR code 配對格式、使用者空間 NCM 與主動回連方向。HiChain 來自
+OpenHarmony 的 `deviceauth_lite` 與 `huks_lite`（Apache-2.0），編進 `libhicarauth.so`。散布修改版
+時請保留這些聲明。
+
+HiCar 是華為的產品；本專案與華為、比亞迪沒有隸屬或背書關係。只在你擁有且允許安裝軟體的車輛上
+使用。

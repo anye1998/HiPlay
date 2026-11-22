@@ -18,6 +18,20 @@ data class HiCarSpeedVolumeSettings(
     val maxGainDb: Double = HiCarSpeedGainCurve.DEFAULT_MAX_GAIN_DB,
     /** `auto` uses the car bus first and falls back to location; the others pin one source. */
     val source: Source = Source.AUTO,
+    /**
+     * Whether guidance gets the same curve as music.
+     *
+     * A nav prompt is spoken, short and easy to lose under wind and road noise at motorway speed,
+     * which is why it may follow the curve. It is a separate switch because a unit whose navigation
+     * speaker is already loud, or whose amplifier compresses hard, is better left alone.
+     */
+    val navigationGain: Boolean = true,
+    /**
+     * Whether call audio follows the curve. Separate for the same reason: a unit whose hands-free
+     * path already has its own speed compensation, or whose echo canceller reacts badly to a boost,
+     * can leave the call at its own level.
+     */
+    val callGain: Boolean = true,
 ) {
     enum class Source { AUTO, VEHICLE, LOCATION }
 
@@ -34,6 +48,8 @@ data class HiCarSpeedVolumeSettings(
         private const val KEY_FULL = "full_kmh"
         private const val KEY_MAX_GAIN = "max_gain_db"
         private const val KEY_SOURCE = "source"
+        private const val KEY_NAVIGATION_GAIN = "navigation_gain"
+        private const val KEY_CALL_GAIN = "call_gain"
 
         /** The range the settings page may offer; outside it the curve is clamped anyway. */
         const val MIN_START_KMH = 10.0
@@ -51,6 +67,8 @@ data class HiCarSpeedVolumeSettings(
                 maxGainDb = prefs.getFloat(KEY_MAX_GAIN, HiCarSpeedGainCurve.DEFAULT_MAX_GAIN_DB.toFloat()).toDouble(),
                 source = runCatching { Source.valueOf(prefs.getString(KEY_SOURCE, Source.AUTO.name)!!) }
                     .getOrDefault(Source.AUTO),
+                navigationGain = prefs.getBoolean(KEY_NAVIGATION_GAIN, true),
+                callGain = prefs.getBoolean(KEY_CALL_GAIN, true),
             )
         }
 
@@ -62,6 +80,8 @@ data class HiCarSpeedVolumeSettings(
                 .putFloat(KEY_FULL, settings.fullKmh.toFloat())
                 .putFloat(KEY_MAX_GAIN, settings.maxGainDb.toFloat())
                 .putString(KEY_SOURCE, settings.source.name)
+                .putBoolean(KEY_NAVIGATION_GAIN, settings.navigationGain)
+                .putBoolean(KEY_CALL_GAIN, settings.callGain)
                 .apply()
         }
     }

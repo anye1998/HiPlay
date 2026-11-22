@@ -137,6 +137,56 @@ class HiCarPcmGainTest {
     }
 }
 
+/** What the settings page prints, and the switches that decide which lanes follow the curve. */
+class HiCarSpeedStatusTest {
+    @Test
+    fun `a stopped receiver says so instead of showing a speed`() {
+        val status = HiCarSpeedStatus()
+        assertEquals(HiCarSpeedStatus.Source.OFF, status.source)
+        assertEquals("未启用", status.sourceLabel)
+        assertTrue(status.describe().contains("未运行"))
+        assertTrue(status.describe().contains("开启"))
+    }
+
+    @Test
+    fun `a live fix names the source that answered`() {
+        val status = HiCarSpeedStatus(
+            running = true,
+            source = HiCarSpeedStatus.Source.VEHICLE,
+            speedKmh = 82.4,
+            gainDb = 5.4,
+            vehicleAvailable = true,
+        )
+        assertEquals("车辆总线（轮速）", status.sourceLabel)
+        assertEquals("82 km/h，来源 车辆总线（轮速），当前增益 +5.4 dB", status.describe())
+    }
+
+    @Test
+    fun `no fix explains both sources instead of pretending to be zero`() {
+        val status = HiCarSpeedStatus(
+            running = true,
+            source = HiCarSpeedStatus.Source.NONE,
+            vehicleError = "SecurityException",
+            locationError = "定位不可用",
+        )
+        val line = status.describe()
+        assertTrue(line, line.contains("SecurityException"))
+        assertTrue(line, line.contains("定位不可用"))
+    }
+
+    @Test
+    fun `guidance and calls follow the curve unless the driver turns them off`() {
+        val defaults = HiCarSpeedVolumeSettings()
+        assertTrue("guidance should follow by default", defaults.navigationGain)
+        assertTrue("calls should follow by default", defaults.callGain)
+        val musicOnly = defaults.copy(navigationGain = false, callGain = false)
+        assertEquals(false, musicOnly.navigationGain)
+        assertEquals(false, musicOnly.callGain)
+        // The curve itself is untouched by the per-lane switches.
+        assertEquals(defaults.maxGainDb, musicOnly.maxGainDb, 1e-9)
+    }
+}
+
 class HiCarSpeedEstimatorTest {
     private val estimator = HiCarSpeedEstimator(
         staleAfterMillis = 8_000,

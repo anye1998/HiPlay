@@ -1,74 +1,146 @@
-# DiPlay
+# HiCar receiver for Android head units
 
-> **This build is no longer a CarPlay client.** The CarPlay, AirPlay and iAP2 stacks, the HUD and
-> cluster outputs, the CarPlay home screen and its settings have been removed from the code; what
-> remains is a HiCar receiver for head units that have no factory HiCar. The rest of this file still
-> describes the CarPlay-era product and is kept only as history — see
-> [docs/HICAR_UI.md](docs/HICAR_UI.md) and [docs/HICAR_MIGRATION.md](docs/HICAR_MIGRATION.md) for what
-> the app does now.
+DiPlay is now a **HiCar receiver**: it makes an Android head unit that shipped without HiCar behave
+as the car side of a Huawei HiCar session. The CarPlay, AirPlay and iAP2 stacks, the HUD and cluster
+outputs and the CarPlay home screen have been removed; what remains is the receiver, its settings and
+the diagnostics needed to bring one up on a head unit nobody has tested before.
 
-[English](README.md) · [简体中文](README.zh-CN.md) · [繁體中文](README.zh-TW.md)
+Package `com.shihab.diplay` · Android 7.0+ (API 24) · GPL-3.0 · [简体中文](README.zh-CN.md) ·
+[繁體中文](README.zh-TW.md)
 
-**CarPlay for compatible BYD Android head units.** Wired and wireless, with the familiar DiAuto interface. Independent app: `com.shihab.diplay`.
+![The settings page: speed-linked gain, per-purpose switches, live speed source](docs/screenshots/hicar-settings-speed.png)
 
-> **BYD support scope:** These projects focus on BYD cars. They may work on other brands, but other brands are unsupported and there are no plans to add support or fix brand-specific incompatibilities.
+## Status
 
-[Download & website](https://shihabal3amri.github.io/DiPlay/) · [Release](https://github.com/shihabal3amri/DiPlay/releases/tag/v0.2.22) · [Report a problem](https://github.com/shihabal3amri/DiPlay/issues/new/choose)
+This is an experimental receiver, and the README says which parts have evidence behind them.
 
-![DiPlay home](site/assets/home.png)
+- **Wireless works on the development car.** On a BYD Song Plus (Android 10) with a Mate 80 Pro Max:
+  the phone shows the HiCar prompt, the six-digit code is accepted, the picture appears, sound plays,
+  taps/slides/back/home work, and a phone that was paired once reconnects without the code. The log of
+  that run is in [docs/HICAR_MIGRATION.md](docs/HICAR_MIGRATION.md) §7.49.
+- **Everything newer has run in tests, not on a car.** Multi-touch, the picture tiers, the split audio
+  lanes and channel choice, QR pairing, lazy hotspot creation, redialling from the car, restoring the
+  car's own Wi-Fi, the speed-linked gain (music, guidance and calls) and the wired NCM path are
+  compiled and unit-tested. The About section of the settings page says which parts have not been
+  tested on a car.
+- **Wired HiCar is unverified end to end.** No cable session with a phone has completed; see
+  [docs/HICAR_WIRED.md](docs/HICAR_WIRED.md).
+- **HUD and instrument-cluster output are not implemented.** They were CarPlay features and were
+  removed with that stack.
 
-## 0.2.22 — public preview
+## What it does
 
-Install on the **car**, not the iPhone. No jailbreak, dongle, Mac, account or authentication server is required for use. Core CarPlay does not require ADB; optional dashboard, battery, wheel-speed and parked-video features do. Your head unit must permit APK installation. The APK supports Android 7.0+ (API 24); on Android 7.0–8.1, wired CarPlay is confirmed on one car and wireless is not yet confirmed on a vehicle. Wireless supports Wi-Fi Direct, the car’s existing hotspot or Existing Wi-Fi / Same LAN. Android 7.0–9 Wi-Fi Direct uses a firmware-dependent legacy path with generated group credentials and unverified requested frequency; see [Android 9 Wi-Fi Direct](docs/ANDROID9_WIFI_DIRECT.md). Android 10+ verifies its negotiated group frequency.
+### Connection
 
-- Wired USB and wireless CarPlay with local authentication.
-- BYD HUD navigation with arrows, distance and street names on verified firmware.
-- Car hotspot support, improved audio buffering and saved receive diagnostics.
-- Automatic address discovery, fixed-channel Wi-Fi fallbacks and successful-configuration memory.
-- Icon/text size, resolution and frame rate; applying a display change reconnects CarPlay.
-- Local diagnostic export. Reports are sent only if you choose to share them.
-- Separate installation alongside DiAuto. Run one projection app at a time.
+1. The head unit advertises the HiCar service (`0xFDEE` over BLE) and shows a six-digit connection code.
+2. The phone finds the car, prompts, and the driver enters the code.
+3. RFCOMM `0xFE35` carries HiChain. The car proves itself with the code — no Huawei-issued accessory
+   certificate and no account server.
+4. After authentication the car opens a 5 GHz access point; the phone joins it and control moves to
+   TCP `4005`/`4006`/`4007`.
+5. Video arrives over HiSight/RTSP as H.264, is decoded and drawn into a `TextureView`; touches and
+   keys go back over a UIBC channel encrypted with AES-128-CTR.
 
-This is **not an Apple-certified product**. The APK bundles an experimental accessory identity recovered from public Carlinkit firmware, not a newly provisioned MFi identity for DiPlay. A bundled private key is extractable. Acceptance after future iOS updates, reliability across head units and suitability of that identity for general distribution are unresolved. This release invites community testing; it is not a guarantee of universal compatibility.
+A QR code on the setup page carries the car's Bluetooth address, model id and code, so a phone can
+scan instead of typing; the address is refused rather than drawn when it is a placeholder.
 
-Earlier releases were tested on the development DiLink5.1 car: live windshield guidance and street names work, Car hotspot now starts CarPlay, and Wi-Fi Direct performance is substantially improved. Audio underrun recovery is improved in 0.2.15; remaining cutouts need current diagnostic reports. The 0.2.16 software Opus microphone fallback was accepted on a BOS Mini A1 head unit (Android 9) with an iPhone 12 on iOS 27. The floating-map test build was installed on the development DiLink 5.1 car; feedback led to the pinch corrections in 0.2.9. Earlier wheel-speed and video contributions were tested on a BYD Tang with DiLink 5.0 and an iPhone 15 Pro on iOS 27; wheel-speed dead reckoning in tunnels remains unverified. Broader head-unit and iOS compatibility is not guaranteed. The HUD firmware scope and cleanup limits are documented in [BYD navigation](docs/BYD_NAVIGATION.md).
+### While connected
 
-## What’s new in 0.2.22
+- **Display modes**: full screen, status bar, or status bar and navigation bar. The picture is fitted
+  to the space that is left — never stretched — and the mode can be changed without dropping the
+  session.
+- **Settings without disconnecting**: the settings page is drawn *over* the session, in the same
+  activity, because a second activity would pause the surface and black out the picture.
+- **Steering-wheel and media keys** are forwarded to the phone (play/pause, previous, next, and the
+  rest of the standard media keys) when the phone says it accepts them; switched off, they stay with
+  the car.
+- **Multi-touch**: a touch packet carries every finger in a snapshot, so pinch and two-finger gestures
+  work in the phone's map.
+- **Picture quality**: three sharpness steps and a frame rate that follows the panel or is pinned to
+  30/60 fps. Answered once per connection, and the page says so.
+- **Audio by purpose**: music, guidance, prompts, calls and ringtones each get their own decoder,
+  queue and `AudioTrack`, so a guidance prompt can play on the unit's own navigation channel while
+  music keeps its own. Each channel can be pinned to a legacy stream number (0 = automatic) and
+  previewed with a short tone.
+- **Speed-linked gain**: music, guidance and calls can each follow a speed curve (start speed, full
+  speed, ceiling in dB), applied to the PCM samples inside the receiver — no system volume is touched.
+  The settings page shows **which source is answering right now** — car bus, location, held through a
+  loss of signal, or none — together with the current speed and gain. Guidance and calls have their
+  own switches.
+- **Second launcher icon**: "HiCar 设置" opens the same activity with the settings page already up, so
+  a setting can be changed during a session without hunting for the small entry on the picture.
 
-- Wireless CarPlay over the car hotspot connects again on BYD DiLink 3.0 and 4.0 head units where 0.2.21 stayed on "Opening CarPlay"; the **Hotspot interface (optional)** workaround can be cleared.
-- Music plays at the iPhone's speed over Wi-Fi again, from the first second of every song, without the 0.2.21 speed-up and stutter.
-- Over USB, WeChat voice messages, Voice Memos and dictation record your voice instead of silence.
-- Wired CarPlay connects on the first attempt after a replug, and the CarPlay screen and Home say why a connection failed and what to change.
-- DiPlay is available in Korean and Turkish.
-- New options, off by default: keep CarPlay in the launcher card, navigation prompts that ask for audio focus, calls at the call's own rate, a full-screen DiLink 3.0 dashboard map and the dashboard map on the Denza N9.
+### Housekeeping
 
-See [0.2.22 release notes](docs/RELEASE-NOTES-0.2.22.md) and [validation](docs/VALIDATION.md) for contribution links and remaining physical tests. General stutter, calls/Siri, decoder and model-specific reports still need current-device evidence. [0.2.21 notes](docs/RELEASE-NOTES-0.2.21.md) remain available as historical guidance.
+- The access point opens only after a phone authenticates, so a receiver with no phone does not take
+  the car's Wi-Fi for nothing.
+- A phone whose Bluetooth link comes up can be redialled from the car, which is the only answer to a
+  handset that does not dial on its own.
+- The car's own Wi-Fi is asked back when the receiver stops.
+- An optional accessibility service presses "允许" on the system's USB permission dialog; it matches
+  only a window that mentions USB and has a confirming button.
+- **Wired HiCar** is driven from user space (CDC-NCM interface, NTB16 framing, ARP replies, a
+  `VpnService` TUN and two transport threads) because this head unit's kernel has no `rndis_host`.
+  Off by default; unverified.
 
-If a problem remains, reproduce it on **0.2.22**, then use **Settings → Diagnostics → Save diagnostic report**. Android 10+ normally saves to **Downloads/DiPlay**; Android 7.0–9 asks for storage access and saves there too. If unavailable, use **View report** or **Share** from the confirmation, which identifies external/private fallback storage. Review the `.txt` and attach it as a file to a matching [existing issue](https://github.com/shihabal3amri/DiPlay/issues), or [create one](https://github.com/shihabal3amri/DiPlay/issues/new/choose). Include vehicle/head-unit model, exact firmware and Android/DiLink, phone/iOS, connection backend, relevant settings, steps and failure time. Reports are shared only when you choose; never post your hotspot password.
+## Requirements
+
+| | |
+| --- | --- |
+| Head unit | Android 7.0+ (API 24), APK installation allowed, Bluetooth 4.0+ with BLE advertising, Wi-Fi able to run a 5 GHz access point |
+| Phone | Huawei phone with HiCar. The development phone is a Mate 80 Pro Max |
+| Speed by car bus | The manufacturer's wheel-speed channel. On BYD this is `autoservice`, reached over adb or root; without it the feature uses location |
+| Speed by location | Fine-location permission, and a view of the sky. Tunnels hold the last speed for about 45 s, then fade |
+
+## Install
+
+Install on the **car**, not the phone. The debug build has the suffix `.hudtest`
+(`com.shihab.diplay.hudtest`) and can sit next to a release install; both use the same preferences
+names but separate app data.
+
+1. Copy the APK to the head unit and install it (a file manager, or `adb install`).
+2. Open **HiCar**, allow the permissions it asks for (Bluetooth advertise/connect, Wi-Fi, location).
+3. Pair the phone with the head unit once in the system Bluetooth settings — the reference receiver
+   requires this, and a first connection is much more reliable after it.
+4. Press **开始** and enter the six-digit code on the phone, or scan the QR code.
+
+If a connection fails, the screen and the exported log say where it stopped. Export from
+**设置 → 诊断 → 导出日志**; the report is written to `Downloads/DiPlay` on Android 10+ and includes the
+connection code on purpose (a rejected code is itself the failure being investigated).
+
+## Build
+
+```bash
+export JAVA_HOME=/path/to/jdk-21-or-newer   # the build uses a modern JDK
+./gradlew :shared:testDebugUnitTest :common:compileDebugKotlin :mobile:assembleDebug
+```
+
+`mobile` is the APK; `samples/*` are unrelated demo apps. The debug APK is
+`mobile/build/outputs/apk/debug/mobile-debug-unsigned.apk` — sign it with your own key before
+installing. A release build needs `DIPLAY_AUTH_ASSETS_DIR` only for the legacy CarPlay identity, which
+this receiver does not use.
+
+`automotive` and the map samples are leftovers of the CarPlay era and are not part of the receiver.
 
 ## Documentation
 
-[Existing Wi-Fi / Same LAN](docs/EXISTING_WIFI.md) keeps the iPhone and head unit
-on an external router. See the guide for setup, build requirements and the
-BYD DiLink 4.0 / Android 10 clean-install validation result.
-
-- [Install and connect](docs/INSTALL.md)
-- [Compatibility and troubleshooting](docs/COMPATIBILITY.md)
-- [Smooth wireless CarPlay](docs/SMOOTH_WIRELESS.md)
-- [Privacy and diagnostic reports](docs/PRIVACY.md)
-- [Build from source](docs/BUILD.md) — select `mobile` for the main DiPlay app; `maphost` is a map sample.
-- [Validation](docs/VALIDATION.md)
-- [Release notes](CHANGELOG.md)
-- [Credits and licenses](docs/THIRD_PARTY_NOTICES.md)
-
-The app and the website include English, Arabic, Russian, Ukrainian, Spanish, Simplified Chinese, Traditional Chinese (Taiwan), Japanese, Italian, Korean and Turkish. Traditional Chinese uses Taiwan wording; the app also recognizes Hong Kong/Macao and explicit Hant selections without claiming separate regional translations. Choose the app language in Settings; on Android 13+, it stays synchronized with Android’s per-app language setting. See the [Traditional Chinese guide](README.zh-TW.md) for installation, settings, troubleshooting, privacy and build instructions.
+- [Interface, display modes and the two launcher entries](docs/HICAR_UI.md)
+- [Protocol reconnaissance and what the head unit can and cannot do](docs/HICAR_RECON.md)
+- [Migration log: every real attempt, with the log lines](docs/HICAR_MIGRATION.md)
+- [Steering-wheel keys](docs/HICAR_KEYS.md) · [Wired HiCar](docs/HICAR_WIRED.md) · [ADB checklist for a head unit](docs/HICAR_ADB.md)
+- [What was taken from OpenHC, and what was deliberately not](docs/OPENHC_COMPARISON.md)
+- [CarPlay removal: the boundary and the progress](docs/CARPLAY_REMOVAL.md)
+- [Release notes](CHANGELOG.md) · [Third-party notices](docs/THIRD_PARTY_NOTICES.md)
 
 ## Source and credits
 
-Based on [xcertplay](https://github.com/shilapi/xcertplay), GPL-3.0. The home/settings UI and website adapt [DiAuto](https://github.com/shihabal3amri/DiAuto), AGPL-3.0; that license is included in `docs/licenses`. Preserve those notices when distributing modifications. CarPlay and its icon belong to Apple Inc.; no Apple or BYD affiliation or endorsement is implied.
+Based on [xcertplay](https://github.com/shilapi/xcertplay), GPL-3.0. The receiver ports work from
+[huducat586/hicar-android-receiver](https://github.com/huducat586/hicar-android-receiver) (MIT) and
+[GGBondLab/OpenHC](https://github.com/GGBondLab/OpenHC) (GPL-3.0-only): the media-key forwarding, the
+multi-touch snapshot, the picture tiers, the audio lane split, the QR pairing format, user-space NCM
+and the redial direction. HiChain comes from OpenHarmony's `deviceauth_lite` and `huks_lite`
+(Apache-2.0), built into `libhicarauth.so`. Preserve those notices when distributing a modified
+version.
 
-This repository starts with a clean public source snapshot. Local research, tester reports and release-signing secrets are excluded. The complete source corresponding to the APK is provided with every release; experimental runtime identity assets are described separately in the build instructions and notices.
-
-## Local release packaging
-
-The release APK intentionally contains the experimental accessory identity. The Git repository and source archive exclude all accessory and Android signing keys; tests generate synthetic identities at runtime. Source/CI builds omit runtime identity assets by default. Local release builds explicitly select an external asset directory. Publishing the APK makes its bundled identity extractable; building locally does not preserve that identity's confidentiality.
+HiCar is a Huawei product; this project is not affiliated with or endorsed by Huawei or BYD. Use it
+only where you are allowed to install software on the vehicle you own.

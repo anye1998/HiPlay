@@ -1,46 +1,127 @@
-# DiPlay
+# 安卓车机上的 HiCar 接收端
 
-> **这个构建不再是 CarPlay 客户端。** CarPlay/AirPlay/iAP2 协议栈、HUD 与仪表盘输出、CarPlay 首页
-> 与相关设置已经从代码里删除，剩下的是一个给「没有前装 HiCar 的车机」用的 HiCar 接收端。下面的
-> 内容仍然是 CarPlay 时期的产品说明，只作历史保留；当前功能见
-> [docs/HICAR_UI.md](docs/HICAR_UI.md) 与 [docs/HICAR_MIGRATION.md](docs/HICAR_MIGRATION.md)。
+DiPlay 现在是一个 **HiCar 接收端**：让一台没有前装 HiCar 的安卓车机，扮演华为 HiCar 会话里的
+「车」这一侧。CarPlay / AirPlay / iAP2 协议栈、HUD 与仪表盘输出、CarPlay 首页都已经从代码里删除，
+剩下的是接收端本体、它的设置页，以及在一台没人试过的车机上把链路拉起来所需要的诊断。
 
-[English](README.md) · [简体中文](README.zh-CN.md) · [繁體中文](README.zh-TW.md)
+包名 `com.shihab.diplay` · Android 7.0+（API 24）· GPL-3.0 · [English](README.md) ·
+[繁體中文](README.zh-TW.md)
 
-为兼容的比亚迪安卓车机提供有线及无线 CarPlay，采用 DiAuto 风格界面。
+![设置页：车速增益、按用途分开关、实时速度来源](docs/screenshots/hicar-settings-speed.png)
 
-> 这些项目专注于比亚迪汽车。它们可能在其他品牌上运行，但其他品牌不在支持范围内，也没有增加支持或修复其品牌特定兼容性问题的计划。
+## 现状
 
-[下载与中文网站](https://shihabal3amri.github.io/DiPlay/zh-Hans/) · [0.2.22 版本](https://github.com/shihabal3amri/DiPlay/releases/tag/v0.2.22) · [完整说明](README.md) · [报告问题](https://github.com/shihabal3amri/DiPlay/issues/new/choose)
+这是实验性的接收端，下面把「有证据的」和「只在测试里跑过的」分开写。
 
-## 0.2.22 — 公开预览版
+- **无线链路已在开发车上跑通。** 比亚迪宋 Plus（Android 10）+ Mate 80 Pro Max：手机弹出 HiCar
+  提示、六位连接码被接受、出画面、有声音、点按/滑动/返回/主页可用、配对过一次后免码回连。那一次
+  的日志在 [docs/HICAR_MIGRATION.md](docs/HICAR_MIGRATION.md) §7.49。
+- **之后新增的功能只在编译和单测里跑过，还没有上车。** 多指触控、清晰度/帧率档位、音频按用途分路
+  与声道选择、扫码配对、热点懒开、车机主动回连、恢复车机自己的 Wi-Fi、随速增益（音乐/导航/通话）、
+  有线 NCM 通路，都是「编译通过 + 单测覆盖」。哪些还没有上车，设置页的「关于」一节写明了。
+- **有线 HiCar 没有端到端验证。** 还没有一次与手机的完整有线会话，见
+  [docs/HICAR_WIRED.md](docs/HICAR_WIRED.md)。
+- **HUD 与仪表盘输出没有实现。** 它们属于 CarPlay 时期的功能，随那套代码一起删除了。
 
-请安装在允许 APK 安装的 Android 7.0+（API 24+）车机上；Android 7.0–8.1 上的有线 CarPlay 已在一台实车上确认，无线连接尚未经实车验证。无需越狱、转接盒、账户或认证服务器。有线及无线核心连接不要求 ADB；可选车辆数据及车辆控制需要支持的固件和已授权网络 ADB。
+## 它能做什么
 
-Wi-Fi Direct 现支持 Android 7.0–9 的旧版建组路径，使用系统返回的真实凭据。首选信道依赖固件 API；Android 7.0–9 无法读回协商频率，所以请求信道在诊断中标为未经验证，系统默认为信道 0。Android 10+ 保留频率验证。也可使用车机内置热点、USB 或[现有 Wi-Fi／同一局域网](docs/EXISTING_WIFI.md)；同一局域网模式由车机和 iPhone 自行连接外部路由器，DiPlay 不替你修改默认路由。[Android 9 Wi-Fi Direct 限制](docs/ANDROID9_WIFI_DIRECT.md)说明清理及持久配置边界。
+### 连接
 
-### 新增与修正
+1. 车机在 BLE 上广播 HiCar 服务（`0xFDEE`），屏幕上显示六位连接码。
+2. 手机发现车机并弹窗，驾驶员在手机上输入连接码。
+3. RFCOMM `0xFE35` 上跑 HiChain。车机用连接码证明自己 —— 不需要华为签发的配件证书，也不需要
+   任何账号服务器。
+4. 认证通过后车机开 5 GHz 热点，手机接入，控制通道转到 TCP `4005`/`4006`/`4007`。
+5. 画面走 HiSight/RTSP，H.264 解码后画进 `TextureView`；触摸和按键走一条 AES-128-CTR 加密的
+   UIBC 通道回传。
 
-- **车机热点**：修正 0.2.21 在比亚迪 DiLink 3.0／4.0 等车机上通过车机热点无线连接时一直停在“正在打开 CarPlay”的问题；之前填写的“热点网络接口（可选）”可以清空。
-- **音乐**：通过 Wi-Fi 播放音乐时恢复 iPhone 的原始速度，每首歌从第一秒起就不再先快 1.5% 再卡顿。
-- **麦克风**：USB 连接时，微信语音、语音备忘录和听写能录到声音，不再是静音。
-- **连接**：插着线重新连接时，有线 CarPlay 第一次就能连上；连接失败时，CarPlay 画面和主页会说明原因以及应该怎么改。
-- **语言**：新增韩语和土耳其语。
-- **新选项（默认关闭）**：在桌面卡片中保留 CarPlay、导航提示音请求音频焦点、按通话本身的采样率通话、DiLink 3.0 全屏仪表地图，以及腾势 N9 的仪表地图。
+连接页上还有一个二维码，带车机的蓝牙地址、机型码和连接码，手机扫码即可，不必手输；地址还是占位
+值时只显示一句原因，不画一个「扫了也连不上」的码。
 
-[0.2.22 完整说明](docs/RELEASE-NOTES-0.2.22.md)包含贡献链接及功能限制；构建和验证信息见[验证记录](docs/VALIDATION.md)。Android 7.0–8.1 尚需实车验证，不宣称所有车型的连接、音频或 Siri 问题均已解决。可选功能请停车后测试。
+### 连接中
 
-### 请提供 0.2.22 的新诊断报告
+- **显示方式**：全屏、状态栏、状态栏+导航栏。画面按手机的分辨率等比缩放到剩下的空间，永不拉伸；
+  切换模式不需要断开连接。
+- **连接中改设置**：设置页是**叠在**会话画面上的一层，和接收端在同一个 Activity 里。第二个
+  Activity 会让画面所在的 surface 暂停，镜像就黑了 —— 这是它不做成独立页面的原因。
+- **方向盘与媒体键**转给手机（播放/暂停、上一首、下一首及其余标准媒体键）：手机在能力应答里声明
+  接受时才转发；关掉开关，按键立刻归车机。
+- **多指触控**：一个触摸包携带全部手指的快照，手机地图上的双指缩放可用。
+- **画面质量**：三档清晰度，帧率可跟随屏幕或固定 30/60。这两项在连接建立时一次性回答手机，改动
+  从下次连接生效，设置页写明了这一点。
+- **按用途分路的声音**：音乐、导航、提示音、通话、铃声各自有解码器、队列和 `AudioTrack`，导航
+  播报可以走车机自己的导航声道，音乐仍留在音乐声道。每条通道可以钉到一个旧式 stream number
+  （0 = 自动），并用一段短音试听。
+- **随速增益**：音乐、导航、通话可以各自跟随同一条速度曲线（起始速度、满档速度、上限 dB），增益
+  直接乘在接收端解出来的 PCM 采样上，不动车机和手机的系统音量。设置页会显示**当前真正在用的
+  来源** —— 车辆总线、定位、信号中断时的保持、或没有 —— 以及当前速度和增益。导航与通话各有
+  独立开关。
+- **桌面上第二个入口**：「HiCar 设置」图标打开同一个 Activity 并直接展开设置页，连接中想改设置
+  不必在画面上找那个小入口。
 
-1. 更新到 **0.2.22**，复现问题并记录发生时间。开机／自动启动问题发生后，可手动打开 DiPlay 导出。
-2. 打开“**设置 → 诊断 → 保存诊断报告**”。Android 10+ 通常保存到 **Downloads/DiPlay**；Android 7.0–9 会请求存储权限并同样保存到该位置，也可点“选择保存位置”。如选择器或公共存储不可用，应用会使用专用外部或私有目录，并在确认中说明目的地。
-3. 使用确认中的**查看报告／分享**；没有分享应用时，可在报告视图中选择并复制文本。检查 `.txt` 并删除隐私信息，再附到匹配的[现有问题](https://github.com/shihabal3amri/DiPlay/issues)，或[新建问题](https://github.com/shihabal3amri/DiPlay/issues/new/choose)。报告不会自动上传，请勿公开热点密码或私有认证文件。
-4. 注明车型／车机、DiLink/Android/完整固件版本、iPhone/iOS、USB／车机热点／Wi-Fi Direct／同一局域网、相关设置、复现步骤、预期与实际结果及故障时间。
+### 收尾
 
-[从源码构建](docs/BUILD.md)：主应用请选择 `mobile` 模块。`maphost` 是地图演示应用，构建步骤和 APK 路径见说明。
+- 热点在手机认证通过之后才开：车里没有手机时，接收端不会白占车机的 Wi-Fi。
+- 已知手机的蓝牙链路一上来，车机可以主动回拨它 —— 这是对「手机自己不会拨」的唯一答案。
+- 停止接收端时，会把车机自己的 Wi-Fi 要回来。
+- 可选的无障碍服务替用户按系统 USB 授权弹窗上的「允许」；它只认同时提到 USB 且有确认按钮的窗口。
+- **有线 HiCar** 在用户态实现（CDC-NCM 接口、NTB16 组帧、自答 ARP、`VpnService` TUN、两条传输
+  线程），因为这台车机的内核没有 `rndis_host`。默认关闭，未验证。
 
-历史记录：[0.2.17](docs/RELEASE-NOTES-0.2.17.md)、[0.2.16](docs/RELEASE-NOTES-0.2.16.md)、[0.2.15](docs/RELEASE-NOTES-0.2.15.md)、[0.2.14](docs/RELEASE-NOTES-0.2.14.md)、[0.2.13](docs/RELEASE-NOTES-0.2.13.md)、[0.2.12](docs/RELEASE-NOTES-0.2.12.md)、[0.2.11](docs/RELEASE-NOTES-0.2.11.md)、[安装与连接](docs/INSTALL.md)。
+## 环境要求
 
-这是公开预览版，**未经 Apple 认证**。APK 使用从公开 Carlinkit 固件中提取的既有实验性配件身份，并非为 DiPlay 新签发的 MFi 身份；其中的私钥可被提取，未来 iOS 是否继续接受及其公开分发适用性尚未确定。Android 签名密钥和配件身份不进入 Git 或源代码压缩包；普通源代码/CI 构建默认不配置身份。部分车机仍可能卡顿或无法应用图标大小设置。
+| | |
+| --- | --- |
+| 车机 | Android 7.0+（API 24），允许安装 APK，蓝牙 4.0+ 且能发 BLE 广播，Wi-Fi 能开 5 GHz 热点 |
+| 手机 | 支持 HiCar 的华为手机。开发机是 Mate 80 Pro Max |
+| 车速（车辆总线） | 厂家自己的轮速通道。比亚迪上是 `autoservice`，需要 adb 或 root；取不到就用定位 |
+| 车速（定位） | 精确定位权限，且能看见天空。隧道里保持最后速度约 45 秒，然后淡回不增益 |
 
-标准导航小组件需要支持 Android 小组件的启动器；比亚迪内置主页不接受任意小组件。悬浮地图和嵌入地图需要启用“CarPlay 仪表地图”。应用和网站都包含十一种语言：英语、简体中文、繁体中文（台湾）、阿拉伯语、俄语、乌克兰语、西班牙语、日语、意大利语、韩语和土耳其语。应用的香港／澳门及 Hant 选择使用台湾译文，不宣称提供独立地区翻译。[繁体中文说明](README.zh-TW.md)提供安装、设置、隐私和构建指南。源代码、构建说明及许可证随版本提供。
+## 安装
+
+装在**车机**上，不是手机。debug 包带后缀 `.hudtest`（`com.shihab.diplay.hudtest`），可以和正式包
+并存；两者偏好文件名相同，但数据目录各自独立。
+
+1. 把 APK 拷到车机并安装（文件管理器或 `adb install`）。
+2. 打开 **HiCar**，同意它申请的权限（蓝牙广播/连接、Wi-Fi、定位）。
+3. 先在车机和手机的「系统蓝牙设置」里完成一次普通配对 —— 参考接收端要求这一步，配过之后再连
+   成功率高得多。
+4. 点 **开始**，在手机上输入六位连接码，或扫二维码。
+
+连接失败时，屏幕和导出的日志会说明停在哪一步。从 **设置 → 诊断 → 导出日志** 导出；Android 10+
+写到 `Downloads/DiPlay`。报告里故意包含连接码（「码被拒」本身就是被排查的失败）。
+
+## 构建
+
+```bash
+export JAVA_HOME=/path/to/jdk-21-or-newer
+./gradlew :shared:testDebugUnitTest :common:compileDebugKotlin :mobile:assembleDebug
+```
+
+`mobile` 是 APK，`samples/*` 是无关的演示应用。debug 包在
+`mobile/build/outputs/apk/debug/mobile-debug-unsigned.apk`，装之前用你自己的密钥签名。release
+构建只有旧的 CarPlay 身份需要 `DIPLAY_AUTH_ASSETS_DIR`，这个接收端不用它。
+
+`automotive` 与地图示例是 CarPlay 时期的遗留，不属于接收端。
+
+## 文档
+
+- [界面、显示模式与桌面上的两个入口](docs/HICAR_UI.md)
+- [协议侦察与车机能力边界](docs/HICAR_RECON.md)
+- [迁移日志：每一次真实尝试，附日志行](docs/HICAR_MIGRATION.md)
+- [方向盘按键](docs/HICAR_KEYS.md) · [有线 HiCar](docs/HICAR_WIRED.md) · [车机 adb 判定清单](docs/HICAR_ADB.md)
+- [从 OpenHC 借鉴了什么、明确不做什么](docs/OPENHC_COMPARISON.md)
+- [CarPlay 删除：边界与进度](docs/CARPLAY_REMOVAL.md)
+- [变更日志](CHANGELOG.md) · [第三方声明](docs/THIRD_PARTY_NOTICES.md)
+
+## 来源与许可
+
+基于 [xcertplay](https://github.com/shilapi/xcertplay)，GPL-3.0。接收端移植了
+[huducat586/hicar-android-receiver](https://github.com/huducat586/hicar-android-receiver)（MIT）与
+[GGBondLab/OpenHC](https://github.com/GGBondLab/OpenHC)（GPL-3.0-only）的做法：媒体键转发、多指
+触摸快照、画面档位、音频分路、二维码配对格式、用户态 NCM 与主动回连方向。HiChain 来自
+OpenHarmony 的 `deviceauth_lite` 与 `huks_lite`（Apache-2.0），编进 `libhicarauth.so`。分发修改版
+时请保留这些声明。
+
+HiCar 是华为的产品；本项目与华为、比亚迪没有隶属或背书关系。只在你拥有且允许安装软件的车辆上
+使用。

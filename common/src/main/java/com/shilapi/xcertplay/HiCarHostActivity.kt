@@ -89,6 +89,7 @@ import com.shilapi.xcertplay.hicar.HiCarPermissions
 import com.shilapi.xcertplay.hicar.HiCarRuntimeConfig
 import com.shilapi.xcertplay.hicar.HiCarDisplaySize
 import com.shilapi.xcertplay.hicar.HiCarVideoSink
+import com.shilapi.xcertplay.hicar.HiCarSpeedStatus
 import com.shilapi.xcertplay.hicar.HiCarSpeedVolumeSettings
 import com.shilapi.xcertplay.hicar.HiCarStatus
 import com.shilapi.xcertplay.hicar.HiCarVideoFit
@@ -158,6 +159,15 @@ class HiCarHostActivity : ComponentActivity() {
 
     /** The speed-volume values the settings page edits; the controller gets them on every change. */
     private var speedSettings by mutableStateOf(HiCarSpeedVolumeSettings())
+
+    /**
+     * Which speed source is answering right now.
+     *
+     * The setting says what is allowed; this says what is actually being used, which is the question
+     * a driver asks when the music does not get louder in a tunnel. Pushed from the monitor about
+     * once a second and reset when the session ends.
+     */
+    private var speedStatus by mutableStateOf(HiCarSpeedStatus())
 
     /** Sharpness and frame rate: answered once per connection, so they apply to the next one. */
     private var videoSettings by mutableStateOf(HiCarVideoSettings())
@@ -261,6 +271,10 @@ class HiCarHostActivity : ComponentActivity() {
         redialEnabled = HiCarReconnectSettings.enabled(this)
         restoreWifiEnabled = HiCarWifiSettings.restoreEnabled(this)
         speedSettings = HiCarSpeedVolumeSettings.load(this)
+        // The "HiCar 设置" launcher icon exists so the driver can change a setting without hunting
+        // for the small entry on the session overlay. It is the same activity, so arriving this way
+        // only means "start with the settings page open".
+        if (openedFromSettingsShortcut(intent)) settingsOpen = true
         // Before the first frame, so the activity never appears with the wrong bars and then jumps.
         applyWindowMode()
         setContent {
@@ -283,6 +297,28 @@ class HiCarHostActivity : ComponentActivity() {
         controller = null
         super.onDestroy()
     }
+
+    /**
+     * A second launch while the receiver is already on screen.
+     *
+     * The activity is `singleTask`, so pressing the "HiCar 设置" icon mid-session lands here instead
+     * of building a second receiver: the picture keeps running, and the settings page is drawn over
+     * it. Without this override the driver would tap the icon and see nothing happen.
+     */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (openedFromSettingsShortcut(intent)) settingsOpen = true
+    }
+
+    /**
+     * Whether this launch came from the settings launcher icon.
+     *
+     * Android keeps the alias in the intent's component name, which is what tells the two launcher
+     * entries apart; the alias targets this activity, so the page itself is already the right place.
+     */
+    private fun openedFromSettingsShortcut(intent: Intent?): Boolean =
+        intent?.component?.className == SETTINGS_ALIAS
 
     /**
      * Which layout the screen shows.
@@ -329,6 +365,7 @@ class HiCarHostActivity : ComponentActivity() {
                     onWindowMode = ::selectWindowMode,
                     speed = speedSettings,
                     onSpeed = ::applySpeedSettings,
+                    speedStatus = speedStatus,
                     mediaKeys = mediaKeysEnabled,
                     onMediaKeys = ::applyMediaKeysSetting,
                     video = videoSettings,
@@ -716,7 +753,9 @@ class HiCarHostActivity : ComponentActivity() {
         appendLog(
             "speed volume: ${if (next.enabled) "on" else "off"}, " +
                 "${next.startKmh.toInt()}–${next.fullKmh.toInt()} km/h, +${next.maxGainDb.toInt()} dB, " +
-                "source ${next.source.name.lowercase()}",
+                "source ${next.source.name.lowercase()}, " +
+                "navigation ${if (next.navigationGain) "on" else "off"}, " +
+                "call ${if (next.callGain) "on" else "off"}",
         )
     }
 
@@ -1006,6 +1045,7 @@ class HiCarHostActivity : ComponentActivity() {
                 config = config,
                 report = { next -> runOnUiThread { status = next } },
                 onLog = { line -> runOnUiThread { appendLog(line) } },
+                onSpeedStatus = { next -> runOnUiThread { speedStatus = next } },
                 videoSettings = videoSettings,
             )
         } catch (failure: RuntimeException) {
@@ -1684,6 +1724,14 @@ class HiCarHostActivity : ComponentActivity() {
 
         /** `adb logcat -s HiCar` on a head unit: short, and stable across sessions. */
         const val LOG_TAG = "HiCar"
+
+        /**
+         * The launcher alias that opens this activity straight into settings.
+         *
+         * Declared in the manifest next to the plain "HiCar" entry; see the manifest comment for why
+         * it is an alias of this activity rather than an activity of its own.
+         */
+        const val SETTINGS_ALIAS = "com.shilapi.xcertplay.HiCarSettingsAlias"
 
         /**
          * The model id a real phone prompts on.

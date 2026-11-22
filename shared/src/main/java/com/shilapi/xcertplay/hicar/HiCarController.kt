@@ -105,6 +105,14 @@ class HiCarController(
     /** Whether the speaker holds media focus, which decides if the media-button session is raised. */
     private val onMediaFocus: (Boolean) -> Unit = {},
     /**
+     * Which speed source is answering, for the settings page.
+     *
+     * Pushed about once a second while the feature runs, and reset when the session ends, so the page
+     * never shows a reading that stopped arriving. Delivered from a handler thread; the UI hops to
+     * the main thread itself.
+     */
+    private val onSpeedStatus: (HiCarSpeedStatus) -> Unit = {},
+    /**
      * Sharpness and frame rate.
      *
      * Read once per connection: `his_video_formats` is answered during the RTSP handshake, so this is
@@ -1187,17 +1195,23 @@ class HiCarController(
         speedMonitor = null
         if (sink == null) {
             onLog("speed volume: no speaker in this session; the setting is saved for the next one")
+            onSpeedStatus(HiCarSpeedStatus())
             return
         }
         val settings = HiCarSpeedVolumeSettings.load(appContext)
         if (!settings.enabled) {
-            sink.setSpeedGain(0.0)
+            sink.setSpeedGains(0.0, 0.0, 0.0)
+            onSpeedStatus(HiCarSpeedStatus())
             onLog("speed volume: off; music is played at its own level")
             return
         }
-        speedMonitor = HiCarSpeedMonitor(appContext, settings, onLog) { db ->
-            sink.setSpeedGain(db)
-        }.also { it.start() }
+        speedMonitor = HiCarSpeedMonitor(appContext, settings, onLog, onGainDb = { db ->
+            sink.setSpeedGains(
+                mediaDb = db,
+                navigationDb = if (settings.navigationGain) db else 0.0,
+                callDb = if (settings.callGain) db else 0.0,
+            )
+        }, onStatus = onSpeedStatus).also { it.start() }
     }
 
     /**

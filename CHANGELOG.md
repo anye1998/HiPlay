@@ -1,5 +1,19 @@
 # Unreleased — HiCar only
 
+- Speed gain reaches guidance and calls: each of the three lanes has its own switch (music always
+  follows), and the sink keeps a separate dB value per lane instead of one for media. Turning one off
+  during a session zeroes that lane on the next PCM block, without touching the others.
+- The settings page now shows **which speed source is answering** — car bus, location, held through a
+  lost fix, or none — with the current speed and the gain in force, plus one line each for why the car
+  bus or location is unavailable. The monitor publishes it once a second; a stopped session resets it
+  instead of leaving a stale reading on screen.
+- A second launcher icon, "HiCar 设置" (sliders), opens the same activity with the settings page
+  already expanded. It is an `activity-alias`, not a second activity: a second activity would pause
+  the receiver and black out the mirrored picture. The activity recognises the alias in its intent's
+  component, and `singleTask` + `onNewIntent` make the icon work mid-session.
+- README rewritten for the receiver: what is verified on a car, what is only unit-tested, the
+  requirement table, install and build steps, and the credits that the ports require.
+
 - Multi-touch: a touch packet now carries **every** finger down (up to ten), as a snapshot the phone
   diffs against the previous one. `ACTION_POINTER_DOWN`/`ACTION_POINTER_UP` go out as moves, only the
   first down starts a gesture and only the last up ends it, so a pinch on the phone's map works. The

@@ -33,6 +33,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import com.shilapi.xcertplay.hicar.HiCarAudioSettings
 import com.shilapi.xcertplay.hicar.HiCarFrameRateMode
+import com.shilapi.xcertplay.hicar.HiCarSpeedStatus
 import com.shilapi.xcertplay.hicar.HiCarSpeedVolumeSettings
 import com.shilapi.xcertplay.hicar.HiCarVideoQuality
 import com.shilapi.xcertplay.hicar.HiCarVideoSettings
@@ -59,6 +60,8 @@ internal fun HiCarSettingsScreen(
     onWindowMode: (HiCarWindowMode) -> Unit,
     speed: HiCarSpeedVolumeSettings,
     onSpeed: (HiCarSpeedVolumeSettings) -> Unit,
+    /** Which source is answering right now; empty until a session runs. */
+    speedStatus: HiCarSpeedStatus,
     mediaKeys: Boolean,
     onMediaKeys: (Boolean) -> Unit,
     video: HiCarVideoSettings,
@@ -119,7 +122,7 @@ internal fun HiCarSettingsScreen(
             VideoQuality(video = video, onChange = onVideo)
 
             Section("声音")
-            SpeedVolume(speed = speed, onChange = onSpeed)
+            SpeedVolume(speed = speed, status = speedStatus, onChange = onSpeed)
             AudioChannels(audio = audio, onChange = onAudio, onPreviewMedia = onPreviewMedia, onPreviewNavigation = onPreviewNavigation)
 
             Section("按键")
@@ -283,6 +286,7 @@ private fun ChannelRow(label: String, value: Int, onChange: (Int) -> Unit) {
 @Composable
 private fun SpeedVolume(
     speed: HiCarSpeedVolumeSettings,
+    status: HiCarSpeedStatus,
     onChange: (HiCarSpeedVolumeSettings) -> Unit,
 ) {
     // Local state so a slider drag is smooth; every settle writes through to preferences.
@@ -300,7 +304,7 @@ private fun SpeedVolume(
         Column(modifier = Modifier.weight(1f)) {
             Text("音乐随车速增大", style = MaterialTheme.typography.bodyLarge)
             Text(
-                "只调音乐通道的增益，导航与通话不跟着变",
+                "在接收端里放大或缩小声音的采样，不改车机和手机的音量",
                 style = MaterialTheme.typography.bodySmall,
             )
         }
@@ -353,6 +357,46 @@ private fun SpeedVolume(
         apply(local.copy(maxGainDb = value.roundToInt().toDouble()))
     }
 
+    Text("也跟着变响的通道", style = MaterialTheme.typography.bodyLarge)
+    GainToggle(
+        title = "导航播报",
+        detail = "高速上风噪和胎噪会盖住播报；关掉后导航保持手机给的音量",
+        checked = local.navigationGain,
+        onChange = { apply(local.copy(navigationGain = it)) },
+    )
+    GainToggle(
+        title = "通话",
+        detail = "关掉后通话音量交给手机和车机自己的免提处理，避免放大后回声",
+        checked = local.callGain,
+        onChange = { apply(local.copy(callGain = it)) },
+    )
+
+    Text("当前速度来源", style = MaterialTheme.typography.bodyLarge)
+    MonoLine(
+        status.sourceLabel,
+        color = if (status.running) MaterialTheme.colorScheme.primary else Color.Unspecified,
+    )
+    Text(status.describe(), style = MaterialTheme.typography.bodySmall)
+    Text(
+        "车辆总线：${vehicleLine(status, local.source)}",
+        style = MaterialTheme.typography.bodySmall,
+    )
+    Text(
+        "定位：" + when {
+            status.locationAvailable -> "已启动"
+            status.locationError != null -> status.locationError ?: ""
+            local.source == HiCarSpeedVolumeSettings.Source.VEHICLE -> "未启用（只用车辆总线）"
+            !status.running -> "未启用"
+            else -> "等待定位"
+        },
+        style = MaterialTheme.typography.bodySmall,
+    )
+    Text(
+        "这里显示的是本次连接里真正在用的来源，不是上面选的偏好：选了「自动」但车机总线读不到轮速时，" +
+            "会显示定位；两者都断了会显示「保持最后速度」，约 45 秒后淡回不增益。",
+        style = MaterialTheme.typography.bodySmall,
+    )
+
     Text("速度来源", style = MaterialTheme.typography.bodyLarge)
     val sources = listOf(
         HiCarSpeedVolumeSettings.Source.AUTO to "自动（优先车机总线，取不到就用定位）",
@@ -375,6 +419,44 @@ private fun SpeedVolume(
             "之后按每秒 4 km/h 淡回不增益，而不是把速度当成 0 —— 否则一出隧道就会突兀地变响。",
         style = MaterialTheme.typography.bodySmall,
     )
+}
+
+/**
+ * One switch for a lane that follows the speed curve.
+ *
+ * It says what changes when it is on and what the driver loses when it is off; a bare "导航" next to
+ * a switch would be read as an on/off for navigation itself.
+ */
+@Composable
+private fun GainToggle(
+    title: String,
+    detail: String,
+    checked: Boolean,
+    onChange: (Boolean) -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(title, style = MaterialTheme.typography.bodyMedium)
+            Text(detail, style = MaterialTheme.typography.bodySmall)
+        }
+        Switch(checked = checked, onCheckedChange = onChange)
+    }
+}
+
+/** What the car-bus half of the status means in one phrase. */
+private fun vehicleLine(
+    status: HiCarSpeedStatus,
+    source: HiCarSpeedVolumeSettings.Source,
+): String = when {
+    source == HiCarSpeedVolumeSettings.Source.LOCATION -> "未启用（只用定位）"
+    !status.running -> "未启用"
+    status.vehicleError != null -> "不可用（${status.vehicleError}）"
+    status.vehicleAvailable -> "已读到轮速"
+    else -> "等待轮速"
 }
 
 @Composable
