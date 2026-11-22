@@ -1,6 +1,5 @@
 package com.shilapi.xcertplay.network
 
-import com.shilapi.xcertplay.orchestration.ConnectionFailureCause
 import java.io.IOException
 
 object WirelessStartupPolicy {
@@ -29,5 +28,5 @@ enum class WirelessStartupFailure {
 class WirelessStartupException(
     val reason: WirelessStartupFailure,
     message: String,
-    val knownCause: ConnectionFailureCause? = null,
+    val knownCause: HotspotFailureCause? = null,
 ) : IOException(message)

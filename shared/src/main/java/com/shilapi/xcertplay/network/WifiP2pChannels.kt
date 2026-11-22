@@ -1,7 +1,5 @@
 package com.shilapi.xcertplay.network
 
-import com.shilapi.xcertplay.orchestration.ConnectionFailureCause
-import com.shilapi.xcertplay.orchestration.ConnectionFailureException
 
 /** A Wi-Fi Direct band choice: the car picks the channel, but only inside [frequenciesMHz]. */
 enum class WifiP2pBand(val label: String, val frequenciesMHz: IntRange) {
@@ -47,8 +45,8 @@ object WifiP2pChannels {
 }
 
 internal class P2pChannelUnavailableException(channel: Int, details: String, cause: Throwable? = null) :
-    ConnectionFailureException(
-        ConnectionFailureCause.WIFI_DIRECT_CHANNEL_UNAVAILABLE,
+    HotspotFailureException(
+        HotspotFailureCause.WIFI_DIRECT_CHANNEL_UNAVAILABLE,
         WifiP2pChannels.band(channel)?.let { "Wi-Fi Direct could not use the ${it.label} band. Choose Auto or another channel. $details" }
             ?: "Wi-Fi Direct could not use channel $channel. Choose Auto or another channel. $details",
         cause,

@@ -1,6 +1,5 @@
 package com.shilapi.xcertplay.network
 
-import com.shilapi.xcertplay.transport.Iap2WirelessSecurity
 import java.io.Closeable
 import java.net.InetAddress
 
@@ -15,7 +14,7 @@ enum class WirelessHotspotBackend(val label: String) {
 class WirelessHotspotInfo(
     val ssid: String,
     val passphrase: String,
-    val security: Iap2WirelessSecurity,
+    val security: HotspotSecurity,
     val channel: Int,
     val frequencyMHz: Int?,
     val bssid: String?,

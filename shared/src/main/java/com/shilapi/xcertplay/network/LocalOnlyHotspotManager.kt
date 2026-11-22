@@ -9,7 +9,6 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import androidx.annotation.RequiresApi
-import com.shilapi.xcertplay.transport.Iap2WirelessSecurity
 import java.io.IOException
 import java.net.Inet4Address
 import java.net.Inet6Address
@@ -675,11 +674,11 @@ class LocalOnlyHotspotManager(context: Context, private val onDiagnostic: (Strin
     }
 
     private fun validatePassphrase(
-        security: Iap2WirelessSecurity,
+        security: HotspotSecurity,
         value: String?,
     ): String {
         val passphrase = value.orEmpty()
-        if (security != Iap2WirelessSecurity.NONE && passphrase.isEmpty()) {
+        if (security != HotspotSecurity.NONE && passphrase.isEmpty()) {
             throw IOException("LocalOnlyHotspot did not report a passphrase for secured Wi-Fi")
         }
         if ('\u0000' in passphrase) {
@@ -689,12 +688,12 @@ class LocalOnlyHotspotManager(context: Context, private val onDiagnostic: (Strin
     }
 
     @RequiresApi(Build.VERSION_CODES.R)
-    private fun mapSoftApSecurity(securityType: Int): Iap2WirelessSecurity = when (securityType) {
-        SoftApConfiguration.SECURITY_TYPE_OPEN -> Iap2WirelessSecurity.NONE
-        SoftApConfiguration.SECURITY_TYPE_WPA2_PSK -> Iap2WirelessSecurity.WPA_WPA2
+    private fun mapSoftApSecurity(securityType: Int): HotspotSecurity = when (securityType) {
+        SoftApConfiguration.SECURITY_TYPE_OPEN -> HotspotSecurity.NONE
+        SoftApConfiguration.SECURITY_TYPE_WPA2_PSK -> HotspotSecurity.WPA_WPA2
         SoftApConfiguration.SECURITY_TYPE_WPA3_SAE_TRANSITION ->
-            Iap2WirelessSecurity.WPA3_TRANSITION
-        SoftApConfiguration.SECURITY_TYPE_WPA3_SAE -> Iap2WirelessSecurity.WPA3_ONLY
+            HotspotSecurity.WPA3_TRANSITION
+        SoftApConfiguration.SECURITY_TYPE_WPA3_SAE -> HotspotSecurity.WPA3_ONLY
         SoftApConfiguration.SECURITY_TYPE_WPA3_OWE,
         SoftApConfiguration.SECURITY_TYPE_WPA3_OWE_TRANSITION,
         -> throw IOException("Unsupported LocalOnlyHotspot security type: OWE")
@@ -705,7 +704,7 @@ class LocalOnlyHotspotManager(context: Context, private val onDiagnostic: (Strin
 
     private fun mapWifiConfigurationSecurity(
         configuration: WifiConfiguration,
-    ): Iap2WirelessSecurity {
+    ): HotspotSecurity {
         val keyManagement = configuration.allowedKeyManagement
             ?: throw IOException("LocalOnlyHotspot did not report its key management")
         val open = keyManagement.get(WifiConfiguration.KeyMgmt.NONE)
@@ -715,10 +714,10 @@ class LocalOnlyHotspotManager(context: Context, private val onDiagnostic: (Strin
 
         return when {
             owe -> throw IOException("Unsupported LocalOnlyHotspot security type: OWE")
-            open && !wpa2 && !sae -> Iap2WirelessSecurity.NONE
-            wpa2 && sae -> Iap2WirelessSecurity.WPA3_TRANSITION
-            wpa2 -> Iap2WirelessSecurity.WPA_WPA2
-            sae -> Iap2WirelessSecurity.WPA3_ONLY
+            open && !wpa2 && !sae -> HotspotSecurity.NONE
+            wpa2 && sae -> HotspotSecurity.WPA3_TRANSITION
+            wpa2 -> HotspotSecurity.WPA_WPA2
+            sae -> HotspotSecurity.WPA3_ONLY
             else -> throw IOException(
                 "Unsupported LocalOnlyHotspot key management: $keyManagement",
             )
@@ -812,7 +811,7 @@ class LocalOnlyHotspotManager(context: Context, private val onDiagnostic: (Strin
     private class HotspotConfiguration(
         val ssid: String,
         val passphrase: String,
-        val security: Iap2WirelessSecurity,
+        val security: HotspotSecurity,
         val channel: Int,
         val bssid: String?,
         val bssidBytes: ByteArray?,

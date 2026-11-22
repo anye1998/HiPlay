@@ -1,9 +1,9 @@
 package com.shilapi.xcertplay.hicar
 
+import com.shilapi.xcertplay.network.HotspotSecurity
 import com.shilapi.xcertplay.network.WirelessHotspotBackend
 import com.shilapi.xcertplay.network.WirelessHotspotInfo
 import com.shilapi.xcertplay.network.WirelessHotspotManager
-import com.shilapi.xcertplay.transport.Iap2WirelessSecurity
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -16,7 +16,7 @@ class HiCarAccessPointsTest {
         WirelessHotspotInfo(
             ssid = "HiCar-0412",
             passphrase = "0f1e2d3c4b5a",
-            security = Iap2WirelessSecurity.WPA_WPA2,
+            security = HotspotSecurity.WPA_WPA2,
             channel = 36,
             frequencyMHz = frequency,
             bssid = "02:00:00:00:00:01",

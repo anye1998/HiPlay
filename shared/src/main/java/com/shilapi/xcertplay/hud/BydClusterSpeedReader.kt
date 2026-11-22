@@ -17,7 +17,7 @@ object BydClusterSpeedReader {
         val poll = executor.scheduleWithFixedDelay({
             val started = SystemClock.elapsedRealtime()
             val speed = runCatching {
-                if (BydOutputSettings.legacyVehicleProbe(app) &&
+                if (BydVehicleOptions.legacyVehicleProbe(app) &&
                     BydVehicleFieldStore.load(app)?.supports(BydVehicleField.SPEED) != true) null
                 else BydWheelSpeed.metersPerSecond(shell.run(app, BydWheelSpeed.speedCommand(app)))
             }.getOrNull()

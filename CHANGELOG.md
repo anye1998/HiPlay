@@ -1,3 +1,24 @@
+# Unreleased — HiCar only
+
+- Remove CarPlay from the inside out: the AirPlay, MFi, iAP2, orchestration, media, location, HUD,
+  cluster and Car App Service code, the CarPlay activities and settings screens, their layouts,
+  icons and translations, the two sample modules, and their tests. What is left is the HiCar
+  receiver, the hotspot it needs, the BYD vehicle data the speed feature reads, and one launcher
+  entry.
+- One activity, three surfaces: a setup page (connection code, Start, log tail), a session page
+  (the picture, Stop, Back/Home, microphone, log, settings) and a settings page drawn **over**
+  whichever is behind it, so opening settings during a connection does not pause the surface the
+  decoder writes into.
+- Display setting with three modes — fullscreen, status bar, status bar plus navigation bar —
+  applied to the live window. The content pads by exactly the bars it keeps, and the picture is
+  fitted to its own aspect ratio instead of being stretched, so neither the shape nor the touch
+  mapping is wrong when a bar appears.
+- Speed-linked music gain is editable while connected: start speed, full speed, ceiling and source
+  (car bus first, then location, with the tunnel hold and fade), pushed into the running audio path
+  by `HiCarController.refreshSpeedVolume()`.
+- Dark theme, new vector icon, `HiCar` label; the hotspot no longer depends on CarPlay types
+  (`HotspotSecurity`, `HotspotFailureException` live in `network` now).
+
 # DiPlay 0.2.22 — 2026-10-28
 
 - Fix the two 0.2.21 regressions: connect wireless CarPlay over the car hotspot again on BYD DiLink 3.0/4.0 and other units where 0.2.21 took a mobile-data interface for the hotspot, and keep wireless music at the iPhone's speed from the first second instead of 1.5 % fast with stutter (#936, #950, #993, #1070, #1080).

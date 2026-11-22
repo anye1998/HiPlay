@@ -52,19 +52,39 @@ HiCar 的依赖是干净的（`shared/.../hicar/*` 只 import 了热点 6 个类
 5. **清资源与测试**：未引用的 drawable/layout/string/values；CarPlay 测试。
 6. **重建设置页**：HiCar 专属设置（连接、显示、音频、车速、诊断、关于），文案统一中文。
 
-## 五、当前进度（2026-11-22）
+## 五、当前进度（2026-11-22，全部完成）
 
 - [x] 启动入口切到 HiCar：`DiPlayActivity` 不再是 LAUNCHER，`HiCarLauncherAlias` 标签改为 `HiCar`
 - [x] 车速音量：曲线 / 平滑 / PCM 软限幅 / 双源 / 隧道保持（128 个单测通过）
 - [x] 音频 SSRC 语义：低 16 位 bus、高 16 位 usage，音乐帧单独增益
 - [x] HiCar 设置页：显示（全屏/状态栏/状态栏+导航栏）、声音（车速增益）、连接、诊断、关于
 - [x] 设置页作为叠加层，连接中可改；显示模式即时生效，画面按比例适配（见 `docs/HICAR_UI.md`）
-- [ ] 热点解耦
-- [ ] 协议层删除
-- [ ] HUD 与界面删除
-- [ ] HiCar 设置页
+- [x] 热点解耦：`Iap2WirelessSecurity` → `network.HotspotSecurity`，`ConnectionFailure*` →
+      `network.HotspotFailureException/Cause`；热点 5 个文件不再 import CarPlay 包
+- [x] 协议层删除：`airplay/`(44)、`mfi/`(7)、`orchestration/`(15)、`media/`(46)、`location/`(1)、
+      `iap2/`(10)、`telecom/`(3)、`glance/`(1)、`shared/`(3，Car App Service)、`transport/`(43)
+- [x] HUD 与界面删除：`hud/` 只留车速/车辆字段相关（`BydAdbShell`、`BydParcel`、`BydAdbAccess`、
+      `BydVehicleFields`、`BydVehicleCapabilityProbe`、`Byd13CatalogProbeMain`、`BydClusterSpeedReader`、
+      `BydWheelSpeed`、`BydVehicleOptions`）；`common/` 只剩 `HiCar*` 与设置页
+- [x] `network/` 只留热点闭包（22 个文件）；`compat` 只留 `PlatformCompat`、`Base64Compat`
+- [x] 资源清理：布局/drawable/raw/多语言 `values-*` 全删；`values` 只留 `colors`/`themes`；
+      `xml` 只留 `backup_rules`/`data_extraction_rules`/`diagnostic_report_paths`
+- [x] 图标换成 `ic_hicar.xml`（矢量，不再有 CarPlay 标识），应用名 `HiCar`
+- [x] 测试清理：`shared/src/test` 只留 `hicar/`，`common/src/test` 只留 3 个 `HiCar*` 测试
+- [x] `:maphost`、`:home` 示例模块删除（改 `settings.gradle.kts`）
+- [x] HiCar 设置页
 
-## 六、验证方式（没有实车）
+## 六、保留但换了实现位置的类型
+
+| 旧位置 | 新位置 | 原因 |
+| --- | --- | --- |
+| `transport.Iap2WirelessSecurity` | `network.HotspotSecurity` | 热点要用，协议层要删 |
+| `orchestration.ConnectionFailureCause/Exception` | `network.HotspotFailureCause/Exception` | 同上 |
+| `transport.VehicleGear` | `vehicle.VehicleGear` | 车速监视要用，iAP2 编码不需要 |
+| `hud.BydOutputSettings.legacyVehicleProbe` | `hud.BydVehicleOptions.legacyVehicleProbe` | 集群/HUD 设置已删，探针开关保留，偏好键不变 |
+| `hud.BydBattery*`、`hud.BydWheelSpeedSource` | 删除 | 只为 CarPlay 的 EV 状态与 iAP2 定位服务 |
+
+## 七、验证方式（没有实车）
 
 - 每一步 `:shared:compileDebugKotlin` + `:common:compileDebugKotlin` 必须通过；
 - `:shared:testDebugUnitTest --tests "com.shilapi.xcertplay.hicar.*"` 必须全绿；

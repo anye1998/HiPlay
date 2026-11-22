@@ -19,7 +19,6 @@ import android.util.Log
 import androidx.annotation.RequiresApi
 import com.shilapi.xcertplay.compat.closeCompat
 import com.shilapi.xcertplay.compat.isLocationEnabledCompat
-import com.shilapi.xcertplay.transport.Iap2WirelessSecurity
 import java.io.IOException
 import java.net.Inet4Address
 import java.net.Inet6Address
@@ -794,13 +793,13 @@ class WifiP2pGroupManager(
         null
     }
 
-    private fun groupSecurity(group: WifiP2pGroup): Iap2WirelessSecurity {
-        if (Build.VERSION.SDK_INT < 36) return Iap2WirelessSecurity.WPA_WPA2
+    private fun groupSecurity(group: WifiP2pGroup): HotspotSecurity {
+        if (Build.VERSION.SDK_INT < 36) return HotspotSecurity.WPA_WPA2
         return when (group.securityType) {
-            WifiP2pGroup.SECURITY_TYPE_WPA2_PSK -> Iap2WirelessSecurity.WPA_WPA2
+            WifiP2pGroup.SECURITY_TYPE_WPA2_PSK -> HotspotSecurity.WPA_WPA2
             WifiP2pGroup.SECURITY_TYPE_WPA3_COMPATIBILITY ->
-                Iap2WirelessSecurity.WPA3_TRANSITION
-            WifiP2pGroup.SECURITY_TYPE_WPA3_SAE -> Iap2WirelessSecurity.WPA3_ONLY
+                HotspotSecurity.WPA3_TRANSITION
+            WifiP2pGroup.SECURITY_TYPE_WPA3_SAE -> HotspotSecurity.WPA3_ONLY
             // Several vendor supplicants report an authentication key management the framework
             // cannot classify, which surfaces as UNKNOWN rather than as a concrete cipher suite.
             // The group itself is still the plain WPA2-PSK group this device creates by default,
@@ -808,7 +807,7 @@ class WifiP2pGroupManager(
             // bring-up that has already resolved its SSID, band, interface and host address.
             WifiP2pGroup.SECURITY_TYPE_UNKNOWN -> {
                 diagnostic("Wi-Fi P2P security type not reported by the framework; assuming WPA2-PSK")
-                Iap2WirelessSecurity.WPA_WPA2
+                HotspotSecurity.WPA_WPA2
             }
             else -> throw IOException(
                 "Unsupported Wi-Fi P2P security type: ${group.securityType}",

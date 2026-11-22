@@ -1,5 +1,12 @@
 # DiPlay
 
+> **This build is no longer a CarPlay client.** The CarPlay, AirPlay and iAP2 stacks, the HUD and
+> cluster outputs, the CarPlay home screen and its settings have been removed from the code; what
+> remains is a HiCar receiver for head units that have no factory HiCar. The rest of this file still
+> describes the CarPlay-era product and is kept only as history — see
+> [docs/HICAR_UI.md](docs/HICAR_UI.md) and [docs/HICAR_MIGRATION.md](docs/HICAR_MIGRATION.md) for what
+> the app does now.
+
 [English](README.md) · [简体中文](README.zh-CN.md) · [繁體中文](README.zh-TW.md)
 
 **CarPlay for compatible BYD Android head units.** Wired and wireless, with the familiar DiAuto interface. Independent app: `com.shihab.diplay`.

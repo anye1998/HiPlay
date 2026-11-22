@@ -1,5 +1,10 @@
 # DiPlay
 
+> **这个构建不再是 CarPlay 客户端。** CarPlay/AirPlay/iAP2 协议栈、HUD 与仪表盘输出、CarPlay 首页
+> 与相关设置已经从代码里删除，剩下的是一个给「没有前装 HiCar 的车机」用的 HiCar 接收端。下面的
+> 内容仍然是 CarPlay 时期的产品说明，只作历史保留；当前功能见
+> [docs/HICAR_UI.md](docs/HICAR_UI.md) 与 [docs/HICAR_MIGRATION.md](docs/HICAR_MIGRATION.md)。
+
 [English](README.md) · [简体中文](README.zh-CN.md) · [繁體中文](README.zh-TW.md)
 
 为兼容的比亚迪安卓车机提供有线及无线 CarPlay，采用 DiAuto 风格界面。

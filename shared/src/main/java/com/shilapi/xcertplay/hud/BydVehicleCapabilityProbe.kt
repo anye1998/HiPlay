@@ -147,13 +147,7 @@ object BydVehicleCapabilityProbe {
         }
     }
 
-    internal fun publishBatteryReading(context: Context, capabilities: BydVehicleCapabilities) {
-        if (!BydOutputSettings.legacyVehicleProbe(context)) return
-        if (!capabilities.batterySupported) return
-        val percent = capabilities.result(BydVehicleField.SOC).value ?: return
-        val range = capabilities.result(BydVehicleField.RANGE).value?.toInt() ?: return
-        val measured = capabilities.result(BydVehicleField.REMAINING_KWH).value
-        val charging = capabilities.result(BydVehicleField.BMS_STATE).value?.toInt() == 1
-        BydBatteryStatus.publishProbeReading(context, BydBatteryReading(percent, range, measured, charging))
-    }
+    // The battery snapshot existed to answer CarPlay's VehicleStatusUpdate; HiCar has no such
+    // channel, so the probe now only reports the addresses it found.
+
 }

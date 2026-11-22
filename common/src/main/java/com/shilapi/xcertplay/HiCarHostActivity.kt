@@ -41,6 +41,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -204,7 +205,10 @@ class HiCarHostActivity : ComponentActivity() {
         // Before the first frame, so the activity never appears with the wrong bars and then jumps.
         applyWindowMode()
         setContent {
-            MaterialTheme {
+            // A head unit is read at night as often as in daylight, and the session page is black
+            // already: the whole receiver follows that, including the pages the driver reads before
+            // a connection.
+            MaterialTheme(colorScheme = darkColorScheme()) {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     Content()
                 }
