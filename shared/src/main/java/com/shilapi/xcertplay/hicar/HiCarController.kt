@@ -68,6 +68,14 @@ data class HiCarRuntimeConfig(
     val withVideo: Boolean = true,
     /** Offer the car's microphone. The runtime permission is still checked separately. */
     val withMicrophone: Boolean = false,
+    /**
+     * The head unit's classic Bluetooth address, as the settings page shows it.
+     *
+     * Needed by the wired path: it goes into the car-info block the phone turns into a device id and
+     * an address to dial. Empty means "ask the framework", which on modern Android answers with the
+     * placeholder `02:00:00:00:00:00`.
+     */
+    val bluetoothAddress: String = "",
 )
 
 /**
@@ -96,8 +104,33 @@ class HiCarController(
     private val onKeysReady: (Boolean) -> Unit = {},
     /** Whether the speaker holds media focus, which decides if the media-button session is raised. */
     private val onMediaFocus: (Boolean) -> Unit = {},
+    /**
+     * Sharpness and frame rate.
+     *
+     * Read once per connection: `his_video_formats` is answered during the RTSP handshake, so this is
+     * a value the controller is constructed with rather than one it can change mid-session.
+     */
+    videoSettings: HiCarVideoSettings = HiCarVideoSettings(),
 ) : Closeable {
     private val appContext = context.applicationContext
+
+    @Volatile private var videoOffer = videoSettings
+
+    /**
+     * The panel's refresh rate.
+     *
+     * Read from the window manager rather than `DisplayMetrics`, which reports the density-derived
+     * rate on some vendor ROMs. A head unit with no window service (the emulator's older images)
+     * falls back to 60, which is what the fixed 30 fps code assumed anyway.
+     */
+    private val refreshHz: Float by lazy {
+        val hz = runCatching {
+            val manager = appContext.getSystemService(android.view.WindowManager::class.java)
+            @Suppress("DEPRECATION")
+            manager?.defaultDisplay?.refreshRate
+        }.getOrNull()
+        HiCarVideoSettings.refreshOf(hz)
+    }
     private val running = AtomicBoolean(false)
     private var setup = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "hicar-setup") }
     private var accept = Executors.newCachedThreadPool { runnable -> Thread(runnable, "hicar-accept") }
@@ -135,6 +168,19 @@ class HiCarController(
 
     /** What the phone was told about the access point; the media clients bind to [ownerAddress]. */
     private var liveOffer: HiCarNetworkOffer? = null
+
+    /**
+     * Guards the access point coming up late.
+     *
+     * The hotspot used to be opened before advertising, which meant every "Start" dropped the head
+     * unit's own Wi-Fi and held the radio whether or not a phone ever appeared. It is now opened when
+     * the phone finishes HiChain — the first moment it is actually needed — and the Wi-Fi negotiation
+     * that arrives immediately afterwards waits here for it.
+     */
+    private val networkLock = Object()
+
+    /** One access point per round: a second request would fight the first for the radio. */
+    @Volatile private var networkStarted = false
 
     /** The H.264 sink, created on first use so the phone can be offered the display service. */
     private var video: HiCarVideoSink? = null
@@ -182,6 +228,12 @@ class HiCarController(
      */
     private var usb: HiCarUsbLink? = null
 
+    /** The wired session, when the driver has turned it on; the diagnostic probe otherwise. */
+    private var wired: HiCarWiredLink? = null
+
+    /** Dials a known phone when its Bluetooth link comes up; owned by the run, not the round. */
+    private var redial: HiCarAutoReconnect? = null
+
     /**
      * The head unit's navigation stream type.
      *
@@ -191,6 +243,17 @@ class HiCarController(
      */
     private val navigationStreamType: Int
         get() = HiCarDebug.number(PROP_NAV_STREAM, DEFAULT_NAV_STREAM)
+
+    /** Channel choices in force; the sink takes them when it builds a track. */
+    @Volatile private var audioSettings = HiCarAudioSettings()
+
+    /**
+     * Whether the head unit's own Wi-Fi was on before this run took the radio.
+     *
+     * Read once per run, used once when the receiver stops — not between rounds, because a phone
+     * that drops and reconnects would lose its access point if the radio were handed back then.
+     */
+    @Volatile private var wifiWasOn = false
 
     /**
      * A copy of the authenticated session key, for the TCP side.
@@ -492,26 +555,41 @@ class HiCarController(
             onLog("touch: dropped, (${x.toInt()},${y.toInt()}) is outside the ${width}x$height window")
             return false
         }
-        val sent = input.touch(action, mapped[0], mapped[1])
-        // The phone answered nothing at all on 2026-11-19 11:5x while 60 encrypted events went out,
-        // so the numbers have to be visible: a wrong mapping and a refused event look identical
-        // from the outside. Moves are summarised, presses are always named.
-        if (action != 2 || touchMoves++ % 30 == 0) {
+        return sendTouches(action, listOf(HiCarTouchPoint(0, mapped[0], mapped[1])))
+    }
+
+    /**
+     * Sends a snapshot of every finger on the picture.
+     *
+     * The log line is the only way to tell a wrong mapping from an event the phone refused: on
+     * 2026-11-19 the phone answered nothing at all while 60 encrypted events went out, and both
+     * causes looked identical from the car. Moves are summarised, presses are always named.
+     */
+    fun sendTouches(action: Int, points: List<HiCarTouchPoint>): Boolean {
+        val sent = input.touches(action, points)
+        if (action != HiCarInputEvent.ACTION_MOVE || touchMoves++ % 30 == 0) {
             val name = when (action) {
-                0 -> "down"
-                1 -> "up"
+                HiCarInputEvent.ACTION_DOWN -> "down"
+                HiCarInputEvent.ACTION_UP -> "up"
                 else -> "move"
             }
+            val where = points.sortedBy { it.id }.joinToString(",") { "(${it.x},${it.y})" }
             onLog(
-                "touch: $name view=${width}x$height at (${x.toInt()},${y.toInt()}) " +
-                    "-> (${mapped[0]},${mapped[1]}) of ${input.displayWidth}x" +
-                    "${input.displayHeight} sent=$sent",
+                "touch: $name ${points.size} point(s) $where of " +
+                    "${input.displayWidth}x${input.displayHeight} sent=$sent",
             )
         }
         return sent
     }
 
     private var touchMoves = 0
+
+    /** Maps view pixels onto the picture; null when the point is outside a window of that size. */
+    fun mapTouch(x: Float, y: Float, width: Int, height: Int): IntArray? =
+        input.map(x, y, width, height, clamp = true)
+
+    /** Ends the gesture the phone believes is in progress; see [HiCarInputRouter.cancelTouch]. */
+    fun cancelTouch(): Boolean = input.cancelTouch()
 
     /** Sends the home or back key (Android key codes 3 and 4). */
     fun sendKey(key: Int): Boolean = input.key(key)
@@ -528,14 +606,35 @@ class HiCarController(
             onLog("HiCar receiver is already running")
             return
         }
-        report(HiCarStatus.PreparingNetwork)
-        usb = HiCarUsbLink(
+        wifiWasOn = HiCarWifiRestore.snapshot(appContext)
+        // Registered once per run: the filter is protected, so it can only be registered while we
+        // are alive, and the cooldown lives with it.
+        redial = HiCarAutoReconnect(
             context = appContext,
             onLog = onLog,
-            model = config.model,
-        ) { name, address ->
-            onLog("USB: the wired link is $name at $address; a phone on this cable is reachable there")
-        }.also { it.start() }
+            running = { running.get() },
+            onSocket = ::adoptOutgoing,
+        ).also { it.start() }
+        report(HiCarStatus.PreparingNetwork)
+        if (HiCarWiredSettings.enabled(appContext)) {
+            // The wired path drives the cable itself (NCM plus a TUN), so the diagnostic probe would
+            // only fight it for the same device.
+            wired = HiCarWiredLink(
+                context = appContext,
+                onLog = onLog,
+                model = config.model,
+                bluetoothAddress = config.bluetoothAddress.ifEmpty { HiCarWiredLink.defaultBluetoothAddress() },
+                controlPort = config.controlPort,
+            ).also { it.start() }
+        } else {
+            usb = HiCarUsbLink(
+                context = appContext,
+                onLog = onLog,
+                model = config.model,
+            ) { name, address ->
+                onLog("USB: the wired link is $name at $address; a phone on this cable is reachable there")
+            }.also { it.start() }
+        }
         setup.execute {
             try {
                 startChain()
@@ -562,11 +661,20 @@ class HiCarController(
 
     override fun close() {
         if (!running.compareAndSet(true, false)) return
+        runCatching { redial?.close() }
+        redial = null
+        runCatching { wired?.close() }
+        wired = null
         runCatching { usb?.close() }
         usb = null
         releaseChain(keepVideo = false)
         setup.shutdownNow()
         accept.shutdownNow()
+        // After the access point is gone: with the radio still held by the group, asking for the
+        // station connection back would be refused for the wrong reason.
+        if (HiCarWifiSettings.restoreEnabled(appContext)) {
+            HiCarWifiRestore.restore(appContext, wifiWasOn, onLog)
+        }
         report(HiCarStatus.Stopped)
         // The count belongs on the stop line as well: a session shorter than one heartbeat ends
         // without ever printing "waiting for the phone", and then an exported log cannot tell a
@@ -629,8 +737,33 @@ class HiCarController(
         liveNetwork?.authenticated = false
         liveNetwork = null
         liveOffer = null
+        networkStarted = false
+        // Wakes a negotiation thread that is waiting for an access point this round will not open.
+        synchronized(networkLock) { networkLock.notifyAll() }
         runCatching { setup.shutdownNow() }
         runCatching { accept.shutdownNow() }
+    }
+
+    /**
+     * Takes a socket this side dialled, and serves it like an incoming one.
+     *
+     * The reverse direction (car dials the phone's 0xFE35) is the only answer to a phone that
+     * decides the car is already known and never dials. From here on the socket is
+     * indistinguishable from an accepted one: same negotiator, same authenticator, same log.
+     */
+    internal fun adoptOutgoing(socket: android.bluetooth.BluetoothSocket): Boolean {
+        if (!running.get()) return false
+        val round = generation
+        sockets.add(socket)
+        connections.incrementAndGet()
+        return try {
+            accept.execute { serve(socket, control = true, round) }
+            true
+        } catch (rejected: java.util.concurrent.RejectedExecutionException) {
+            sockets.remove(socket)
+            closeQuietly(socket)
+            false
+        }
     }
 
     /**
@@ -693,10 +826,9 @@ class HiCarController(
             onLog("HiCar needs Bluetooth switched on")
             return
         }
-        val networkOffer = prepareNetwork() ?: return
-        liveOffer = networkOffer
-        liveNetwork = HiCarNetworkNegotiator(networkOffer, onLog = onLog).also { it.authenticated = false }
-        startDmsdpEndpoints(networkOffer)
+        // The access point is deliberately not opened here: HiChain runs on Bluetooth and needs no
+        // Wi-Fi, so a receiver with no phone in the car no longer takes the radio (and the head
+        // unit's own network) for nothing. See [requestNetwork].
         if (config.withVideo) prepareVideo()
         val rfcomm = HiCarRfcommServices.open(adapter, onLog)
         if (rfcomm == null) {
@@ -810,6 +942,61 @@ class HiCarController(
     }
 
     /**
+     * Opens the access point, once, because the phone finished HiChain.
+     *
+     * Runs on its own thread: `openAccessPoint` blocks for up to the network timeout, and the
+     * Bluetooth thread that called this has frames to read. The negotiation that is already arriving
+     * waits in [awaitNetwork].
+     */
+    private fun requestNetwork() {
+        synchronized(networkLock) {
+            if (networkStarted) return
+            networkStarted = true
+        }
+        Thread({
+            try {
+                report(HiCarStatus.PreparingNetwork)
+                val offer = prepareNetwork()
+                if (offer == null) {
+                    // Reported by prepareNetwork; the phone will give up on its own, and the round
+                    // ends the way it does for any other failure.
+                    onLog("HiCar: no access point this round, so the Wi-Fi exchange cannot be answered")
+                    return@Thread
+                }
+                liveOffer = offer
+                // Already authenticated: the group only exists because HiChain finished, which is
+                // what used to be checked before the passphrase was handed over.
+                liveNetwork = HiCarNetworkNegotiator(offer, onLog = onLog).also { it.authenticated = true }
+                startDmsdpEndpoints(offer)
+                onLog("HiCar: access point is up; the Wi-Fi negotiation can be answered now")
+            } catch (failure: Exception) {
+                onLog("HiCar: access point failed after authentication (${failure.javaClass.simpleName})")
+            } finally {
+                synchronized(networkLock) { networkLock.notifyAll() }
+            }
+        }, "hicar-network").apply { isDaemon = true }.start()
+    }
+
+    /**
+     * The negotiator for a Wi-Fi frame, waiting for the access point if it is not up yet.
+     *
+     * Null means the group never came up within the same timeout the rest of the chain uses; the
+     * caller logs it rather than answering a negotiation with credentials for a network that does
+     * not exist.
+     */
+    private fun awaitNetwork(): HiCarNetworkNegotiator? {
+        val deadline = System.currentTimeMillis() + config.networkTimeoutMillis
+        synchronized(networkLock) {
+            while (liveNetwork == null) {
+                val left = deadline - System.currentTimeMillis()
+                if (left <= 0) return null
+                runCatching { networkLock.wait(left) }
+            }
+            return liveNetwork
+        }
+    }
+
+    /**
      * Binds the three TCP endpoints as soon as the access point is up.
      *
      * They listen from the start even though nothing is served before authentication: the phone
@@ -866,7 +1053,19 @@ class HiCarController(
      */
     private fun buildMedia(offer: HiCarNetworkOffer, key: ByteArray): HiCarDmsdpEndpoints.Media? {
         val handlers = ArrayList<HiCarControlSession.TextHandler>()
-        val sink = HiCarAudioSink(appContext, onLog)
+        // The stored choice wins; on a fresh install the unit's own navigation channel (14 on this
+        // head unit) is used for guidance, which is what the previous build did for every sound.
+        val audioChannels = HiCarAudioSettingsStore.load(appContext).let { stored ->
+            if (stored.navigationStream != HiCarAudioSettings.AUTO || navigationStreamType == 0) {
+                stored
+            } else {
+                stored.copy(
+                    navigationStream = HiCarAudioSettings.normalize(navigationStreamType),
+                )
+            }
+        }
+        audioSettings = audioChannels
+        val sink = HiCarAudioSink(appContext, onLog, audioChannels)
         var receiver: HiCarAudioReceiver? = null
         if (sink.ready) {
             // The session that receives background buttons is only worth having while this holds.
@@ -935,6 +1134,30 @@ class HiCarController(
         }
     }
 
+    /** Applies channel choices to the audio path that is running now (new tracks only). */
+    fun applyAudioSettings(next: HiCarAudioSettings) {
+        audioSettings = next
+        speaker?.updateSettings(next)
+    }
+
+    /** Plays a preview tone on the music channel; false when there is no decoder. */
+    fun previewMedia(): Boolean = speaker?.previewMedia() == true
+
+    /** Plays a preview tone on the navigation channel; false when there is no decoder. */
+    fun previewNavigation(): Boolean = speaker?.previewNavigation() == true
+
+    /**
+     * Takes a new sharpness/frame-rate pair for the **next** connection.
+     *
+     * Nothing on the wire changes now: the phone was already told what to encode. Reporting it here
+     * keeps the log honest, because otherwise the settings page would look like it had taken effect.
+     */
+    fun applyVideoSettings(next: HiCarVideoSettings) {
+        val changed = next != videoOffer
+        videoOffer = next
+        if (changed) onLog("video: next connection offers ${next.quality.stored} at ${next.frameRate.stored}")
+    }
+
     /** Whether a steering-wheel key can be delivered to the phone at this instant. */
     fun mediaKeysReady(): Boolean = running.get() && keyInputSelected && input.ready()
 
@@ -987,7 +1210,10 @@ class HiCarController(
      */
     private fun routeNavigation(active: Boolean) {
         val sink = speaker ?: return
-        sink.setStreamType(if (active) navigationStreamType else 0)
+        // Guidance is a separate lane when the phone sends it separately, and in that case the duck
+        // is already happening; when it is mixed into the music this message is the only warning, and
+        // the media lane has to make room.
+        sink.setNavigationFocus(active)
     }
 
     /**
@@ -1026,6 +1252,8 @@ class HiCarController(
                 notifyKeysReady()
             },
             displaySize = displaySize,
+            videoSettings = videoOffer,
+            refreshHz = refreshHz,
             onKeyInputSelected = { selected ->
                 keyInputSelected = selected
                 notifyKeysReady()
@@ -1238,10 +1466,16 @@ class HiCarController(
                             // channel that carried it is worth remembering; a group that never got
                             // this far is forgotten when the round ends.
                             hotspot?.onLinkConfirmed()
+                            // A phone that got this far is the only kind worth dialling later: an
+                            // address seen on a failed attempt may be a phone that never completed.
+                            HiCarPhoneRegistry.remember(appContext, peer)
                             onLog(
-                                "HiChain finished: ${key.size}-byte session key; TCP endpoints are " +
-                                    "serving this key, so DMSDP can start on the access point",
+                                "HiChain finished: ${key.size}-byte session key; opening the access " +
+                                    "point now, because that is what the phone asks for next",
                             )
+                            // The phone's next message is the Wi-Fi negotiation. Opening the group
+                            // after the handshake keeps the radio free until a phone is really there.
+                            requestNetwork()
                         }
                         continue
                     }
@@ -1258,8 +1492,11 @@ class HiCarController(
                     continue
                 }
                 for (frame in decoder.feed(buffer, read)) {
-                    val network = liveNetwork
                     val isNetwork = frame.kind == KIND_NETWORK || frame.kind == KIND_NETWORK_COMMAND
+                    // The negotiation can beat the access point by a second or two. Waiting here
+                    // rather than dropping the frame is the difference between "hotspot lazy start"
+                    // and "every connection fails just after it authenticated".
+                    val network = if (isNetwork) awaitNetwork() else liveNetwork
                     if (isNetwork && network != null && !network.authenticated) {
                         // The phone only runs this exchange after it has a session key. Arriving
                         // earlier means our key is not visible yet, and answering would leak the
@@ -1409,7 +1646,16 @@ class HiCarController(
         }
     }
 
-    private companion object {
+    companion object {
+        // The three touch actions, mirrored here so the screen does not have to reach into the
+        // encoder's internal event type to name them.
+        const val TOUCH_DOWN = HiCarInputEvent.ACTION_DOWN
+        const val TOUCH_UP = HiCarInputEvent.ACTION_UP
+        const val TOUCH_MOVE = HiCarInputEvent.ACTION_MOVE
+
+        /** The phone decodes at most ten contacts per packet. */
+        const val MAX_TOUCH_POINTS = HiCarInputEvent.MAX_POINTS
+
         const val KIND_NETWORK = 4
         const val KIND_NETWORK_COMMAND = 33
         const val PREFERENCES = "hicar-receiver"

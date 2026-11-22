@@ -33,7 +33,10 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.systemBars
 import androidx.compose.foundation.layout.width
@@ -46,15 +49,18 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.Switch
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.viewinterop.AndroidView
@@ -66,10 +72,19 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.core.content.pm.PackageInfoCompat
 import com.shilapi.xcertplay.hicar.HiCarAdvertisementProbe
 import com.shilapi.xcertplay.hicar.HiCarController
+import com.shilapi.xcertplay.hicar.HiCarAudioSettings
+import com.shilapi.xcertplay.hicar.HiCarAudioSettingsStore
 import com.shilapi.xcertplay.hicar.HiCarDisplaySettings
+import com.shilapi.xcertplay.hicar.HiCarTouchPoint
 import com.shilapi.xcertplay.hicar.HiCarKeySettings
 import com.shilapi.xcertplay.hicar.HiCarMediaKeyForwarder
 import com.shilapi.xcertplay.hicar.HiCarMediaKeySession
+import com.shilapi.xcertplay.hicar.HiCarPairingCode
+import com.shilapi.xcertplay.hicar.HiCarReconnectSettings
+import com.shilapi.xcertplay.hicar.HiCarVideoSettings
+import com.shilapi.xcertplay.hicar.HiCarVideoSettingsStore
+import com.shilapi.xcertplay.hicar.HiCarWifiSettings
+import com.shilapi.xcertplay.hicar.HiCarWiredSettings
 import com.shilapi.xcertplay.hicar.HiCarPermissions
 import com.shilapi.xcertplay.hicar.HiCarRuntimeConfig
 import com.shilapi.xcertplay.hicar.HiCarDisplaySize
@@ -143,6 +158,21 @@ class HiCarHostActivity : ComponentActivity() {
 
     /** The speed-volume values the settings page edits; the controller gets them on every change. */
     private var speedSettings by mutableStateOf(HiCarSpeedVolumeSettings())
+
+    /** Sharpness and frame rate: answered once per connection, so they apply to the next one. */
+    private var videoSettings by mutableStateOf(HiCarVideoSettings())
+
+    /** Which head unit channel music and guidance go to. */
+    private var audioSettings by mutableStateOf(HiCarAudioSettings())
+
+    /** The wired path: off by default, because no part of it has run on a car yet. */
+    private var wiredEnabled by mutableStateOf(false)
+
+    /** Whether a known phone is dialled when its Bluetooth link comes up. */
+    private var redialEnabled by mutableStateOf(true)
+
+    /** Whether the head unit's own Wi-Fi is asked back after the receiver stops. */
+    private var restoreWifiEnabled by mutableStateOf(true)
 
     /** The session overlay's log panel starts closed: the picture is the point of that screen. */
     private var sessionLogVisible by mutableStateOf(false)
@@ -225,6 +255,11 @@ class HiCarHostActivity : ComponentActivity() {
         microphoneEnabled = storedMicrophone()
         windowMode = HiCarDisplaySettings.load(this)
         mediaKeysEnabled = HiCarKeySettings.mediaKeysEnabled(this)
+        videoSettings = HiCarVideoSettingsStore.load(this)
+        audioSettings = HiCarAudioSettingsStore.load(this)
+        wiredEnabled = HiCarWiredSettings.enabled(this)
+        redialEnabled = HiCarReconnectSettings.enabled(this)
+        restoreWifiEnabled = HiCarWifiSettings.restoreEnabled(this)
         speedSettings = HiCarSpeedVolumeSettings.load(this)
         // Before the first frame, so the activity never appears with the wrong bars and then jumps.
         applyWindowMode()
@@ -296,6 +331,12 @@ class HiCarHostActivity : ComponentActivity() {
                     onSpeed = ::applySpeedSettings,
                     mediaKeys = mediaKeysEnabled,
                     onMediaKeys = ::applyMediaKeysSetting,
+                    video = videoSettings,
+                    onVideo = ::applyVideoSettings,
+                    audio = audioSettings,
+                    onAudio = ::applyAudioSettings,
+                    onPreviewMedia = { previewAudio(media = true) },
+                    onPreviewNavigation = { previewAudio(media = false) },
                     onClose = { settingsOpen = false },
                     connection = { ConnectionSection() },
                     diagnostics = { DiagnosticsSection() },
@@ -334,6 +375,7 @@ class HiCarHostActivity : ComponentActivity() {
                     "以这里显示的为准。",
                 style = MaterialTheme.typography.bodySmall,
             )
+            PairingCode()
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Button(onClick = ::toggle, enabled = model.length == 8) {
                     Text(if (running) "停止" else "开始")
@@ -356,6 +398,50 @@ class HiCarHostActivity : ComponentActivity() {
             }
         }
     }
+
+    /**
+     * The QR code a phone scans instead of typing the code.
+     *
+     * It carries the head unit's own Bluetooth address, so the phone dials it directly instead of
+     * finding it on the air — the one path that does not depend on the 0xFDEE advertisement being
+     * recognised. The code is rebuilt whenever the address, the model or the PIN changes, because a
+     * QR that disagrees with the screen is worse than none.
+     */
+    @Composable
+    private fun PairingCode() {
+        val name = pairName()
+        val link = HiCarPairingCode.buildOrNull(
+            model = model,
+            bluetoothAddress = btAddress,
+            pin = pin,
+            deviceName = name,
+            supportsUsb = true,
+        )
+        val bitmap = remember(link) { link?.let { HiCarQrCode.bitmap(it, QR_PIXELS) } }
+        if (bitmap != null) {
+            Image(
+                bitmap = bitmap.asImageBitmap(),
+                contentDescription = "配对二维码",
+                modifier = Modifier
+                    .size(QR_SIZE)
+                    .background(Color.White)
+                    .padding(4.dp),
+            )
+            Text(
+                "手机扫描这辆车：扫码会带上车型、蓝牙地址和这 6 位连接码，不用手输。" +
+                    "码里不包含手机的任何信息，换一台手机重扫即可。",
+                style = MaterialTheme.typography.bodySmall,
+            )
+        } else {
+            val why = HiCarPairingCode.problem(model, btAddress, pin, name)
+            if (why != null) {
+                Text("二维码暂不可用：$why", style = MaterialTheme.typography.bodySmall)
+            }
+        }
+    }
+
+    /** The name the phone shows for this unit; the model tail tells two of them apart. */
+    private fun pairName(): String = "HiCar-" + model.takeLast(4)
 
     /**
      * The connected screen: the phone's picture, with the controls that have to stay reachable.
@@ -514,6 +600,65 @@ class HiCarHostActivity : ComponentActivity() {
                     "手机认的就是这个标识，换了它就等于一台没连过的新车。",
                 style = MaterialTheme.typography.bodySmall,
             )
+
+            SettingSwitch(
+                title = "插数据线时自动连接（实验）",
+                detail = "由本应用自己驱动 USB 网卡，不需要车机内核支持 NCM。" +
+                    "这条链路还没有在实车上跑过，默认关闭；打开后重启接收端才生效",
+                checked = wiredEnabled,
+                onChange = ::applyWiredSetting,
+            )
+            SettingSwitch(
+                title = "手机蓝牙连上时自动回连",
+                detail = "只对连过一次的手机生效。手机进了车里、蓝牙连上但 HiCar 不弹窗时，" +
+                    "由车机主动拨它，省掉一次手动开始",
+                checked = redialEnabled,
+                onChange = ::applyRedialSetting,
+            )
+            SettingSwitch(
+                title = "结束后恢复车机自己的 WiFi",
+                detail = "开热点会把车机的 WiFi 关掉。Android 10 起普通应用没有权限再打开它，" +
+                    "所以这里只能尝试，被系统拒绝时会提示你手动打开",
+                checked = restoreWifiEnabled,
+                onChange = ::applyRestoreWifiSetting,
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                TextButton(
+                    onClick = {
+                        openSystemSettings(Settings.ACTION_ACCESSIBILITY_SETTINGS, "无障碍设置")
+                    },
+                ) { Text("USB 授权自动确认") }
+                TextButton(
+                    onClick = { openSystemSettings(Settings.ACTION_WIFI_SETTINGS, "WiFi 设置") },
+                ) { Text("打开 WiFi 设置") }
+            }
+            Text(
+                "「USB 授权自动确认」需要你在系统的无障碍设置里启用「HiCar USB 授权」：" +
+                    "插线时系统会弹一个「允许访问 USB 设备」，启用后自动点掉。它只认同时含 USB 字样" +
+                    "和允许/确定按钮的窗口，别的一律不碰。",
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+    }
+
+    /** A titled switch with its explanation; the settings page has five of these now. */
+    @Composable
+    private fun SettingSwitch(
+        title: String,
+        detail: String,
+        checked: Boolean,
+        onChange: (Boolean) -> Unit,
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(title, style = MaterialTheme.typography.bodyLarge)
+                Text(detail, style = MaterialTheme.typography.bodySmall)
+            }
+            Switch(checked = checked, onCheckedChange = onChange)
         }
     }
 
@@ -573,6 +718,77 @@ class HiCarHostActivity : ComponentActivity() {
                 "${next.startKmh.toInt()}–${next.fullKmh.toInt()} km/h, +${next.maxGainDb.toInt()} dB, " +
                 "source ${next.source.name.lowercase()}",
         )
+    }
+
+    /** Stores the picture settings; a running session keeps what it negotiated and says so. */
+    private fun applyVideoSettings(next: HiCarVideoSettings) {
+        val changed = next != videoSettings
+        videoSettings = next
+        HiCarVideoSettingsStore.save(this, next)
+        controller?.applyVideoSettings(next)
+        if (changed) {
+            appendLog(
+                "video: ${next.quality.stored} at ${next.frameRate.stored}; " +
+                    "the phone was already told what to encode, so this lands on the next connection",
+            )
+        }
+    }
+
+    /** Stores the channel choices; a track that is already playing keeps its channel. */
+    private fun applyAudioSettings(next: HiCarAudioSettings) {
+        val changed = next != audioSettings
+        audioSettings = next
+        HiCarAudioSettingsStore.save(this, next)
+        controller?.applyAudioSettings(next)
+        if (changed) {
+            appendLog(
+                "audio: music ${HiCarAudioSettings.label(next.mediaStream)}, " +
+                    "navigation ${HiCarAudioSettings.label(next.navigationStream)}",
+            )
+        }
+    }
+
+    /** Plays the short tone that tells the driver which speaker a channel number means. */
+    private fun previewAudio(media: Boolean) {
+        val active = controller
+        if (active == null) {
+            appendLog("audio: preview needs a running receiver (the decoder lives in it)")
+            return
+        }
+        val played = if (media) active.previewMedia() else active.previewNavigation()
+        if (!played) appendLog("audio: no decoder in this build, so the preview cannot play")
+    }
+
+    /** Turns the wired path on or off; it is picked up when the receiver next starts. */
+    private fun applyWiredSetting(enabled: Boolean) {
+        wiredEnabled = enabled
+        HiCarWiredSettings.setEnabled(this, enabled)
+        appendLog(
+            "wired: ${if (enabled) "on" else "off"}; " +
+                if (enabled) {
+                    "restart the receiver so the cable is driven by this build, not the probe"
+                } else {
+                    "the cable is only probed for diagnosis"
+                },
+        )
+    }
+
+    private fun applyRedialSetting(enabled: Boolean) {
+        redialEnabled = enabled
+        HiCarReconnectSettings.setEnabled(this, enabled)
+        appendLog("redial: ${if (enabled) "on" else "off"}")
+    }
+
+    private fun applyRestoreWifiSetting(enabled: Boolean) {
+        restoreWifiEnabled = enabled
+        HiCarWifiSettings.setRestoreEnabled(this, enabled)
+        appendLog("wifi: restoring the head unit's own Wi-Fi ${if (enabled) "on" else "off"}")
+    }
+
+    /** Opens the system page where the driver turns the USB assist on, or Wi-Fi back on. */
+    private fun openSystemSettings(action: String, why: String) {
+        val opened = runCatching { startActivity(Intent(action)) }.isSuccess
+        appendLog(if (opened) "settings: opened $why" else "settings: this ROM has no screen for $why")
     }
 
     /**
@@ -782,6 +998,7 @@ class HiCarHostActivity : ComponentActivity() {
             deviceName = "HiCar receiver",
             pin = pin,
             withMicrophone = microphoneEnabled,
+            bluetoothAddress = btAddress,
         )
         val next = try {
             HiCarController(
@@ -789,6 +1006,7 @@ class HiCarHostActivity : ComponentActivity() {
                 config = config,
                 report = { next -> runOnUiThread { status = next } },
                 onLog = { line -> runOnUiThread { appendLog(line) } },
+                videoSettings = videoSettings,
             )
         } catch (failure: RuntimeException) {
             // A constructor that refuses its configuration is a bug, not a device failure; say which
@@ -860,16 +1078,83 @@ class HiCarHostActivity : ComponentActivity() {
     }
 
     /** Maps a touch on the window into the picture's own coordinate space. */
+    /**
+     * Every finger on the picture, forwarded as one snapshot per event.
+     *
+     * The four `MotionEvent` cases do not map one-to-one onto the three UIBC actions, and the
+     * difference is the whole reason a pinch works: `ACTION_POINTER_DOWN` (a second finger) and
+     * `ACTION_POINTER_UP` (one of several leaving) are still the same *gesture*, so they go out as
+     * moves carrying the new set — only `ACTION_DOWN` starts a gesture and only `ACTION_UP` ends it.
+     * Sending a multi-finger set as a down, or an up with two contacts, is how a phone ends up with
+     * a finger pressed forever.
+     */
     private fun videoTouch(view: View, event: MotionEvent): Boolean {
         val active = controller ?: return false
-        val action = when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> 0
-            MotionEvent.ACTION_MOVE -> 2
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> 1
+        val width = view.width
+        val height = view.height
+        if (width < 1 || height < 1) return false
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                val point = touchPoint(active, event, 0, width, height) ?: return false
+                active.sendTouches(HiCarController.TOUCH_DOWN, listOf(point))
+            }
+
+            MotionEvent.ACTION_POINTER_DOWN, MotionEvent.ACTION_MOVE -> {
+                val points = touchSnapshot(active, event, width, height, skipIndex = -1)
+                // An empty set would be read as "everything lifted", which would end the gesture the
+                // driver is still making; a move with nothing to report is simply not sent.
+                if (points.isEmpty()) return true
+                active.sendTouches(HiCarController.TOUCH_MOVE, points)
+            }
+
+            MotionEvent.ACTION_POINTER_UP -> {
+                // The finger that left is still in this event; the set the phone should now hold is
+                // the other ones.
+                val points = touchSnapshot(active, event, width, height, skipIndex = event.actionIndex)
+                if (points.isEmpty()) return true
+                active.sendTouches(HiCarController.TOUCH_MOVE, points)
+            }
+
+            MotionEvent.ACTION_UP -> {
+                val point = touchPoint(active, event, 0, width, height) ?: return false
+                active.sendTouches(HiCarController.TOUCH_UP, listOf(point))
+            }
+
+            MotionEvent.ACTION_CANCEL -> {
+                // Whatever the window took the gesture for, the phone must not keep a finger down.
+                active.cancelTouch()
+            }
+
             else -> return false
         }
-        active.sendTouchAt(event.x, event.y, view.width, view.height, action)
         return true
+    }
+
+    private fun touchPoint(
+        active: HiCarController,
+        event: MotionEvent,
+        index: Int,
+        width: Int,
+        height: Int,
+    ): HiCarTouchPoint? {
+        if (index >= event.pointerCount) return null
+        val mapped = active.mapTouch(event.getX(index), event.getY(index), width, height) ?: return null
+        return HiCarTouchPoint(event.getPointerId(index), mapped[0], mapped[1])
+    }
+
+    private fun touchSnapshot(
+        active: HiCarController,
+        event: MotionEvent,
+        width: Int,
+        height: Int,
+        skipIndex: Int,
+    ): List<HiCarTouchPoint> {
+        val points = ArrayList<HiCarTouchPoint>(event.pointerCount)
+        for (index in 0 until event.pointerCount) {
+            if (index == skipIndex) continue
+            touchPoint(active, event, index, width, height)?.let { points.add(it) }
+        }
+        return points
     }
 
     private fun sendKey(key: Int, name: String) {
@@ -1392,6 +1677,10 @@ class HiCarHostActivity : ComponentActivity() {
         const val SETUP_LOG_LINES = 12
         const val SESSION_LOG_LINES = 6
         const val SETTINGS_LOG_LINES = 40
+
+        /** Rendered large and scaled down by Compose: a 512 px code survives a 150 dp box. */
+        const val QR_PIXELS = 512
+        val QR_SIZE = 150.dp
 
         /** `adb logcat -s HiCar` on a head unit: short, and stable across sessions. */
         const val LOG_TAG = "HiCar"

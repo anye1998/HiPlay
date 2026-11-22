@@ -299,11 +299,13 @@ class HiCarAudioAndInputTest {
         val length = ((record[2].toInt() and 0xFF) shl 8) or (record[3].toInt() and 0xFF)
         assertEquals(record.size, length)
         val plain = HiCarRecordCipher(key, 1_500).decrypt(record.copyOfRange(4, record.size))
-        // Six marker bytes, then action, length, flags, x, y, elapsed, terminator.
+        // Six marker bytes, then action, length, count, pointer id, x, y, pad.
         for (index in 0 until 6) assertEquals(0xFF, plain[index].toInt() and 0xFF)
         assertEquals(0, plain[6].toInt())
-        assertEquals(11, ((plain[7].toInt() and 0xFF) shl 8) or (plain[8].toInt() and 0xFF))
-        // Body starts after the six marker bytes: x occupies 5-6 and y 7-8 of the body.
+        // `1 + 5N + pad` for one contact: a 10-byte body, so seven bytes are declared.
+        assertEquals(7, ((plain[7].toInt() and 0xFF) shl 8) or (plain[8].toInt() and 0xFF))
+        assertEquals(1, plain[9].toInt())
+        assertEquals(0, plain[10].toInt())
         assertEquals(400, ((plain[11].toInt() and 0xFF) shl 8) or (plain[12].toInt() and 0xFF))
         assertEquals(240, ((plain[13].toInt() and 0xFF) shl 8) or (plain[14].toInt() and 0xFF))
     }

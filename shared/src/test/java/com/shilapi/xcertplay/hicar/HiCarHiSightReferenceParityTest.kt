@@ -25,6 +25,9 @@ import java.nio.charset.StandardCharsets
  * a check that the two ciphers agree.
  */
 class HiCarHiSightReferenceParityTest {
+    /** The video parameters the reference implementation hard-codes. */
+    private val REFERENCE_VIDEO = HiCarVideoSettings(frameRate = HiCarFrameRateMode.FPS_30)
+
 
     private val key = ByteArray(32) { index -> (index * 7 + 3).toByte() }
     private val phone = HiCarRecordCipher(key, 65_000)
@@ -42,7 +45,9 @@ class HiCarHiSightReferenceParityTest {
     @Test
     fun `every answer in the handshake matches the reference`() {
         val reference = HiSightWire(key, {}, true)
-        val mine = HiCarHiSightWire(key, {}, withInput = true)
+        // The reference build answers with a fixed 30 fps / 2 Mbps; the frame rate now follows the
+        // panel by default, so the baseline is pinned here instead of relying on the default.
+        val mine = HiCarHiSightWire(key, {}, withInput = true, video = REFERENCE_VIDEO)
         val referenceAnswers = ArrayList<String>()
         val mineAnswers = ArrayList<String>()
 
@@ -65,7 +70,7 @@ class HiCarHiSightReferenceParityTest {
     @Test
     fun `play and teardown match the reference`() {
         val reference = HiSightWire(key, {}, true)
-        val mine = HiCarHiSightWire(key, {}, withInput = true)
+        val mine = HiCarHiSightWire(key, {}, withInput = true, video = REFERENCE_VIDEO)
         for (step in handshake()) {
             reference.feed(step.bytes, step.bytes.size)
             mine.feed(step.bytes, step.bytes.size)

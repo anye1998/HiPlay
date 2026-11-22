@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Shown in Settings › Accessibility › Installed services. -->
+    <string name="usb_accessibility_label">HiCar USB 授权</string>
+    <string name="usb_accessibility_description">插上数据线时，自动点掉系统的「允许访问 USB 设备」对话框。只在这个对话框上工作，不读取其他界面内容。</string>
+</resources>

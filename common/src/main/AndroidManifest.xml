@@ -37,6 +37,23 @@
             </intent-filter>
         </activity>
 
+        <!-- Optional: presses "允许" on the system's USB permission dialog, which is the one step of
+             a wired connection that has no API. Disabled until the driver turns it on in
+             Settings › Accessibility; see HiCarUsbAccessibilityService for what it will and will
+             not touch. -->
+        <service
+            android:name="com.shilapi.xcertplay.HiCarUsbAccessibilityService"
+            android:exported="false"
+            android:label="@string/usb_accessibility_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/usb_accessibility" />
+        </service>
+
         <!-- The launcher entry. The label is a literal to match the screen's own copy, which is
              Simplified Chinese on purpose and hardcoded so it reads the same on any ROM locale. -->
         <activity-alias

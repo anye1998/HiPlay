@@ -151,17 +151,17 @@ OpenHC 多出来的三件事：
 | 能力 | OpenHC 怎么做 | 我们的现状 | 价值 | 代价 / 风险 | 状态 |
 | --- | --- | --- | --- | --- | --- |
 | **方向盘按键** | `MediaKeys` + `MediaKeyForwarder` + `MediaSession`：前台窗口与媒体会话两个入口，去重、补抬起、吞自动重复 | 只有屏幕上的「返回/主页」两个键，方向盘完全没接 | 高：车上最常用的操作 | 需手机选回按键事件；后台会话需媒体焦点 | **本轮已移植**（`docs/HICAR_KEYS.md`） |
-| **多指触摸** | `HiSightInput.Touch` 带 1–10 个触点快照，`UibcEncoder` 按编号升序组包；地图双指缩放（README 明确写了） | 单点：编码器固定 14 字节单点包，路由器只跟一根手指 | 高：地图缩放、双指手势 | 低-中：包格式已知（动作 + 1+5N + 编号/xy），但要改编码器、路由器和 MotionEvent 映射 | 待做 |
-| **帧率跟随屏幕刷新率 / 清晰度档位** | README：帧率自动跟随车机屏幕刷新率，清晰度三档可选；`Capabilities` 里 fps/gop/bitrate 都可配 | 固定 `fps 30;gop 30;bitrate 2000000`（`HiCarHiSightWire` 第 268 行） | 中：60 Hz 车机更顺；弱网可降码率 | 低：只改协商参数 + 设置项 | 待做 |
-| **音频分路播放器 + 声道可选 + 试听** | 按用途分三路 `AudioTrack`，各自焦点；设置里能分别指定导航/音乐声道并试听 | 单 `AudioTrack`，只按 route 换 streamType；导航与音乐共焦点 | 中-高：导航播报时音乐该压低而不是抢焦点 | 中：要改 `HiCarAudioSink` 的播放器结构 | 待做（见第四节 ①②） |
-| **二维码首次配对** | `hicar://car/connect?…&mac=&pin=&ability=`，手机扫码直接连 | 依赖 0xFDEE 广播被手机识别 | 高：绕开广播的地址/白名单不确定性 | 中：要能显示二维码、屏要能拍；码含 6 位需配对后轮换 | 待做（见第五节 1） |
-| **热点懒开** | `StartWifiNetwork` 在 `Authenticated` 之后 | `prepareNetwork()` 先开热点再广播 | 中：没手机时空转、少断自身 WiFi | 中：协商要排队等热点就绪 | 待做（见第五节 2） |
-| **主动回连 + 自动连接手机** | `ACTION_ACL_CONNECTED` → 按 SDP 拨手机的蓝牙控制服务；开机自启可选 | 被动等手机自己回来 | 高：解决"认证成功然后没有然后" | 高：后台拉起、悬浮窗权限、BYD 后台限制 | 待做（见第五节 5） |
-| **有线用户态 CDC-NCM** | NTB16 组帧 + 自答 ARP + `VpnService` TUN，不依赖内核 `rndis_host` | 等内核 `rndis_host`，本车缺失 | 高：有线的唯一可行路径 | 高：工作量最大，需逐字节对照 | 待做（见第三节、第五节 3） |
-| **插线不弹 USB 授权框** | 无障碍服务自动确认（README「可选」） | 已随 CarPlay 一起删除 | 中：有线体验 | 中：要用户开无障碍权限，车机 UI 上要解释清楚 | 待做（低优先） |
-| **无线结束恢复车机 WiFi** | README 明确给出开关 | 无（开热点会断车机 WiFi，结束后靠用户手动开） | 中：很实用的小功能 | 低：`WifiManager` 一个开关 | 待做（低优先） |
-| **开机自动打开** | README「可选」+ `BOOT_COMPLETED` | 无（`BootReceiver` 随 CarPlay 删除） | 低-中 | 中：后台自启在国产 ROM 上限制多，需要说明 | 待做（可选） |
-| **成文输入** | `HiSightInput.Text`，vendor `input_content`，包类别 2 | 无 | 低：车机键盘输入到手机 | 高：作者自己标"未经验证"（插入/替换语义不明） | 不建议现在做 |
+| **多指触摸** | `HiSightInput.Touch` 带 1–10 个触点快照，`UibcEncoder` 按编号升序组包；地图双指缩放（README 明确写了） | 单点：编码器固定 14 字节单点包，路由器只跟一根手指 | 高：地图缩放、双指手势 | 低-中：包格式已知（动作 + 1+5N + 编号/xy），但要改编码器、路由器和 MotionEvent 映射 | **已移植**：`HiCarUiInput` 触摸体改为「全部触点快照」，界面按 `POINTER_DOWN/UP` 发 move；单测覆盖 1/2/10 指与拒绝规则 |
+| **帧率跟随屏幕刷新率 / 清晰度档位** | README：帧率自动跟随车机屏幕刷新率，清晰度三档可选；`Capabilities` 里 fps/gop/bitrate 都可配 | 固定 `fps 30;gop 30;bitrate 2000000`（`HiCarHiSightWire` 第 268 行） | 中：60 Hz 车机更顺；弱网可降码率 | 低：只改协商参数 + 设置项 | **已实现**：`HiCarVideoSettings`（清晰度三档 + 帧率跟随/30/60），设置页可选，下次连接生效 |
+| **音频分路播放器 + 声道可选 + 试听** | 按用途分三路 `AudioTrack`，各自焦点；设置里能分别指定导航/音乐声道并试听 | 单 `AudioTrack`，只按 route 换 streamType；导航与音乐共焦点 | 中-高：导航播报时音乐该压低而不是抢焦点 | 中：要改 `HiCarAudioSink` 的播放器结构 | **已实现**：每用途一条 lane（队列/解码器/音轨），导航出声时媒体本地压低到 0.32；声道可选 + 试听 |
+| **二维码首次配对** | `hicar://car/connect?…&mac=&pin=&ability=`，手机扫码直接连 | 依赖 0xFDEE 广播被手机识别 | 高：绕开广播的地址/白名单不确定性 | 中：要能显示二维码、屏要能拍；码含 6 位需配对后轮换 | **已实现**：`HiCarPairingCode` + zxing 渲染，连接页实时按地址/机型/连接码生成 |
+| **热点懒开** | `StartWifiNetwork` 在 `Authenticated` 之后 | `prepareNetwork()` 先开热点再广播 | 中：没手机时空转、少断自身 WiFi | 中：协商要排队等热点就绪 | **已实现**：HiChain 完成后才开热点，Wi-Fi 协商帧到达时 `awaitNetwork` 等待 |
+| **主动回连 + 自动连接手机** | `ACTION_ACL_CONNECTED` → 按 SDP 拨手机的蓝牙控制服务；开机自启可选 | 被动等手机自己回来 | 高：解决"认证成功然后没有然后" | 高：后台拉起、悬浮窗权限、BYD 后台限制 | **已实现**：`ACL_CONNECTED` → 拨手机 0xFE35，只拨连过一次的手机，20 s 冷却 |
+| **有线用户态 CDC-NCM** | NTB16 组帧 + 自答 ARP + `VpnService` TUN，不依赖内核 `rndis_host` | 等内核 `rndis_host`，本车缺失 | 高：有线的唯一可行路径 | 高：工作量最大，需逐字节对照 | **已实现，未实车验证**：见 `docs/HICAR_WIRED.md` |
+| **插线不弹 USB 授权框** | 无障碍服务自动确认（README「可选」） | 已随 CarPlay 一起删除 | 中：有线体验 | 中：要用户开无障碍权限，车机 UI 上要解释清楚 | **已实现（可选）**：`HiCarUsbAccessibilityService`，只在同时含 USB 字样与确认按钮的窗口上点一下 |
+| **无线结束恢复车机 WiFi** | README 明确给出开关 | 无（开热点会断车机 WiFi，结束后靠用户手动开） | 中：很实用的小功能 | 低：`WifiManager` 一个开关 | **已实现**：停止时尝试 `setWifiEnabled(true)`，Android 10+ 被拒时日志提示并提供「打开 WiFi 设置」 |
+| **开机自动打开** | README「可选」+ `BOOT_COMPLETED` | 无（`BootReceiver` 随 CarPlay 删除） | 低-中 | 中：后台自启在国产 ROM 上限制多，需要说明 | **不做**（价值低，本轮跳过） |
+| **成文输入** | `HiSightInput.Text`，vendor `input_content`，包类别 2 | 无 | 低：车机键盘输入到手机 | 高：作者自己标"未经验证"（插入/替换语义不明） | **不做**（价值低，本轮跳过） |
 | **通话与车机麦克风** | README：**还没有验证** | 麦克风上行已有实现，同样未实车验证 | — | — | 共同空白，不是可借鉴项 |
 
 优先级建议（结合"减少上车次数"）：
@@ -171,3 +171,20 @@ OpenHC 多出来的三件事：
 3. **音频分路**：先做用途号映射（纯逻辑单测），再改播放器结构。
 4. 二维码 + 热点懒开 + 主动回连：这三项是一组，都在"怎么让手机找到车机"这条线上，一起改一起验。
 5. 有线、USB 授权、恢复 WiFi、开机自启：独立小项，按现场痛点排。
+
+### 本轮落地情况（2026-11-22 晚）
+
+上一张表里除「开机自动打开」「成文输入」两项（价值低）外，其余全部落地。验证边界仍是同一条规则：
+**没有实车证据的功能不写成「已支持」**。
+
+| 能力 | 代码 | 验证 |
+| --- | --- | --- |
+| 多指触摸 | `HiCarUiInput`（快照包）、`HiCarHostActivity.videoTouch` | 单测 19 项（包字节、1/2/10 指、拒绝规则）；界面按 `POINTER_*` 组快照；**未实车** |
+| 画面档位 | `HiCarVideoSettings`、`HiCarHiSightWire` | 单测 9 项（档位/帧率量化/格式行）；模拟器确认设置项；**未实车看画质** |
+| 音频分路 | `HiCarAudioSink`（lane）、`HiCarAudioSettings`、`HiCarPreviewTone` | 单测 6 项（用途映射/声道范围/试听音）；**未实车听** |
+| 扫码配对 | `HiCarPairingCode`、`HiCarQrCode` | 单测 8 项（字段顺序、6+2 拆分、占位地址拒绝、注入过滤）；模拟器确认二维码渲染 |
+| 热点懒开 | `HiCarController.requestNetwork/awaitNetwork` | 编译 + 单测不覆盖时序；**未实车** |
+| 主动回连 | `HiCarReconnect`、`HiCarAutoReconnect` | 单测 6 项（决策表/冷却）；**未实车** |
+| 有线 NCM | 见 `docs/HICAR_WIRED.md` | 单测 19 项；**整条未实车** |
+| USB 授权 | `HiCarUsbAccessibilityService` | 单测 6 项（对话框识别）；**未实车** |
+| 恢复 WiFi | `HiCarWifiRestore` | 仅编译；Android 10 上预期被系统拒绝，日志与提示是主要产出 |

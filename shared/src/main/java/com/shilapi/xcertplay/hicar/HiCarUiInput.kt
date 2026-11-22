@@ -8,13 +8,33 @@ import java.nio.ByteOrder
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.TimeUnit
 
-/** One UIBC event: a touch action (0 down, 1 up, 2 move) or a key press/release. */
+/**
+ * One contact in a touch snapshot.
+ *
+ * [id] is the pointer id Android assigned, kept as-is because the phone compares snapshots by it: a
+ * number that disappears is read as "this finger lifted", so renumbering would turn a two-finger
+ * pinch into two separate taps on whatever the phone had under them.
+ */
+class HiCarTouchPoint(val id: Int, val x: Int, val y: Int) {
+    override fun toString(): String = "($id:$x,$y)"
+}
+
+/**
+ * One UIBC event: a touch snapshot (0 down, 1 up, 2 move) or a key press/release.
+ *
+ * A touch carries **all** contacts that are down, not just the one that moved. That is the whole
+ * difference between one finger and ten: the phone treats each packet as the current set, works out
+ * which ids appeared or vanished, and turns the rest into moves.
+ */
 internal class HiCarInputEvent private constructor(
     val action: Int,
-    val x: Int,
-    val y: Int,
+    val points: List<HiCarTouchPoint>,
     val key: Int,
 ) {
+    /** The first contact, for the callers that only ever send one. */
+    val x: Int get() = points.firstOrNull()?.x ?: 0
+    val y: Int get() = points.firstOrNull()?.y ?: 0
+
     companion object {
         const val ACTION_DOWN = 0
         const val ACTION_UP = 1
@@ -22,13 +42,23 @@ internal class HiCarInputEvent private constructor(
         const val ACTION_KEY_DOWN = 3
         const val ACTION_KEY_UP = 4
 
-        fun touch(action: Int, x: Int, y: Int): HiCarInputEvent {
+        /** The phone decodes at most ten contacts; a longer packet is one packet it will refuse. */
+        const val MAX_POINTS = 10
+
+        fun touch(action: Int, x: Int, y: Int): HiCarInputEvent =
+            touch(action, listOf(HiCarTouchPoint(0, x, y)))
+
+        fun touch(action: Int, points: List<HiCarTouchPoint>): HiCarInputEvent {
             require(action in ACTION_DOWN..ACTION_MOVE) { "touch action" }
-            return HiCarInputEvent(action, x, y, 0)
+            require(points.isNotEmpty() && points.size <= MAX_POINTS) { "touch point count" }
+            // Two contacts with the same id would be read as one finger that jumped; the phone has no
+            // way to say which of the two it should keep.
+            require(points.map { it.id }.toSet().size == points.size) { "touch pointer ids" }
+            return HiCarInputEvent(action, points.sortedBy { it.id }, 0)
         }
 
         fun key(key: Int, down: Boolean): HiCarInputEvent =
-            HiCarInputEvent(if (down) ACTION_KEY_DOWN else ACTION_KEY_UP, 0, 0, key)
+            HiCarInputEvent(if (down) ACTION_KEY_DOWN else ACTION_KEY_UP, emptyList(), key)
     }
 }
 
@@ -36,33 +66,55 @@ internal class HiCarInputEvent private constructor(
  * Encodes UIBC events the way the phone expects them on the input socket.
  *
  * `0xFF`-prefixed marker, a big-endian body, then the whole thing AES-CTR encrypted and length
- * prefixed. Touch bodies are 14 bytes, key bodies 12. Coordinates are in the picture space the
- * decoder reports — sending window pixels would put the finger somewhere else.
+ * prefixed. A touch body is `4 + 5N + padding` bytes for N contacts (10 at most); a key body is 12.
+ * Coordinates are in the picture space the decoder reports — sending window pixels would put the
+ * finger somewhere else.
  *
- * Ported from `UiInput` (Aki894/CarLink `hisight_input.py`, MIT).
+ * The touch form is the one GGBondLab/OpenHC runs on a real car (`core/hisight`,
+ * `UibcEncoder.touch`), which is also the only form that can express a pinch: one packet per
+ * snapshot of every finger down.
  */
 internal class HiCarUiInputEncoder(sessionKey: ByteArray) {
     private val cipher = HiCarRecordCipher(sessionKey, MAX_RECORD_BYTES)
 
-    fun encode(event: HiCarInputEvent, elapsedMillis: Long): ByteArray {
+    fun encode(event: HiCarInputEvent, @Suppress("UNUSED_PARAMETER") elapsedMillis: Long): ByteArray {
         val body: ByteArray = when (event.action) {
             HiCarInputEvent.ACTION_DOWN, HiCarInputEvent.ACTION_UP, HiCarInputEvent.ACTION_MOVE -> {
                 // Range is the router's business: it knows the decoded size, which is no longer a
                 // constant. Re-checking against 800×480 here would reject every coordinate of a
                 // 1080p picture.
-                if (event.x < 0 || event.y < 0 || elapsedMillis < 0) {
+                val points = event.points
+                if (points.isEmpty() || points.size > HiCarInputEvent.MAX_POINTS) {
+                    throw HiCarWireException("touch point count")
+                }
+                if (points.any { it.id !in 0..31 || it.x !in 0..0xFFFF || it.y !in 0..0xFFFF }) {
                     throw HiCarWireException("touch coordinates")
                 }
-                ByteBuffer.allocate(14).order(ByteOrder.BIG_ENDIAN)
-                    .put(event.action.toByte())
-                    .putShort(11)
-                    .put(1)
-                    .put(0)
-                    .putShort(event.x.toShort())
-                    .putShort(event.y.toShort())
-                    .putInt((elapsedMillis and 0xFFFF_FFFFL).toInt())
-                    .put(0)
-                    .array()
+                // `action | BE16 (1 + 5N + pad) | N | N×(id, BE16 x, BE16 y) | pad`.
+                //
+                // The 14-byte single-touch body this replaced carried a millisecond timestamp after
+                // the pair. The reference implementation that runs on a real car sends no timestamp
+                // and can carry ten contacts in the same packet, so the snapshot form wins: a pinch
+                // is impossible in the other body, and its length field means "1 + 5N", not
+                // "1 + 5N + 5".
+                val count = points.size
+                val padding = (4 + 5 * count) % 2
+                val declared = 1 + 5 * count + padding
+                val body = ByteArray(4 + 5 * count + padding)
+                body[0] = event.action.toByte()
+                body[1] = ((declared ushr 8) and 0xFF).toByte()
+                body[2] = (declared and 0xFF).toByte()
+                body[3] = count.toByte()
+                var at = 4
+                for (point in points) {
+                    body[at] = point.id.toByte()
+                    body[at + 1] = ((point.x ushr 8) and 0xFF).toByte()
+                    body[at + 2] = (point.x and 0xFF).toByte()
+                    body[at + 3] = ((point.y ushr 8) and 0xFF).toByte()
+                    body[at + 4] = (point.y and 0xFF).toByte()
+                    at += 5
+                }
+                body
             }
 
             HiCarInputEvent.ACTION_KEY_DOWN, HiCarInputEvent.ACTION_KEY_UP -> {
@@ -123,9 +175,15 @@ internal class HiCarInputRouter {
     }
 
     private var sender: Sender? = null
-    private var pressed = false
-    private var x = 0
-    private var y = 0
+
+    /**
+     * The contacts the phone currently believes are down, by pointer id.
+     *
+     * A linked map so the "which one do I lift" answer is stable: [cancel] lifts the first id of the
+     * last snapshot, which is the smallest, and the phone raises every other finger with it.
+     */
+    private val activePoints = LinkedHashMap<Int, HiCarTouchPoint>()
+    private var lastSnapshot: List<HiCarTouchPoint> = emptyList()
 
     /** Media keys the phone believes are down; a session that ends must lift them. */
     private val pressedKeys = LinkedHashSet<Int>()
@@ -166,7 +224,8 @@ internal class HiCarInputRouter {
     @Synchronized
     fun attach(next: Sender) {
         sender = next
-        pressed = false
+        activePoints.clear()
+        lastSnapshot = emptyList()
         pressedKeys.clear()
         onReadyChanged?.invoke(true)
     }
@@ -175,7 +234,8 @@ internal class HiCarInputRouter {
     fun detach(old: Sender) {
         if (sender === old) {
             sender = null
-            pressed = false
+            activePoints.clear()
+            lastSnapshot = emptyList()
             pressedKeys.clear()
             onReadyChanged?.invoke(false)
         }
@@ -184,17 +244,53 @@ internal class HiCarInputRouter {
     @Synchronized
     fun ready(): Boolean = sender != null
 
+    /** One finger, for the buttons and probes that only ever touch a single point. */
     @Synchronized
-    fun touch(action: Int, nx: Int, ny: Int): Boolean {
+    fun touch(action: Int, nx: Int, ny: Int): Boolean = touches(action, listOf(HiCarTouchPoint(0, nx, ny)))
+
+    /**
+     * A snapshot of every contact that is down.
+     *
+     * The three actions do not mean what they do in `MotionEvent`. The phone reads each packet as the
+     * current set and diffs it against what it remembers, so:
+     *
+     * - [HiCarInputEvent.ACTION_DOWN] may only be sent when nothing is down — it starts a gesture;
+     * - [HiCarInputEvent.ACTION_MOVE] carries the set as it is now, fingers may have been added or
+     *   removed since the last snapshot (this is how a pinch works);
+     * - [HiCarInputEvent.ACTION_UP] carries exactly one contact, ends the whole gesture, and the
+     *   phone lifts the rest by itself.
+     *
+     * Getting that wrong is not cosmetic: a second DOWN leaves the phone with a gesture it will
+     * never finish, and a multi-contact UP is treated as a move, so the picture stays "pressed".
+     */
+    @Synchronized
+    fun touches(action: Int, points: List<HiCarTouchPoint>): Boolean {
         val target = sender ?: return false
-        if (nx !in 0 until displayWidth || ny !in 0 until displayHeight) return false
         if (action !in HiCarInputEvent.ACTION_DOWN..HiCarInputEvent.ACTION_MOVE) return false
-        if (action == HiCarInputEvent.ACTION_DOWN && pressed) return false
-        if (action != HiCarInputEvent.ACTION_DOWN && !pressed) return false
-        if (!target.send(HiCarInputEvent.touch(action, nx, ny))) return false
-        x = nx
-        y = ny
-        pressed = action != HiCarInputEvent.ACTION_UP
+        if (points.isEmpty() || points.size > HiCarInputEvent.MAX_POINTS) return false
+        if (points.map { it.id }.toSet().size != points.size) return false
+        for (point in points) {
+            if (point.id !in 0..31) return false
+            if (point.x !in 0 until displayWidth || point.y !in 0 until displayHeight) return false
+        }
+        when (action) {
+            HiCarInputEvent.ACTION_DOWN -> if (activePoints.isNotEmpty()) return false
+            HiCarInputEvent.ACTION_MOVE -> if (activePoints.isEmpty()) return false
+            HiCarInputEvent.ACTION_UP -> {
+                if (activePoints.isEmpty() || points.size != 1) return false
+                if (points[0].id !in activePoints) return false
+            }
+        }
+        val snapshot = points.sortedBy { it.id }
+        if (!target.send(HiCarInputEvent.touch(action, snapshot))) return false
+        if (action == HiCarInputEvent.ACTION_UP) {
+            activePoints.clear()
+            lastSnapshot = emptyList()
+        } else {
+            activePoints.clear()
+            for (point in snapshot) activePoints[point.id] = point
+            lastSnapshot = snapshot
+        }
         return true
     }
 
@@ -205,12 +301,29 @@ internal class HiCarInputRouter {
     /** Releases a finger and any key the phone still thinks are down; called when a session ends. */
     @Synchronized
     fun cancel() {
-        if (pressed) sender?.send(HiCarInputEvent.touch(HiCarInputEvent.ACTION_UP, x, y))
-        pressed = false
+        cancelTouch()
         for (code in pressedKeys.toList().asReversed()) {
             sender?.send(HiCarInputEvent.key(code, false))
         }
         pressedKeys.clear()
+    }
+
+    /**
+     * Lifts whatever fingers the phone still believes are down, without touching the keys.
+     *
+     * A gesture that the window cancelled (a system swipe took over, the view was detached) has to
+     * end, or every later DOWN is refused for the rest of the session. The media keys are a separate
+     * state and a separate reason: cancelling a touch must not release a steering-wheel button the
+     * driver is still holding.
+     */
+    @Synchronized
+    fun cancelTouch(): Boolean {
+        // One contact ends the whole gesture on the phone's side, so the anchor is any contact that
+        // is still down; the first of the last snapshot is the smallest id, which every phone keeps.
+        val anchor = lastSnapshot.firstOrNull() ?: return false
+        activePoints.clear()
+        lastSnapshot = emptyList()
+        return sender?.send(HiCarInputEvent.touch(HiCarInputEvent.ACTION_UP, listOf(anchor))) == true
     }
 
     /** The two navigation keys, sent as one press: nothing on this side holds them down. */

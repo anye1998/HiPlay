@@ -31,7 +31,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
+import com.shilapi.xcertplay.hicar.HiCarAudioSettings
+import com.shilapi.xcertplay.hicar.HiCarFrameRateMode
 import com.shilapi.xcertplay.hicar.HiCarSpeedVolumeSettings
+import com.shilapi.xcertplay.hicar.HiCarVideoQuality
+import com.shilapi.xcertplay.hicar.HiCarVideoSettings
 import com.shilapi.xcertplay.hicar.HiCarWindowMode
 import kotlin.math.roundToInt
 
@@ -57,6 +61,12 @@ internal fun HiCarSettingsScreen(
     onSpeed: (HiCarSpeedVolumeSettings) -> Unit,
     mediaKeys: Boolean,
     onMediaKeys: (Boolean) -> Unit,
+    video: HiCarVideoSettings,
+    onVideo: (HiCarVideoSettings) -> Unit,
+    audio: HiCarAudioSettings,
+    onAudio: (HiCarAudioSettings) -> Unit,
+    onPreviewMedia: () -> Unit,
+    onPreviewNavigation: () -> Unit,
     onClose: () -> Unit,
     connection: @Composable ColumnScope.() -> Unit,
     diagnostics: @Composable ColumnScope.() -> Unit,
@@ -105,8 +115,12 @@ internal fun HiCarSettingsScreen(
                 style = MaterialTheme.typography.bodySmall,
             )
 
+            Section("画面质量")
+            VideoQuality(video = video, onChange = onVideo)
+
             Section("声音")
             SpeedVolume(speed = speed, onChange = onSpeed)
+            AudioChannels(audio = audio, onChange = onAudio, onPreviewMedia = onPreviewMedia, onPreviewNavigation = onPreviewNavigation)
 
             Section("按键")
             Row(
@@ -137,12 +151,123 @@ internal fun HiCarSettingsScreen(
 
             Section("关于")
             Text(
-                "HiCar 接收端（实验）。画面、声音与触控链路已连通，方向盘按键与 HUD 尚未实现；" +
-                    "无线连接为 5 GHz 热点，车机不需要前装 HiCar。",
+                "HiCar 接收端（实验）。无线链路（5 GHz 热点 + 蓝牙认证）已实车连通；方向盘按键、" +
+                    "多指触控、随速音量、画面档位、扫码配对已加入。多指触控与有线连接还没有实车验证，" +
+                    "相关设置标了「实验」。HUD 与仪表盘输出未实现。",
                 style = MaterialTheme.typography.bodySmall,
             )
             Box(Modifier.height(16.dp))
         }
+    }
+}
+
+/**
+ * Sharpness and frame rate.
+ *
+ * Both are answered once, during the RTSP handshake, so unlike everything else on this page they do
+ * not take effect until the next connection — which the note under them says, because a setting that
+ * silently waits is a setting the driver will press twice.
+ */
+@Composable
+private fun VideoQuality(video: HiCarVideoSettings, onChange: (HiCarVideoSettings) -> Unit) {
+    for (quality in HiCarVideoQuality.values()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { onChange(video.copy(quality = quality)) },
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            RadioButton(
+                selected = video.quality == quality,
+                onClick = { onChange(video.copy(quality = quality)) },
+            )
+            Column {
+                Text(quality.title, style = MaterialTheme.typography.bodyLarge)
+                Text(quality.detail, style = MaterialTheme.typography.bodySmall)
+            }
+        }
+    }
+    Text("帧率", style = MaterialTheme.typography.bodyLarge)
+    for (mode in HiCarFrameRateMode.values()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { onChange(video.copy(frameRate = mode)) },
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            RadioButton(
+                selected = video.frameRate == mode,
+                onClick = { onChange(video.copy(frameRate = mode)) },
+            )
+            Column {
+                Text(mode.title, style = MaterialTheme.typography.bodyMedium)
+                Text(mode.detail, style = MaterialTheme.typography.bodySmall)
+            }
+        }
+    }
+    Text(
+        "这两项在连接建立时一次性告诉手机，改动从下次连接开始生效（连接中改会让当前会话保持原样）。" +
+            "清晰度降低分辨率与码率；帧率跟随屏幕时，60 Hz 屏要 60 帧，90/120 Hz 依次提高。",
+        style = MaterialTheme.typography.bodySmall,
+    )
+}
+
+/**
+ * Which head unit channel music and guidance go to.
+ *
+ * Zero means "let the system pick by usage", which is what the receiver did before and what works on
+ * a unit without special channels. A number is a legacy stream type: 3 is music, 5 notification, and
+ * 11 and up are vendor additions where a car unit usually puts its own navigation speaker. The
+ * preview exists because a number that "works" can still be the same speaker as another number on a
+ * unit whose amplifier maps several streams onto one output.
+ */
+@Composable
+private fun AudioChannels(
+    audio: HiCarAudioSettings,
+    onChange: (HiCarAudioSettings) -> Unit,
+    onPreviewMedia: () -> Unit,
+    onPreviewNavigation: () -> Unit,
+) {
+    Text(
+        "车机自己的导航声道一般不在标准列表里（大多是 11 及以上的编号）。不确定就留在「自动」，" +
+            "再用下面的试听确认这个编号到底从哪个喇叭出来。",
+        style = MaterialTheme.typography.bodySmall,
+    )
+    ChannelRow(
+        label = "音乐声道",
+        value = audio.mediaStream,
+        onChange = { onChange(audio.copy(mediaStream = it)) },
+    )
+    ChannelRow(
+        label = "导航声道",
+        value = audio.navigationStream,
+        onChange = { onChange(audio.copy(navigationStream = it)) },
+    )
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        TextButton(onClick = onPreviewMedia) { Text("试听音乐声道") }
+        TextButton(onClick = onPreviewNavigation) { Text("试听导航声道") }
+    }
+    Text(
+        "导航播报时，音乐会被压低到约三分之一，而不是和播报抢焦点；播报结束后自动恢复。" +
+            "这条只在手机把导航单独分出来时有效，混在音乐里的导航只能整条压低。",
+        style = MaterialTheme.typography.bodySmall,
+    )
+}
+
+@Composable
+private fun ChannelRow(label: String, value: Int, onChange: (Int) -> Unit) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Text(
+            "$label：${HiCarAudioSettings.label(value)}",
+            style = MaterialTheme.typography.bodyMedium,
+        )
+        Slider(
+            value = value.toFloat(),
+            onValueChange = { onChange(it.roundToInt()) },
+            valueRange = 0f..HiCarAudioSettings.MAX_STREAM.toFloat(),
+            // 21 steps: automatic plus the twenty stream numbers a unit might use.
+            steps = HiCarAudioSettings.MAX_STREAM - 1,
+        )
     }
 }
 

@@ -1,5 +1,36 @@
 # Unreleased — HiCar only
 
+- Multi-touch: a touch packet now carries **every** finger down (up to ten), as a snapshot the phone
+  diffs against the previous one. `ACTION_POINTER_DOWN`/`ACTION_POINTER_UP` go out as moves, only the
+  first down starts a gesture and only the last up ends it, so a pinch on the phone's map works. The
+  14-byte single-contact body with its timestamp is gone: it cannot express two fingers, and the
+  reference implementation that runs on a real car sends the snapshot form.
+- Picture quality: three sharpness steps (720p ceiling and a lower bitrate, the screen's largest step,
+  or the same size with more bits) and a frame rate that follows the panel's refresh rate by default
+  (quantised to 30/60/90/120) or is pinned to 30/60. Answered once per connection, and the settings
+  page says so.
+- Audio split by purpose: each route (music, navigation, prompt, call, ringtone) gets its own queue,
+  decoder and track; a non-media lane making a sound drops the music to about a third locally instead
+  of asking for a second audio focus — two requests from one app do not duck each other, they fight.
+  Music and navigation channels can each be pinned to a legacy stream number (0 = automatic) and
+  previewed with a short tone, which is the only way to find a vendor's navigation speaker.
+- Pairing QR code on the setup page: `hicar://car/connect?…&mac=…&pin=…&ability=6`, rebuilt whenever
+  the model, the head unit's Bluetooth address or the PIN changes; a placeholder address is refused
+  with a sentence rather than drawn into a code that scans and connects to nothing.
+- The access point opens **after** HiChain instead of before the advertisement, and a Wi-Fi
+  negotiation frame that arrives first waits for it. A receiver with no phone in the car no longer
+  takes the radio and drops the head unit's own Wi-Fi for nothing.
+- Redial: when a known phone's Bluetooth link comes up, this side dials its `0xFE35` service — the
+  reverse direction, which is the only answer to a phone that never dials on its own. Only phones
+  that completed a session, at most one attempt per 20 s.
+- Wired HiCar driven from user space: NCM interface claim, NTB16 framing, ARP replies, a `VpnService`
+  TUN and two transport threads. Off by default — no part of it has run against a phone; see
+  `docs/HICAR_WIRED.md`.
+- Optional accessibility service that presses "允许" on the system's USB permission dialog, matching
+  only a window that mentions USB **and** has a confirming button.
+- The head unit's own Wi-Fi is asked back when the receiver stops (Android 10+ refuses, and the log
+  says so and points at the Wi-Fi settings screen).
+
 - Forward the car's steering-wheel and media keys to the phone, ported from OpenHC: media key
   events (play/pause, stop, next, previous, rewind, fast-forward, play, pause) become UIBC key
   packets, with the pairing rules that keep a held key from sticking — auto-repeat swallowed, a

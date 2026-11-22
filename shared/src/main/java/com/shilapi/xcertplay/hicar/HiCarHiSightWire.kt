@@ -47,11 +47,21 @@ internal class HiCarHiSightWire(
      * sending anyway is how a steering wheel ends up doing nothing with no explanation in the log.
      */
     private val onInputSelection: (Boolean) -> Unit = {},
+    /**
+     * Sharpness and frame rate for this session.
+     *
+     * Answered once, in the capability reply, so a change only lands on the next connection; the
+     * settings page says so next to the two controls.
+     */
+    private val video: HiCarVideoSettings = HiCarVideoSettings(),
+    /** The panel's refresh rate, used when the frame rate follows the display. */
+    private val refreshHz: Float = 60f,
 ) {
     private val cipher = HiCarRecordCipher(sessionKey, MAX_RECORD_BYTES)
     private var buffer = ByteArray(0)
     private var encrypted = false
     private var optionsSent = false
+    private var offerLogged = false
     private var failed = false
     private var teardown = false
     private var target = "*"
@@ -264,10 +274,20 @@ internal class HiCarHiSightWire(
                 }
                 val caps = LinkedHashMap<String, String>()
                 caps["his_version"] = "1.0"
-                caps["his_video_formats"] =
-                    "codecs 1;fps 30;gop 30;bitrate 2000000;vbr-min 1000000;vbr-max 3000000;" +
-                        "dpi ${HiCarDisplaySize.densityFor(size.width)};scr-w ${size.width};" +
-                        "scr-h ${size.height};width ${size.width};height ${size.height}"
+                val offer = video.offer(size, refreshHz)
+                caps["his_video_formats"] = offer.formats(
+                    density = HiCarDisplaySize.densityFor(offer.width),
+                    screenWidth = size.width,
+                    screenHeight = size.height,
+                )
+                if (!offerLogged) {
+                    offerLogged = true
+                    onLog(
+                        "HiSight: offering ${offer.width}x${offer.height} at ${offer.fps} fps, " +
+                            "${offer.bitrate / 1000} kbps (${video.quality.stored}, " +
+                            "frame rate ${video.frameRate.stored})",
+                    )
+                }
                 caps["his_device_type"] = "device_type 4;subtype 0;"
                 if (withInput) {
                     caps["his_uibc_capability"] =

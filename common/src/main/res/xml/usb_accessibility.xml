@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    The USB prompt is a window, and the only event this service needs is "a window appeared". No
+    content is requested beyond what the dialog itself shows, and no other event type is subscribed.
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagDefault"
+    android:canRetrieveWindowContent="true"
+    android:description="@string/usb_accessibility_description"
+    android:notificationTimeout="300"
+    android:settingsActivity="com.shilapi.xcertplay.HiCarHostActivity" />

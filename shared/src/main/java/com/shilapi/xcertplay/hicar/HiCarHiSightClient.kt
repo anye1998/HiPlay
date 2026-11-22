@@ -38,6 +38,10 @@ internal class HiCarHiSightClient(
     private val displaySize: HiCarDisplaySize = HiCarDisplaySize.BASE,
     /** Fired when the phone's capability answer says whether it will accept key events. */
     private val onKeyInputSelected: (Boolean) -> Unit = {},
+    /** Sharpness and frame rate offered for this session. */
+    private val videoSettings: HiCarVideoSettings = HiCarVideoSettings(),
+    /** The panel's refresh rate; read by the controller, which has the window manager. */
+    private val refreshHz: Float = 60f,
 ) : AutoCloseable {
     private var key: ByteArray? = sessionKey.copyOf()
     private var control: Socket? = null
@@ -68,6 +72,8 @@ internal class HiCarHiSightClient(
                     withInput = true,
                     size = displaySize,
                     onInputSelection = onKeyInputSelected,
+                    video = videoSettings,
+                    refreshHz = refreshHz,
                 )
             } finally {
                 sessionKey.fill(0)
