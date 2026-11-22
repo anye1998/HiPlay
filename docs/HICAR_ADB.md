@@ -51,7 +51,7 @@ adb shell "cat /data/misc/bluedroid/bt_config.conf | grep -iE '^Address|IRK|Name
 ```bash
 adb install -r mobile-debug.apk
 # 桌面图标名是 "HiCar（实验）"；直接点名启动：
-adb shell am start -n com.shihab.diplay.hudtest/com.shilapi.xcertplay.HiCarLauncherAlias
+adb shell am start -n com.anye1998.hiplay/com.shilapi.xcertplay.HiCarLauncherAlias
 adb logcat -c && adb logcat -s HiCar
 ```
 

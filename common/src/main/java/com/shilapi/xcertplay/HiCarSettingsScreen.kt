@@ -58,6 +58,9 @@ import kotlin.math.roundToInt
 internal fun HiCarSettingsScreen(
     windowMode: HiCarWindowMode,
     onWindowMode: (HiCarWindowMode) -> Unit,
+    /** Whether a session is running, which decides if re-encoding can be offered at all. */
+    inSession: Boolean,
+    onReapplyDisplay: () -> Unit,
     speed: HiCarSpeedVolumeSettings,
     onSpeed: (HiCarSpeedVolumeSettings) -> Unit,
     /** Which source is answering right now; empty until a session runs. */
@@ -113,10 +116,24 @@ internal fun HiCarSettingsScreen(
                 }
             }
             Text(
-                "画面始终按手机的分辨率等比缩放，只在多出来的地方留黑边，不会被拉伸。" +
-                    "选择保留系统栏时，画面会被挤小一点，但不会被系统栏盖住。",
+                "画面始终按手机的宽高比等比缩放，不会被拉伸。保留系统栏时，画面会被挤小一点，" +
+                    "但不会被系统栏盖住。",
                 style = MaterialTheme.typography.bodySmall,
             )
+            Text(
+                "手机的画面尺寸是在连接建立时一次性谈定的（RTSP 握手里的 his_video_formats），" +
+                    "这个协议没有「现在换一个尺寸重编」的消息，所以连接中开关系统栏只会重新排布窗口、" +
+                    "等比缩放，不会让手机重新编码。下次连接会按当前剩余区域协商（例如打开状态栏后是 " +
+                    "1920×1032，而不是 16:9 的 1920×1080）；手机如果坚持自己的比例，仍然会留一点黑边。",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            if (inSession) {
+                Button(onClick = onReapplyDisplay) { Text("按当前区域重新取画面（会重连）") }
+                Text(
+                    "会停止并重新开始接收端，手机上正在播放的声音和通话会中断，已配对的手机会自动回连。",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
 
             Section("画面质量")
             VideoQuality(video = video, onChange = onVideo)

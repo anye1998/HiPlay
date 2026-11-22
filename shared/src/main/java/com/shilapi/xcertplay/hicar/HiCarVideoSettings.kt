@@ -121,16 +121,19 @@ data class HiCarVideoSettings(
     val frameRate: HiCarFrameRateMode = HiCarFrameRateMode.FOLLOW_DISPLAY,
 ) {
     /**
-     * The picture geometry to offer, given the screen it will be shown on.
+     * The picture geometry to offer, given the area it will be shown in.
      *
-     * A phone that accepts the offer gets a picture that is already the right shape, so the receiver
-     * never has to scale a larger stream down to a small panel — which is most of the cost on these
-     * head units. [HiCarDisplaySize.best] still has the last word, so a 720p screen is never offered
-     * more than it can show.
+     * The area is the panel minus whichever system bars the display mode leaves visible, so it is
+     * not always 16:9. Offering its own shape is what lets the phone encode a picture that fills the
+     * window: a fixed 16:9 step in a 1920×1032 area is letterboxed back to 1834×1032, and those side
+     * bars are exactly the waste this avoids. [quality] still caps the size, so a 720p screen or the
+     * 流畅 step is never offered more than it should encode.
      */
-    fun offerSize(screen: HiCarDisplaySize): HiCarDisplaySize = HiCarDisplaySize.best(
-        minOf(screen.width, quality.maxWidth),
-        minOf(screen.height, quality.maxHeight),
+    fun offerSize(screen: HiCarDisplaySize): HiCarDisplaySize = HiCarDisplaySize.fitTo(
+        width = screen.width,
+        height = screen.height,
+        maxWidth = minOf(screen.width, quality.maxWidth),
+        maxHeight = minOf(screen.height, quality.maxHeight),
     )
 
     /**

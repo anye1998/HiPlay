@@ -16,7 +16,7 @@
 | --- | --- | --- |
 | `common` | `common/` | 应用 UI、设置页、诊断、更新模块、`AndroidManifest.xml` 中绝大多数组件声明 |
 | `shared` | `shared/` | **协议栈本体**：AirPlay / iAP2 / MFi / USB / Wi-Fi / 媒体管线 / 会话编排 |
-| `mobile` | `mobile/` | 唯一带 `applicationId = com.shihab.diplay` 的 APK 壳；只有清单、资源、签名配置，**没有 Java/Kotlin 源文件** |
+| `mobile` | `mobile/` | 唯一带 `applicationId = com.anye1998.hiplay` 的 APK 壳；只有清单、资源、签名配置，**没有 Java/Kotlin 源文件** |
 | `automotive` | `automotive/` | Car App Library 变体（`MyCarAppService` 在 `mobile` 清单里被 `tools:node="remove"` 掉） |
 | `samples/maphost`、`samples/home` | `samples/` | 示例工程，与协议无关 |
 | `site` | `site/` | 项目网页（GitHub Pages） |

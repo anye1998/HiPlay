@@ -58,6 +58,43 @@ class HiCarVideoAndTouchTest {
     }
 
     @Test
+    fun `the area a status bar leaves is offered as it is, not snapped back to sixteen by nine`() {
+        val withBar = HiCarDisplaySize(1920, 1032)
+        val offer = HiCarVideoSettings().offer(withBar, 60f)
+        assertEquals(1920, offer.width)
+        assertEquals(1032, offer.height)
+        // A phone that honours this offer sends the window's exact shape, so the fit has no bars.
+        val fit = HiCarVideoFit.fit(
+            HiCarVideoFit.aspectOf(offer.width, offer.height),
+            withBar.width.toFloat(),
+            withBar.height.toFloat(),
+        )
+        assertEquals(1920f, fit.width, 0.5f)
+        assertEquals(1032f, fit.height, 0.5f)
+    }
+
+    @Test
+    fun `an odd content height is rounded down to what an encoder accepts`() {
+        val offer = HiCarVideoSettings().offer(HiCarDisplaySize(1920, 1031), 60f)
+        assertEquals(1920, offer.width)
+        assertEquals(1030, offer.height)
+    }
+
+    @Test
+    fun `smooth scales the content area without changing its shape`() {
+        val offer = HiCarVideoSettings(quality = HiCarVideoQuality.SMOOTH)
+            .offer(HiCarDisplaySize(1920, 1032), 60f)
+        assertEquals(1280, offer.width)
+        assertEquals(688, offer.height)
+    }
+
+    @Test
+    fun `a degenerate area falls back to the proven geometry`() {
+        assertEquals(HiCarDisplaySize.BASE, HiCarDisplaySize.fitTo(0, -3, 1920, 1080))
+        assertEquals(HiCarDisplaySize.BASE, HiCarDisplaySize.fitTo(1920, 1080, 0, 0))
+    }
+
+    @Test
     fun `frame rate follows the panel but is quantised to what phones encode`() {
         val settings = HiCarVideoSettings()
         // 59.94 Hz is a 60 Hz panel with an HDMI clock behind it; 0 Hz is what a dead bridge reports.

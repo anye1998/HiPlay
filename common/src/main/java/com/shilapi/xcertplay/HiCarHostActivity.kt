@@ -66,6 +66,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -363,6 +364,8 @@ class HiCarHostActivity : ComponentActivity() {
                 HiCarSettingsScreen(
                     windowMode = windowMode,
                     onWindowMode = ::selectWindowMode,
+                    inSession = inSession,
+                    onReapplyDisplay = ::reapplyDisplay,
                     speed = speedSettings,
                     onSpeed = ::applySpeedSettings,
                     speedStatus = speedStatus,
@@ -741,7 +744,36 @@ class HiCarHostActivity : ComponentActivity() {
         windowMode = mode
         HiCarDisplaySettings.save(this, mode)
         applyWindowMode()
-        appendLog("display: window mode ${mode.stored} (${mode.title})")
+        appendLog(
+            "display: window mode ${mode.stored} (${mode.title}); the phone's geometry was fixed at " +
+                "its handshake, so this session keeps its shape and the next connection measures " +
+                "the visible area again",
+        )
+    }
+
+    /**
+     * Reconnects so the phone encodes for the area that is visible now.
+     *
+     * `his_video_formats` is answered once, in the HiSight handshake, and the phone's encoder keeps
+     * that geometry until the session ends. There is no message in this protocol for "encode a
+     * different size now", and the video port itself is handed out per DMSDP negotiation, so the only
+     * honest way to get a new shape is a new session. That is disruptive, which is why it is a button
+     * with the cost written on it, not something a bar toggle does behind the driver's back.
+     */
+    private fun reapplyDisplay() {
+        if (!running) {
+            appendLog("display: not connected; the next connection already uses the current area")
+            return
+        }
+        stopReceiver()
+        // The controller releases its listeners and adapter on Stop; starting from inside Stop's own
+        // call stack would race that cleanup, so the restart is a posted turn of the main thread.
+        window.decorView.postDelayed({
+            if (!running && missingPermissions().isEmpty()) {
+                startReceiver()
+                appendLog("display: reconnected on request so the phone re-encodes for the visible area")
+            }
+        }, RESTART_DELAY_MILLIS)
     }
 
     /** Persists the speed-volume values and pushes them into the audio path that is running now. */
@@ -1056,17 +1088,21 @@ class HiCarHostActivity : ComponentActivity() {
             return
         }
         controller = next
-        // Ask for the sharpest geometry this panel can actually show; the phone may answer with a
-        // different one, and the window ratio follows whatever it really sends.
+        // The area the picture will really occupy, not the whole panel: with a status or navigation
+        // bar left visible the window is shorter, and offering the panel's 16:9 would make the phone
+        // encode a picture this window then has to letterbox. The phone may still ignore the offer;
+        // the decoder's output stays authoritative and the window follows it.
         val screen = realScreenPixels()
-        val requested = HiCarDisplaySize.best(screen[0], screen[1])
+        val content = contentPixels()
+        val requested = videoSettings.offerSize(HiCarDisplaySize(content[0], content[1]))
         next.setDisplaySize(requested)
         videoAspect = requested.aspect
         val window = resources.displayMetrics
         appendLog(
             "display: offering ${requested.width}×${requested.height} at " +
                 "${HiCarDisplaySize.densityFor(requested.width)} dpi " +
-                "(panel ${screen[0]}×${screen[1]}, window ${window.widthPixels}×${window.heightPixels})",
+                "(panel ${screen[0]}×${screen[1]}, content ${content[0]}×${content[1]}, " +
+                "window ${window.widthPixels}×${window.heightPixels})",
         )
         next.start()
         // The view already exists on this screen; attach it so the first frame has somewhere to go.
@@ -1092,6 +1128,42 @@ class HiCarHostActivity : ComponentActivity() {
         }
         val fallback = resources.displayMetrics
         return intArrayOf(fallback.widthPixels, fallback.heightPixels)
+    }
+
+    /**
+     * The pixels the picture may occupy under the current display mode.
+     *
+     * `HiCarWindowMode` decides which bars stay visible, and a visible bar is *not* drawn over the
+     * picture: `Content()` pads the layout by the same inset, so the image is laid out in the smaller
+     * rectangle. That rectangle is what the phone has to encode for, which is why this is measured
+     * separately from the panel.
+     *
+     * The insets come from the window, in pixels, so a landscape unit whose navigation bar sits on
+     * the side is handled by subtracting left/right as well as top/bottom. Before the first layout
+     * the insets are unknown and the panel is returned; a session cannot start before the start
+     * button exists, so in practice the measurement is always available.
+     */
+    private fun contentPixels(): IntArray {
+        val panel = realScreenPixels()
+        val insets = runCatching { ViewCompat.getRootWindowInsets(window.decorView) }.getOrNull()
+        val status = if (windowMode.showsStatusBar) {
+            insets?.getInsets(WindowInsetsCompat.Type.statusBars())
+        } else {
+            null
+        }
+        val navigation = if (windowMode.showsNavigationBar) {
+            insets?.getInsets(WindowInsetsCompat.Type.navigationBars())
+        } else {
+            null
+        }
+        val horizontal = (status?.left ?: 0) + (status?.right ?: 0) +
+            (navigation?.left ?: 0) + (navigation?.right ?: 0)
+        val vertical = (status?.top ?: 0) + (status?.bottom ?: 0) +
+            (navigation?.top ?: 0) + (navigation?.bottom ?: 0)
+        return intArrayOf(
+            (panel[0] - horizontal).coerceAtLeast(2),
+            (panel[1] - vertical).coerceAtLeast(2),
+        )
     }
 
     /**
@@ -1732,6 +1804,14 @@ class HiCarHostActivity : ComponentActivity() {
          * it is an alias of this activity rather than an activity of its own.
          */
         const val SETTINGS_ALIAS = "com.shilapi.xcertplay.HiCarSettingsAlias"
+
+        /**
+         * How long Stop gets to release the adapter and listeners before Start runs again.
+         *
+         * The reference receiver's own reconnect path waits about this long; starting immediately
+         * lands while the previous round's sockets are still closing.
+         */
+        const val RESTART_DELAY_MILLIS = 1_200L
 
         /**
          * The model id a real phone prompts on.

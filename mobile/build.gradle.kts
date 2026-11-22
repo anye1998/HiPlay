@@ -14,7 +14,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.shihab.diplay"
+        applicationId = "com.anye1998.hiplay"
         minSdk = 24
         targetSdk = 37
         versionCode = 41
@@ -43,8 +43,11 @@ android {
 
     buildTypes {
         debug {
-            applicationIdSuffix = ".hudtest"
-            versionNameSuffix = "-hud-test"
+            // No applicationId suffix: the receiver is installed under its real name
+            // (com.anye1998.hiplay) so `adb shell am start -n com.anye1998.hiplay/...` and the two
+            // launcher aliases are the same in a test build and a release build. A debug build and a
+            // release build therefore cannot sit side by side.
+            versionNameSuffix = "-debug"
             // A car-side build must keep one signing identity across rebuilds. Android derives the
             // app UID from the signature, and the HiChain keystore (app_hicar-huks) is encrypted
             // against that UID: re-signing with a fresh debug key makes the stored pairing keys

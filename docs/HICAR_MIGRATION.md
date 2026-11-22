@@ -721,7 +721,7 @@ HiCar sniff: 3 0xFDEE advertisement(s) captured; payloads below
 这是"公开还是私有"的最终判据，不依赖任何推断。
 
 为此本轮把应用日志**镜像到 logcat**（tag `HiCar`）：车机上 `adb logcat -s HiCar` 与界面日志逐行一致，
-不用截图、不用导出文件。组件名也记在清单里（`com.shihab.diplay.hudtest/com.shilapi.xcertplay.HiCarLauncherAlias`）。
+不用截图、不用导出文件。组件名也记在清单里（`com.anye1998.hiplay/com.shilapi.xcertplay.HiCarLauncherAlias`）。
 
 **适用范围更正（15:05）**：7.12 的"拿真车机当对照样本"前提是那台车机**自带 HiCar**。本项目实际使用的车机
 **没有前装 HiCar**（用户确认），所以它没有可采集的 HiCar 广播——对它正确的做法是反过来：把本 APK 直接装上去当

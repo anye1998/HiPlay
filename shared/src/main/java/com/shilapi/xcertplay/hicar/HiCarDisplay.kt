@@ -6,7 +6,10 @@ package com.shilapi.xcertplay.hicar
  * Two sizes matter and they are not the same thing:
  *
  * - **offered** — what this receiver tells the phone it can show, in `his_video_formats`. It is
- *   chosen once per session from the screen it will be presented on, and 1080p is the ceiling.
+ *   chosen once per session from the area the picture will actually occupy — the panel minus the
+ *   status and navigation bars the chosen display mode leaves visible — and 1080p is the ceiling.
+ *   Because that area is not necessarily 16:9, the offer follows its shape rather than a fixed step;
+ *   a phone that honours it sends a picture that fills the window exactly.
  * - **actual** — what the phone really encodes. It arrives in the decoder's output format and is
  *   authoritative: a phone is free to ignore the offer and send its own shape (many send the
  *   handset's aspect with letterboxing). The window ratio and the touch mapping both follow this
@@ -54,6 +57,30 @@ data class HiCarDisplaySize(val width: Int, val height: Int) {
          */
         fun best(screenWidth: Int, screenHeight: Int): HiCarDisplaySize =
             STEPS.firstOrNull { it.width <= screenWidth && it.height <= screenHeight } ?: BASE
+
+        /**
+         * The area itself, scaled down to fit [maxWidth]×[maxHeight] while keeping its shape.
+         *
+         * Used when the display mode leaves a status or navigation bar on screen: the area that is
+         * really available is not 16:9 any more, and offering a 16:9 step would make the phone encode
+         * a picture that has to be letterboxed back into a slightly different rectangle. A phone that
+         * honours this offer sends exactly the window's shape, so nothing is wasted on black bars.
+         *
+         * Dimensions are rounded down to even numbers because H.264 encoders reject an odd width or
+         * height, and clamped so a degenerate inset (a bar taller than the screen) still yields a
+         * usable size rather than an exception.
+         */
+        fun fitTo(width: Int, height: Int, maxWidth: Int, maxHeight: Int): HiCarDisplaySize {
+            if (width <= 0 || height <= 0 || maxWidth <= 0 || maxHeight <= 0) return BASE
+            val limit = minOf(
+                1.0,
+                maxWidth.toDouble() / width,
+                maxHeight.toDouble() / height,
+            )
+            val scaledWidth = (width * limit).toInt().coerceAtLeast(2) and 1.inv()
+            val scaledHeight = (height * limit).toInt().coerceAtLeast(2) and 1.inv()
+            return HiCarDisplaySize(scaledWidth, scaledHeight)
+        }
 
         /**
          * The render density that keeps UI elements the size they were at 800×480.

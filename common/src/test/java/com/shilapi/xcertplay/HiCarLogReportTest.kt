@@ -12,7 +12,7 @@ class HiCarLogReportTest {
         audit: List<String> = listOf("--- device audit ---", "--- end of device audit ---"),
     ) = HiCarLogEnvironment(
         generated = "2026-11-13 14:30:00 +0800",
-        applicationId = "com.shihab.diplay.hudtest",
+        applicationId = "com.anye1998.hiplay",
         versionName = "1.4.2",
         versionCode = 142L,
         androidRelease = "13",
@@ -31,7 +31,7 @@ class HiCarLogReportTest {
     fun reportStatesTheBuildDeviceAndAdvertisedModel() {
         val report = hicarLogReport(environment(), listOf("line one"), droppedLines = 0)
         assertTrue(report.startsWith("HiCar receiver bring-up log"))
-        assertTrue(report.contains("app: com.shihab.diplay.hudtest 1.4.2 (142)"))
+        assertTrue(report.contains("app: com.anye1998.hiplay 1.4.2 (142)"))
         assertTrue(report.contains("android: 13 (SDK 33), BYD DiLink 4.0"))
         assertTrue(report.contains("advertised model: A1B2C3D4"))
         assertTrue(report.contains("identity: 0f1e2d3c4b5a6978"))

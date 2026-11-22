@@ -73,8 +73,8 @@ Check that this file exists:
 mobile/build/outputs/apk/debug/mobile-debug.apk
 ```
 
-The debug application ID is `com.shihab.diplay.hudtest`.
-The release application ID is `com.shihab.diplay`.
+The debug and release application ID is `com.anye1998.hiplay`; a debug build carries the
+`-debug` version-name suffix instead of a separate ID, so the two cannot be installed side by side.
 
 The source APK contains no accessory identity unless you supply runtime authentication assets.
 Standalone CarPlay needs these assets to connect to an iPhone.

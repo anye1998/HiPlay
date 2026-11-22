@@ -1,5 +1,17 @@
 # Unreleased — HiCar only
 
+- The picture geometry offered to the phone now follows the area the window really has: the panel
+  minus the status and navigation bars the display mode leaves visible (`contentPixels()` →
+  `HiCarDisplaySize.fitTo()`), instead of snapping to a 16:9 step. A 1920×1032 area is offered as
+  1920×1032, so a phone that accepts the offer fills the window instead of being letterboxed into
+  it. The handshake is still once per session, so a mode change re-lays out the current picture and
+  the new shape lands on the next connection; Settings → 显示 has a "按当前区域重新取画面（会重连）"
+  button for the driver who wants it immediately.
+- The application ID is now `com.anye1998.hiplay` (was `com.shihab.diplay`), and the debug build no
+  longer appends `.hudtest`: one ID for both builds, with a `-debug` version-name suffix. An existing
+  install keeps its data under the old ID; the new ID starts with a fresh data directory, so the
+  phone has to pair once more.
+
 - Speed gain reaches guidance and calls: each of the three lanes has its own switch (music always
   follows), and the sink keeps a separate dB value per lane instead of one for media. Turning one off
   during a session zeroes that lane on the next PCM block, without touching the others.
