@@ -315,7 +315,7 @@
     "name": "繁體中文（台灣）",
     "installGuide": "docs/INSTALL.zh-TW.md",
     "privacyGuide": "docs/PRIVACY.zh-TW.md",
-    "readme": "README.zh-TW.md",
+    "readme": "README.md",
     "dir": "ltr",
     "tag": "獨立社群專案",
     "badge": "公開預覽版",

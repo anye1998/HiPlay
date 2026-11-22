@@ -11,8 +11,10 @@
   already expanded. It is an `activity-alias`, not a second activity: a second activity would pause
   the receiver and black out the mirrored picture. The activity recognises the alias in its intent's
   component, and `singleTask` + `onNewIntent` make the icon work mid-session.
-- README rewritten for the receiver: what is verified on a car, what is only unit-tested, the
-  requirement table, install and build steps, and the credits that the ports require.
+- README rewritten for the receiver, in Chinese only: what is verified on a car, what is only
+  unit-tested, the requirement table, install and build steps, and the credits that the ports
+  require. The English and Traditional Chinese READMEs are gone; `docs/LOCALIZATION.zh-TW.md` still
+  covers the Traditional docs under `docs/`.
 
 - Multi-touch: a touch packet now carries **every** finger down (up to ten), as a snapshot the phone
   diffs against the previous one. `ACTION_POINTER_DOWN`/`ACTION_POINTER_UP` go out as moves, only the
