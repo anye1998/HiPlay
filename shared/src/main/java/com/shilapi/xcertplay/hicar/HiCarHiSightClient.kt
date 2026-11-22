@@ -36,6 +36,8 @@ internal class HiCarHiSightClient(
     private val onVideoConnected: () -> Unit = {},
     /** The geometry offered to the phone; the decoder's output overrides it once frames arrive. */
     private val displaySize: HiCarDisplaySize = HiCarDisplaySize.BASE,
+    /** Fired when the phone's capability answer says whether it will accept key events. */
+    private val onKeyInputSelected: (Boolean) -> Unit = {},
 ) : AutoCloseable {
     private var key: ByteArray? = sessionKey.copyOf()
     private var control: Socket? = null
@@ -60,7 +62,13 @@ internal class HiCarHiSightClient(
                 // answer false. That was the defect - the phone was never told this receiver can
                 // take touches, so it offered `remotectl_port` (it always does) and then dropped
                 // every encrypted event written to it. The router is consulted per touch instead.
-                HiCarHiSightWire(sessionKey, onLog, withInput = true, size = displaySize)
+                HiCarHiSightWire(
+                    sessionKey,
+                    onLog,
+                    withInput = true,
+                    size = displaySize,
+                    onInputSelection = onKeyInputSelected,
+                )
             } finally {
                 sessionKey.fill(0)
             }

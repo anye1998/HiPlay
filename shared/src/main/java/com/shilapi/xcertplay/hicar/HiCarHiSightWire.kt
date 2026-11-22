@@ -40,6 +40,13 @@ internal class HiCarHiSightWire(
      * still what makes a phone that honours it send a sharper picture.
      */
     private val size: HiCarDisplaySize = HiCarDisplaySize.BASE,
+    /**
+     * Whether the phone selected `left_key_down`/`left_key_up`.
+     *
+     * Its answer to the capability question is the only evidence that a key packet will be honoured;
+     * sending anyway is how a steering wheel ends up doing nothing with no explanation in the log.
+     */
+    private val onInputSelection: (Boolean) -> Unit = {},
 ) {
     private val cipher = HiCarRecordCipher(sessionKey, MAX_RECORD_BYTES)
     private var buffer = ByteArray(0)
@@ -57,6 +64,10 @@ internal class HiCarHiSightWire(
 
     /** The port the phone accepts encrypted UIBC input on; 0 when it did not offer one. */
     var inputPort: Int = 0
+        private set
+
+    /** Whether the phone's `his_uibc_capability` selection included key events. */
+    var keyInputSelected: Boolean = false
         private set
 
     val ended: Boolean get() = teardown
@@ -290,6 +301,7 @@ internal class HiCarHiSightWire(
                         throw HiCarWireException("rtsp duplicate parameter")
                     }
                 }
+                params["his_uibc_capability"]?.let(::noteInputSelection)
                 val url = params["his_presentation_url"]
                 if (url != null) {
                     val candidate = url.split(" ").firstOrNull() ?: ""
@@ -331,6 +343,32 @@ internal class HiCarHiSightWire(
                 )
             }
         }
+    }
+
+    /**
+     * Reads the phone's own answer to [his_uibc_capability].
+     *
+     * The answer is a list of event names the phone is willing to decode. It is logged by name
+     * because "keys do nothing" and "the phone never selected keys" are otherwise indistinguishable
+     * from the car side — the 11:11 session left exactly that question open for touches.
+     */
+    private fun noteInputSelection(value: String) {
+        val events = LinkedHashSet<String>()
+        for (part in value.split(';')) {
+            if (part.substringBefore('=').trim().lowercase(Locale.ROOT) != "generic_cap_list") continue
+            for (event in part.substringAfter('=', "").split(',')) {
+                val name = event.trim().lowercase(Locale.ROOT)
+                if (name.isNotEmpty()) events.add(name)
+            }
+        }
+        val keys = events.contains("left_key_down") && events.contains("left_key_up")
+        keyInputSelected = keys
+        onLog(
+            "HiSight: phone selected input events " +
+                (if (events.isEmpty()) "none" else events.joinToString(",")) +
+                "; key input " + (if (keys) "available" else "not selected, the steering wheel stays on the car"),
+        )
+        onInputSelection(keys)
     }
 
     private fun message(start: String, seq: String, body: String, vararg headers: Pair<String, String>): ByteArray {

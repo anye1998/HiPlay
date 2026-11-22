@@ -86,6 +86,16 @@ class HiCarController(
     private val config: HiCarRuntimeConfig,
     private val report: (HiCarStatus) -> Unit,
     private val onLog: (String) -> Unit = {},
+    /**
+     * Whether the car's media keys can be sent right now.
+     *
+     * True needs both halves: the phone selected key events in its capability answer, and the input
+     * socket exists. The screen uses it to create (and later close) the media-button session, so the
+     * announcement is pushed rather than polled.
+     */
+    private val onKeysReady: (Boolean) -> Unit = {},
+    /** Whether the speaker holds media focus, which decides if the media-button session is raised. */
+    private val onMediaFocus: (Boolean) -> Unit = {},
 ) : Closeable {
     private val appContext = context.applicationContext
     private val running = AtomicBoolean(false)
@@ -144,6 +154,9 @@ class HiCarController(
     /** At most one video session at a time, however many control connections arrive. */
     private val mediaBusy = AtomicBoolean(false)
     private var hisight: HiCarHiSightClient? = null
+
+    /** Whether the phone's `his_uibc_capability` answer included key events. */
+    @Volatile private var keyInputSelected = false
 
     @Volatile private var audioReady = false
     @Volatile private var microphoneReady = false
@@ -508,7 +521,10 @@ class HiCarController(
     /** Whether the microphone may be offered at all; checked again when the phone asks for it. */
     fun microphoneAllowed(): Boolean = config.withMicrophone && HiCarMicrophone.permitted(appContext)
 
-    fun start() {        if (!running.compareAndSet(false, true)) {
+    fun start() {
+        // The channel opens on the HiSight thread and closes with it; the screen posts to its own.
+        input.onReadyChanged = { notifyKeysReady() }
+        if (!running.compareAndSet(false, true)) {
             onLog("HiCar receiver is already running")
             return
         }
@@ -606,6 +622,8 @@ class HiCarController(
         }
         audioReady = false
         microphoneReady = false
+        keyInputSelected = false
+        notifyKeysReady()
         runCatching { hotspot?.close() }
         hotspot = null
         liveNetwork?.authenticated = false
@@ -851,6 +869,8 @@ class HiCarController(
         val sink = HiCarAudioSink(appContext, onLog)
         var receiver: HiCarAudioReceiver? = null
         if (sink.ready) {
+            // The session that receives background buttons is only worth having while this holds.
+            sink.onFocusChanged = { held -> runCatching { onMediaFocus(held) } }
             sink.start()
             try {
                 val created = HiCarAudioReceiver(
@@ -913,6 +933,21 @@ class HiCarController(
                 runCatching { mic?.close() }
             }
         }
+    }
+
+    /** Whether a steering-wheel key can be delivered to the phone at this instant. */
+    fun mediaKeysReady(): Boolean = running.get() && keyInputSelected && input.ready()
+
+    /**
+     * Sends one half of a media key press.
+     *
+     * The phone is what repeats a held key, so a down stays down until the matching up arrives. The
+     * forwarder decides the pairing; this only refuses a key when nothing can carry it.
+     */
+    fun sendMediaKey(code: Int, down: Boolean): Boolean = input.mediaKey(code, down)
+
+    private fun notifyKeysReady() {
+        runCatching { onKeysReady(mediaKeysReady()) }
     }
 
     /**
@@ -986,8 +1021,15 @@ class HiCarController(
             input = input,
             active = { running.get() },
             onLog = onLog,
-            onVideoConnected = { report(HiCarStatus.Streaming) },
+            onVideoConnected = {
+                report(HiCarStatus.Streaming)
+                notifyKeysReady()
+            },
             displaySize = displaySize,
+            onKeyInputSelected = { selected ->
+                keyInputSelected = selected
+                notifyKeysReady()
+            },
         )
         key.fill(0)
         hisight = client

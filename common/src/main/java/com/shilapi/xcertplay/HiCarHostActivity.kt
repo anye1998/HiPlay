@@ -14,6 +14,7 @@ import android.graphics.SurfaceTexture
 import android.provider.Settings
 import android.util.DisplayMetrics
 import android.util.Log
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.TextureView
 import android.view.View
@@ -66,6 +67,9 @@ import androidx.core.content.pm.PackageInfoCompat
 import com.shilapi.xcertplay.hicar.HiCarAdvertisementProbe
 import com.shilapi.xcertplay.hicar.HiCarController
 import com.shilapi.xcertplay.hicar.HiCarDisplaySettings
+import com.shilapi.xcertplay.hicar.HiCarKeySettings
+import com.shilapi.xcertplay.hicar.HiCarMediaKeyForwarder
+import com.shilapi.xcertplay.hicar.HiCarMediaKeySession
 import com.shilapi.xcertplay.hicar.HiCarPermissions
 import com.shilapi.xcertplay.hicar.HiCarRuntimeConfig
 import com.shilapi.xcertplay.hicar.HiCarDisplaySize
@@ -143,6 +147,25 @@ class HiCarHostActivity : ComponentActivity() {
     /** The session overlay's log panel starts closed: the picture is the point of that screen. */
     private var sessionLogVisible by mutableStateOf(false)
 
+    /**
+     * Steering-wheel and media buttons, forwarded to the phone.
+     *
+     * Two entries feed the same forwarder: this window's key events (the receiver is on screen) and a
+     * media-button session (it is not). Both are needed — a driver who switches to the car's own
+     * screen still expects the wheel to control the phone's music.
+     */
+    private val mediaKeys = HiCarMediaKeyForwarder()
+    private var mediaKeySession: HiCarMediaKeySession? = null
+
+    /** Whether the phone and the input socket are both ready for a key. */
+    private var keysReady by mutableStateOf(false)
+
+    /** Whether the speaker holds media focus, which is what makes the whole unit's buttons ours. */
+    private var mediaFocus by mutableStateOf(false)
+
+    /** Whether the driver wants the wheel handed to the phone at all. */
+    private var mediaKeysEnabled by mutableStateOf(true)
+
     /** Longer than [log]: the screen keeps a readable tail, the export keeps the whole attempt. */
     private val history = ArrayList<String>()
     private var droppedFromHistory = 0
@@ -201,6 +224,7 @@ class HiCarHostActivity : ComponentActivity() {
         pin = storedPin()
         microphoneEnabled = storedMicrophone()
         windowMode = HiCarDisplaySettings.load(this)
+        mediaKeysEnabled = HiCarKeySettings.mediaKeysEnabled(this)
         speedSettings = HiCarSpeedVolumeSettings.load(this)
         // Before the first frame, so the activity never appears with the wrong bars and then jumps.
         applyWindowMode()
@@ -217,6 +241,7 @@ class HiCarHostActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        closeMediaKeySession("screen closed")
         sniffer?.close()
         sniffer = null
         controller?.close()
@@ -269,6 +294,8 @@ class HiCarHostActivity : ComponentActivity() {
                     onWindowMode = ::selectWindowMode,
                     speed = speedSettings,
                     onSpeed = ::applySpeedSettings,
+                    mediaKeys = mediaKeysEnabled,
+                    onMediaKeys = ::applyMediaKeysSetting,
                     onClose = { settingsOpen = false },
                     connection = { ConnectionSection() },
                     diagnostics = { DiagnosticsSection() },
@@ -873,11 +900,121 @@ class HiCarHostActivity : ComponentActivity() {
     }
 
     private fun stopReceiver() {
+        // Before the controller: a session left open would keep sending keys to a closed channel.
+        closeMediaKeySession("receiver stopped")
+        keysReady = false
+        mediaFocus = false
         running = false
         controller?.close()
         controller = null
         status = HiCarStatus.Stopped
         appendLog("--- receiver stopped ${SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())} ---")
+    }
+
+    /**
+     * Steering-wheel keys, seen before dispatch.
+     *
+     * While the receiver is on screen this is the only entry: the key arrives here, and consuming it
+     * is what stops the head unit from acting on it too — a "next" that skips both the phone's track
+     * and the car's own radio is worse than either alone.
+     */
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (handleMediaKey(event, "window")) return true
+        return super.dispatchKeyEvent(event)
+    }
+
+    private fun handleMediaKey(event: KeyEvent, source: String): Boolean {
+        if (!mediaKeysEnabled) return false
+        if (event.keyCode !in HiCarMediaKeyForwarder.KEY_CODES) return false
+        // Re-checked here as well as pushed by the controller: the input socket can appear between two
+        // status reports, and a key pressed in that gap must not be dropped silently.
+        mediaKeys.ready = keysReady && mediaKeysEnabled
+        val down = when (event.action) {
+            KeyEvent.ACTION_DOWN -> true
+            KeyEvent.ACTION_UP -> false
+            else -> return false
+        }
+        val result = mediaKeys.onKey(event.keyCode, down, event.repeatCount, event.eventTime)
+        if (event.repeatCount == 0) {
+            appendLog(
+                "keys: ${HiCarMediaKeyForwarder.label(event.keyCode)} " +
+                    "${if (down) "down" else "up"} from $source; ${result.note}",
+            )
+        }
+        deliverKeys(result)
+        return result.handled
+    }
+
+    private fun deliverKeys(result: HiCarMediaKeyForwarder.Result) {
+        if (result.keys.isEmpty()) return
+        val active = controller
+        for (key in result.keys) {
+            val sent = active?.sendMediaKey(key.code, key.down) == true
+            if (!sent) {
+                appendLog(
+                    "keys: ${HiCarMediaKeyForwarder.label(key.code)} " +
+                        "${if (key.down) "down" else "up"} was not sent; no input channel this session",
+                )
+            }
+        }
+    }
+
+    /**
+     * Keeps the media-button session in step with the two things it depends on.
+     *
+     * It exists only while keys are usable **and** the speaker holds media focus: without focus some
+     * other app owns the unit's media buttons, and a session of ours would take them from it.
+     */
+    private fun updateMediaKeySession() {
+        val available = keysReady && mediaKeysEnabled
+        mediaKeys.ready = available
+        val want = available && mediaFocus
+        val open = mediaKeySession
+        if (want && open == null) {
+            mediaKeySession = runCatching { HiCarMediaKeySession(this, KEY_SESSION_TAG, keySessionListener) }
+                .onFailure {
+                    appendLog(
+                        "keys: no media-button session (${it.javaClass.simpleName}); " +
+                            "wheel keys work only while the receiver is on screen",
+                    )
+                }
+                .getOrNull()
+            if (mediaKeySession != null) {
+                appendLog("keys: media-button session open; wheel keys reach the phone in the background too")
+            }
+        } else if (!want && open != null) {
+            closeMediaKeySession(if (!available) "keys unavailable" else "media focus released")
+        }
+    }
+
+    private fun closeMediaKeySession(why: String) {
+        val open = mediaKeySession
+        mediaKeySession = null
+        mediaKeys.ready = false
+        if (open == null) return
+        runCatching { open.close() }
+        appendLog("keys: media-button session closed ($why); the wheel belongs to the car again")
+    }
+
+    private val keySessionListener = object : HiCarMediaKeySession.Listener {
+        override fun onMediaKey(event: KeyEvent): Boolean = handleMediaKey(event, "media session")
+
+        override fun onCommand(command: HiCarMediaKeyForwarder.Command) {
+            val result = mediaKeys.onCommand(command)
+            appendLog(
+                "keys: ${HiCarMediaKeyForwarder.label(command.code)} command from the media session; " +
+                    result.note,
+            )
+            deliverKeys(result)
+        }
+    }
+
+    /** Persists the wheel switch and applies it immediately, session included. */
+    private fun applyMediaKeysSetting(enabled: Boolean) {
+        mediaKeysEnabled = enabled
+        HiCarKeySettings.setMediaKeysEnabled(this, enabled)
+        appendLog("keys: steering wheel forwarding ${if (enabled) "on" else "off"}")
+        updateMediaKeySession()
     }
 
     private fun appendLog(line: String) {
@@ -1275,6 +1412,9 @@ class HiCarHostActivity : ComponentActivity() {
         /** Android key codes sent over UIBC; the phone only accepts these two. */
         const val KEY_HOME = 3
         const val KEY_BACK = 4
+        /** MediaSession tag; appears in `dumpsys media_session` next to the car's own players. */
+        const val KEY_SESSION_TAG = "HiCar"
+
         const val KEY_IDENTITY = "local_identity"
         const val KEY_BLUETOOTH_ADDRESS = "bluetooth_address"
         val PIN_PATTERN = Regex("[0-9]{6}")

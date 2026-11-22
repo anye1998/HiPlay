@@ -64,6 +64,15 @@ internal class HiCarAudioSink(context: Context, private val onLog: (String) -> U
 
     @Volatile private var closed = false
     @Volatile private var focused = true
+
+    /**
+     * Whether this sink currently holds audio focus.
+     *
+     * The screen needs it for one decision: the media-button session exists only while we hold focus,
+     * because that is what makes the whole unit's media keys ours to hand to the phone. Reported from
+     * the focus listener, which Android calls on the main thread.
+     */
+    @Volatile var onFocusChanged: ((Boolean) -> Unit)? = null
     @Volatile private var paused = false
 
     /**
@@ -386,6 +395,7 @@ internal class HiCarAudioSink(context: Context, private val onLog: (String) -> U
                     focused = change == AudioManager.AUDIOFOCUS_GAIN
                     paused = !focused
                     if (!focused) reset()
+                    onFocusChanged?.invoke(focused)
                 }
                 .build()
             focusRequest = request
@@ -397,12 +407,14 @@ internal class HiCarAudioSink(context: Context, private val onLog: (String) -> U
                     focused = change == AudioManager.AUDIOFOCUS_GAIN
                     paused = !focused
                     if (!focused) reset()
+                    onFocusChanged?.invoke(focused)
                 },
                 AudioManager.STREAM_MUSIC,
                 AudioManager.AUDIOFOCUS_GAIN,
             ) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
         }
         if (!focused) onLog("audio: focus unavailable; the speaker service will stay silent until it returns")
+        onFocusChanged?.invoke(focused)
     }
 
     private fun abandonFocus() {

@@ -55,6 +55,8 @@ internal fun HiCarSettingsScreen(
     onWindowMode: (HiCarWindowMode) -> Unit,
     speed: HiCarSpeedVolumeSettings,
     onSpeed: (HiCarSpeedVolumeSettings) -> Unit,
+    mediaKeys: Boolean,
+    onMediaKeys: (Boolean) -> Unit,
     onClose: () -> Unit,
     connection: @Composable ColumnScope.() -> Unit,
     diagnostics: @Composable ColumnScope.() -> Unit,
@@ -105,6 +107,27 @@ internal fun HiCarSettingsScreen(
 
             Section("声音")
             SpeedVolume(speed = speed, onChange = onSpeed)
+
+            Section("按键")
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("方向盘按键转给手机", style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        "上一首、下一首、播放暂停按的是手机的音乐，不是车机自己的收音机",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                Switch(checked = mediaKeys, onCheckedChange = onMediaKeys)
+            }
+            Text(
+                "这条要手机配合：只有它在这次连接里声明了按键事件，车机才发得出去——" +
+                    "日志里会有一行写手机选了什么，选不到时方向盘仍然归车机。关掉这个开关，按键立刻交还车机。",
+                style = MaterialTheme.typography.bodySmall,
+            )
 
             Section("连接")
             connection()

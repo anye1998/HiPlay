@@ -1,5 +1,17 @@
 # Unreleased — HiCar only
 
+- Forward the car's steering-wheel and media keys to the phone, ported from OpenHC: media key
+  events (play/pause, stop, next, previous, rewind, fast-forward, play, pause) become UIBC key
+  packets, with the pairing rules that keep a held key from sticking — auto-repeat swallowed, a
+  missing up patched, an orphan up handed back to the car, and the same event arriving from both
+  the window and the media session forwarded once. A media-button session covers the case where the
+  driver switches away from the receiver, and only exists while the speaker holds media focus.
+- Parse the phone's `his_uibc_capability` answer and log which input events it selected: "the
+  steering wheel does nothing" and "the phone never asked for keys" are now distinguishable.
+- New setting: 方向盘按键转给手机 (on by default), applied immediately, mid-session included.
+- Documented the rest of OpenHC's ideas in `docs/OPENHC_COMPARISON.md` §6 with a priority order;
+  `docs/HICAR_KEYS.md` records what is verified (unit tests, emulator key injection) and what still
+  needs a car (whether the phone selects keys, whether the background session gets them).
 - Remove CarPlay from the inside out: the AirPlay, MFi, iAP2, orchestration, media, location, HUD,
   cluster and Car App Service code, the CarPlay activities and settings screens, their layouts,
   icons and translations, the two sample modules, and their tests. What is left is the HiCar

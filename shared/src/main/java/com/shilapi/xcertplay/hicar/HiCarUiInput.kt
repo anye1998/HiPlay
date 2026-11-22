@@ -66,7 +66,7 @@ internal class HiCarUiInputEncoder(sessionKey: ByteArray) {
             }
 
             HiCarInputEvent.ACTION_KEY_DOWN, HiCarInputEvent.ACTION_KEY_UP -> {
-                if (event.key != KEY_HOME && event.key != KEY_BACK) throw HiCarWireException("unsupported input key")
+                if (event.key !in SUPPORTED_KEYS) throw HiCarWireException("unsupported input key")
                 ByteBuffer.allocate(12).order(ByteOrder.BIG_ENDIAN)
                     .put(event.action.toByte())
                     .putShort(9)
@@ -91,10 +91,21 @@ internal class HiCarUiInputEncoder(sessionKey: ByteArray) {
 
     fun close() = cipher.clear()
 
-    private companion object {
-        const val MAX_RECORD_BYTES = 1_500
+    companion object {
+        private const val MAX_RECORD_BYTES = 1_500
         const val KEY_HOME = 3
         const val KEY_BACK = 4
+
+        /**
+         * The key codes this encoder will put on the wire.
+         *
+         * Home and back were the only two for a long time, because they were the only ones the driver
+         * could ask for. The media keys are added for the steering wheel: they are exactly the ones a
+         * phone accepts *without* being told `source_device_type 7`, so they need no extra
+         * negotiation, and their body bytes are identical either way (modifier bits zero).
+         */
+        val SUPPORTED_KEYS: Set<Int> = setOf(KEY_HOME, KEY_BACK) + HiCarMediaKeyForwarder.KEY_CODES
+
         val MARKER = byteArrayOf(-1, -1, -1, -1, -1, -1)
     }
 }
@@ -115,6 +126,19 @@ internal class HiCarInputRouter {
     private var pressed = false
     private var x = 0
     private var y = 0
+
+    /** Media keys the phone believes are down; a session that ends must lift them. */
+    private val pressedKeys = LinkedHashSet<Int>()
+
+    /**
+     * Called when the input channel appears or goes away.
+     *
+     * Key forwarding has to know this: a phone that selected key events still cannot receive one
+     * until the socket exists, and the session that receives background buttons is only worth
+     * creating once it can actually send.
+     */
+    @Volatile
+    var onReadyChanged: ((Boolean) -> Unit)? = null
 
     /**
      * The coordinate space touches are expressed in.
@@ -143,6 +167,8 @@ internal class HiCarInputRouter {
     fun attach(next: Sender) {
         sender = next
         pressed = false
+        pressedKeys.clear()
+        onReadyChanged?.invoke(true)
     }
 
     @Synchronized
@@ -150,6 +176,8 @@ internal class HiCarInputRouter {
         if (sender === old) {
             sender = null
             pressed = false
+            pressedKeys.clear()
+            onReadyChanged?.invoke(false)
         }
     }
 
@@ -174,13 +202,18 @@ internal class HiCarInputRouter {
     fun map(x: Float, y: Float, width: Int, height: Int, clamp: Boolean): IntArray? =
         map(x, y, width, height, clamp, displayWidth, displayHeight)
 
-    /** Releases a finger the phone still thinks is down; called when a session ends. */
+    /** Releases a finger and any key the phone still thinks are down; called when a session ends. */
     @Synchronized
     fun cancel() {
         if (pressed) sender?.send(HiCarInputEvent.touch(HiCarInputEvent.ACTION_UP, x, y))
         pressed = false
+        for (code in pressedKeys.toList().asReversed()) {
+            sender?.send(HiCarInputEvent.key(code, false))
+        }
+        pressedKeys.clear()
     }
 
+    /** The two navigation keys, sent as one press: nothing on this side holds them down. */
     @Synchronized
     fun key(key: Int): Boolean {
         val target = sender ?: return false
@@ -188,6 +221,27 @@ internal class HiCarInputRouter {
         cancel()
         if (!target.send(HiCarInputEvent.key(key, true))) return false
         return target.send(HiCarInputEvent.key(key, false))
+    }
+
+    /**
+     * One half of a media key press.
+     *
+     * Separate from [key] on purpose: a steering-wheel button is held as long as the driver holds it,
+     * and the phone is what repeats it. Pairing is enforced here so a lost down cannot leave the phone
+     * with a key stuck down — the failure that turns "next track" into "skip the whole playlist".
+     */
+    @Synchronized
+    fun mediaKey(code: Int, down: Boolean): Boolean {
+        val target = sender ?: return false
+        if (code !in HiCarMediaKeyForwarder.KEY_CODES) return false
+        if (down) {
+            if (code in pressedKeys) return false
+            if (!target.send(HiCarInputEvent.key(code, true))) return false
+            pressedKeys += code
+            return true
+        }
+        if (!pressedKeys.remove(code)) return false
+        return target.send(HiCarInputEvent.key(code, false))
     }
 
     companion object {
