@@ -71,6 +71,9 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.core.content.pm.PackageInfoCompat
+import com.shilapi.xcertplay.adb.AdbKeys
+import com.shilapi.xcertplay.adb.LocalAdb
+import com.shilapi.xcertplay.hud.BydAdbAccess
 import com.shilapi.xcertplay.hicar.HiCarAdvertisementProbe
 import com.shilapi.xcertplay.hicar.HiCarController
 import com.shilapi.xcertplay.hicar.HiCarAudioSettings
@@ -169,6 +172,24 @@ class HiCarHostActivity : ComponentActivity() {
      * once a second and reset when the session ends.
      */
     private var speedStatus by mutableStateOf(HiCarSpeedStatus())
+
+    /**
+     * Whether this app may use the head unit's own adbd (`127.0.0.1:5555`).
+     *
+     * The car-bus speed source runs `service call` through that shell, so without this the feature
+     * can only fall back to GPS. Null until the first check finishes, which is what makes the row
+     * say "检测中" instead of guessing.
+     */
+    private var adbState by mutableStateOf<BydAdbAccess.State?>(null)
+
+    /** True while the approval handshake is in flight; the dialog can take up to a minute. */
+    private var adbBusy by mutableStateOf(false)
+
+    /** The last result, in words, for the line under the button. */
+    private var adbMessage by mutableStateOf("")
+
+    /** Whether the app has ever been told the adbd status in this run, so it is logged once. */
+    private var adbLogged by mutableStateOf(false)
 
     /** Sharpness and frame rate: answered once per connection, so they apply to the next one. */
     private var videoSettings by mutableStateOf(HiCarVideoSettings())
@@ -276,6 +297,9 @@ class HiCarHostActivity : ComponentActivity() {
         // for the small entry on the session overlay. It is the same activity, so arriving this way
         // only means "start with the settings page open".
         if (openedFromSettingsShortcut(intent)) settingsOpen = true
+        // A read-only check, without offering the key: it must never raise the car's dialog on its
+        // own, and it tells the settings page whether the speed source has a shell to use.
+        refreshAdbState(logResult = false)
         // Before the first frame, so the activity never appears with the wrong bars and then jumps.
         applyWindowMode()
         setContent {
@@ -678,6 +702,27 @@ class HiCarHostActivity : ComponentActivity() {
                     "和允许/确定按钮的窗口，别的一律不碰。",
                 style = MaterialTheme.typography.bodySmall,
             )
+
+            Text("车速总线（ADB 授权）", style = MaterialTheme.typography.titleMedium)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = ::requestAdb, enabled = !adbBusy) {
+                    Text(if (adbBusy) "等待车机确认…" else "获取 ADB 授权")
+                }
+                TextButton(onClick = { refreshAdbState() }, enabled = !adbBusy) { Text("重新检测") }
+            }
+            MonoLine("ADB：${adbStateText(adbState)}")
+            if (adbMessage.isNotEmpty()) {
+                Text(adbMessage, style = MaterialTheme.typography.bodySmall)
+            }
+            Text(
+                "随速增益的「车辆总线」来源要读车机自己的 autoservice，只有 adb shell 能访问。" +
+                    "这个按钮把本应用生成的 RSA 公钥交给车机 adbd：已经信任时立即显示已授权；" +
+                    "没信任时车机会弹一次「允许 USB 调试吗」，点允许后公钥写进车机，" +
+                    "重启应用和升级应用都不会丢（卸载会清掉本应用私钥，需要重新授权）。" +
+                    "无线 adb 常开时不需要插数据线；有些车机 adbd 不校验密钥（ro.adb.secure=0），" +
+                    "会直接通过，不弹窗。",
+                style = MaterialTheme.typography.bodySmall,
+            )
         }
     }
 
@@ -860,6 +905,96 @@ class HiCarHostActivity : ComponentActivity() {
     private fun openSystemSettings(action: String, why: String) {
         val opened = runCatching { startActivity(Intent(action)) }.isSuccess
         appendLog(if (opened) "settings: opened $why" else "settings: this ROM has no screen for $why")
+    }
+
+    /**
+     * Reads the adbd state without offering the key.
+     *
+     * A check, not a request: `mayAsk = false` means the car's "allow debugging?" dialog can never
+     * appear from here, which matters because this runs on start and may run while driving.
+     */
+    private fun refreshAdbState(logResult: Boolean = true) {
+        if (adbBusy) return
+        Thread({
+            val state = runCatching {
+                BydAdbAccess.checkState(this@HiCarHostActivity, mayAsk = false)
+            }.getOrNull()
+            runOnUiThread {
+                adbState = state
+                if (logResult || !adbLogged) {
+                    adbLogged = true
+                    adbMessage = adbStateText(state)
+                    appendLog("adb: ${adbStateText(state)}")
+                }
+            }
+        }, "hicar-adb-check").start()
+    }
+
+    /**
+     * Offers this app's ADB key to the head unit's own adbd, in one press.
+     *
+     * The car bus (wheel speed) is only reachable through `adb shell` on `service call`, so the app
+     * needs adbd to trust the RSA key it generated. Sent as `AUTH_PUBLIC_KEY`, which is exactly what
+     * a PC does; on a secure adbd the car shows its "允许 USB 调试吗" dialog once, and the key is
+     * written to `adb_keys` when the driver allows it. A unit built with `ro.adb.secure=0` accepts
+     * the connection without any dialog, which is why the same button can return READY immediately.
+     *
+     * Run on a worker because the approval wait is up to a minute ([LocalAdb.APPROVAL_TIMEOUT_MS]);
+     * the UI keeps showing "等待车机确认".
+     */
+    private fun requestAdb() {
+        if (adbBusy) return
+        adbBusy = true
+        adbMessage = "正在把本应用的密钥交给车机 adbd（127.0.0.1:5555）…如果车机弹出「允许 USB 调试吗」，点「允许」即可"
+        appendLog("adb: offering this app's key to the local adbd at 127.0.0.1:5555")
+        Thread({
+            val state = runCatching {
+                BydAdbAccess.checkState(this@HiCarHostActivity, mayAsk = true)
+            }.getOrNull()
+            // A successful handshake is proven by a command, not by the handshake alone: a shell that
+            // opens but returns nothing would still leave the speed source without a reading.
+            val proof = if (state == BydAdbAccess.State.READY) {
+                runCatching {
+                    LocalAdb(AdbKeys.load(this@HiCarHostActivity)).use { it.shell("id") }
+                }.getOrNull()
+            } else {
+                null
+            }
+            runOnUiThread {
+                adbBusy = false
+                adbState = state
+                adbMessage = when (state) {
+                    BydAdbAccess.State.READY -> {
+                        // `id` answers with several groups on one long line; the first token is the one
+                        // that matters here and keeps the row readable.
+                        val who = proof?.trim()?.substringBefore(' ')?.takeIf { it.isNotEmpty() }
+                        "shell 可用" + (who?.let { "（$it）" } ?: "")
+                    }
+                    BydAdbAccess.State.NOT_APPROVED ->
+                        "还没有被允许：再点一次按钮，并在车机屏幕上点「允许」"
+                    BydAdbAccess.State.ADB_OFF ->
+                        "连不上 127.0.0.1:5555：请确认车机的 adb 调试/无线 adb 已开启"
+                    BydAdbAccess.State.PAIRING_ONLY ->
+                        "这个 adbd 只接受无线配对（TLS），本应用走 5555 明文通道，用不了"
+                    null -> "握手失败（详见日志）"
+                }
+                appendLog("adb: ${adbStateText(state)}${if (proof != null) "; shell id → ${proof.trim()}" else ""}")
+                if (state == BydAdbAccess.State.READY) {
+                    // The monitor may be backing off from a failed channel; rebuild it so the car bus
+                    // is used now rather than at the next retry.
+                    controller?.refreshSpeedVolume()
+                }
+            }
+        }, "hicar-adb-authorize").start()
+    }
+
+    /** The one-line state the settings page prints. */
+    private fun adbStateText(state: BydAdbAccess.State?): String = when (state) {
+        null -> "检测中…"
+        BydAdbAccess.State.READY -> "已授权：adb shell 可用（车辆总线要靠它读）"
+        BydAdbAccess.State.NOT_APPROVED -> "未授权：点「获取 ADB 授权」，在车机弹窗里点允许"
+        BydAdbAccess.State.ADB_OFF -> "连不上 127.0.0.1:5555：请确认车机的 adb 调试（无线 adb）已开启"
+        BydAdbAccess.State.PAIRING_ONLY -> "该 adbd 只接受无线配对（TLS），本应用走 5555 明文通道"
     }
 
     /**

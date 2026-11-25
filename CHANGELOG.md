@@ -1,5 +1,13 @@
 # Unreleased — HiCar only
 
+- One-press ADB authorization in Settings → 连接 → 车速总线（ADB 授权）. It runs the same handshake a
+  PC does (`LocalAdb.connect(mayAsk = true)`), waits for the car's approval dialog when the adbd is
+  secure, then proves the link with `shell id` and shows the user it came back as; on an adbd built
+  with `ro.adb.secure=0` it returns READY without any dialog. The state is also checked read-only on
+  start, so the page says 未授权/已授权/连不上 instead of leaving the speed source a mystery. After a
+  successful authorization a running session rebuilds its speed monitor, so the car bus stops waiting
+  for the 30 s retry.
+
 - The picture geometry offered to the phone now follows the area the window really has: the panel
   minus the status and navigation bars the display mode leaves visible (`contentPixels()` →
   `HiCarDisplaySize.fitTo()`), instead of snapping to a 16:9 step. A 1920×1032 area is offered as
