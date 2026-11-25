@@ -197,8 +197,19 @@ class HiCarHostActivity : ComponentActivity() {
     /** Which head unit channel music and guidance go to. */
     private var audioSettings by mutableStateOf(HiCarAudioSettings())
 
-    /** The wired path: off by default, because no part of it has run on a car yet. */
-    private var wiredEnabled by mutableStateOf(false)
+    /** Whether the cable is driven: on by default, and it wins over Wi-Fi whenever it carries. */
+    private var wiredEnabled by mutableStateOf(true)
+
+    /** Whether an inserted cable may start the app by itself, without touching the screen. */
+    private var cableAutoStart by mutableStateOf(true)
+
+    /**
+     * Whether the Wi-Fi half of the session is on.
+     *
+     * The setup page's button toggles only this. A cable session is started by the cable, so
+     * "停止" must not mean "stop the projection that is currently on screen".
+     */
+    private var wirelessOn by mutableStateOf(true)
 
     /** Whether a known phone is dialled when its Bluetooth link comes up. */
     private var redialEnabled by mutableStateOf(true)
@@ -236,10 +247,13 @@ class HiCarHostActivity : ComponentActivity() {
     private var exportUri by mutableStateOf<Uri?>(null)
     private var exportNotice by mutableStateOf("")
 
+    /** Whether the receiver that follows a permission prompt should offer Wi-Fi. */
+    private var pendingWireless = true
+
     private val permissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { granted ->
         val refused = granted.filterValues { !it }.keys
         if (refused.isEmpty()) {
-            startReceiver()
+            startReceiver(pendingWireless)
         } else {
             // Name them: the access point needs Wi-Fi Direct, which fails without these, and a bare
             // "permissions were not granted" hides which step is about to fail.
@@ -290,6 +304,7 @@ class HiCarHostActivity : ComponentActivity() {
         videoSettings = HiCarVideoSettingsStore.load(this)
         audioSettings = HiCarAudioSettingsStore.load(this)
         wiredEnabled = HiCarWiredSettings.enabled(this)
+        cableAutoStart = HiCarWiredSettings.autoStart(this)
         redialEnabled = HiCarReconnectSettings.enabled(this)
         restoreWifiEnabled = HiCarWifiSettings.restoreEnabled(this)
         speedSettings = HiCarSpeedVolumeSettings.load(this)
@@ -312,6 +327,8 @@ class HiCarHostActivity : ComponentActivity() {
                 }
             }
         }
+        // After the content, so the status and the log it writes have somewhere to land.
+        handleCableIntent(intent)
     }
 
     override fun onDestroy() {
@@ -334,6 +351,33 @@ class HiCarHostActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         if (openedFromSettingsShortcut(intent)) settingsOpen = true
+        handleCableIntent(intent)
+    }
+
+    /**
+     * Starts the receiver because a cable woke the app.
+     *
+     * The wireless half is deliberately left off: the cable is what the driver just plugged in, and
+     * turning the access point on as well would hold the radio for a path nobody asked for. If the
+     * system refused the background launch, this never runs and the notification stays tappable.
+     */
+    private fun handleCableIntent(intent: Intent?) {
+        if (intent?.action != ACTION_CABLE) return
+        HiCarUsbAttachNotifier.cancel(this)
+        // Consumed: a configuration change reuses this intent, and it must not start a second run.
+        intent.action = null
+        appendLog("cable: the data line woke the receiver")
+        if (running) {
+            appendLog("cable: a session is already running; the cable will take over by itself")
+            return
+        }
+        if (missingPermissions().isNotEmpty()) {
+            appendLog("cable: permissions are missing, so the cable cannot be used yet")
+            pendingWireless = false
+            permissions.launch(missingPermissions())
+            return
+        }
+        startReceiver(wireless = false)
     }
 
     /**
@@ -442,9 +486,23 @@ class HiCarHostActivity : ComponentActivity() {
             PairingCode()
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Button(onClick = ::toggle, enabled = model.length == 8) {
-                    Text(if (running) "停止" else "开始")
+                    Text(
+                        when {
+                            !running -> "开始"
+                            wirelessOn -> "停止无线"
+                            else -> "开始无线"
+                        },
+                    )
                 }
             }
+            Text(
+                if (running) {
+                    "这个按钮只管无线：插着数据线时，有线连接由数据线自己维持，按「停止无线」不会中断画面。"
+                } else {
+                    "插上数据线会自动启动接收端并优先走有线；不插线时点「开始」走无线。"
+                },
+                style = MaterialTheme.typography.bodySmall,
+            )
             // The reference receiver's README makes this a prerequisite on some devices, and it is
             // the opposite of the advice we had been giving (delete the phone's record / rotate the
             // identity), so it goes where a first-run driver cannot miss it.
@@ -666,11 +724,18 @@ class HiCarHostActivity : ComponentActivity() {
             )
 
             SettingSwitch(
-                title = "插数据线时自动连接（实验）",
-                detail = "由本应用自己驱动 USB 网卡，不需要车机内核支持 NCM。" +
-                    "这条链路还没有在实车上跑过，默认关闭；打开后重启接收端才生效",
+                title = "数据线优先（有线连接）",
+                detail = "由本应用自己驱动 USB 网卡，不需要车机内核支持 NCM。插上线就断开无线改走数据线，" +
+                    "拔线后自动回到无线。这条链路还没有在实车上跑过。",
                 checked = wiredEnabled,
                 onChange = ::applyWiredSetting,
+            )
+            SettingSwitch(
+                title = "插线自动启动",
+                detail = "插上数据线时自动打开接收端并直接走有线，不用先点桌面图标。车机若禁止后台启动界面，" +
+                    "会改为弹一条通知，点一下即可进入。",
+                checked = cableAutoStart,
+                onChange = ::applyCableAutoStart,
             )
             SettingSwitch(
                 title = "手机蓝牙连上时自动回连",
@@ -815,7 +880,9 @@ class HiCarHostActivity : ComponentActivity() {
         // call stack would race that cleanup, so the restart is a posted turn of the main thread.
         window.decorView.postDelayed({
             if (!running && missingPermissions().isEmpty()) {
-                startReceiver()
+                // The same half that was running before: a cable session must not come back as a
+                // wireless one just because the picture needed a new geometry.
+                startReceiver(wirelessOn)
                 appendLog("display: reconnected on request so the phone re-encodes for the visible area")
             }
         }, RESTART_DELAY_MILLIS)
@@ -882,11 +949,17 @@ class HiCarHostActivity : ComponentActivity() {
         appendLog(
             "wired: ${if (enabled) "on" else "off"}; " +
                 if (enabled) {
-                    "restart the receiver so the cable is driven by this build, not the probe"
+                    "the cable wins over wireless; takes effect on the next start of the receiver"
                 } else {
-                    "the cable is only probed for diagnosis"
+                    "the cable is only probed for diagnosis; takes effect on the next start"
                 },
         )
+    }
+
+    private fun applyCableAutoStart(enabled: Boolean) {
+        cableAutoStart = enabled
+        HiCarWiredSettings.setAutoStart(this, enabled)
+        appendLog("cable: starting from the data line ${if (enabled) "on" else "off"}")
     }
 
     private fun applyRedialSetting(enabled: Boolean) {
@@ -1133,14 +1206,27 @@ class HiCarHostActivity : ComponentActivity() {
         }, "hicar-selftest").start()
     }
 
+    /**
+     * The one button on the setup page.
+     *
+     * Before a run it starts the receiver with Wi-Fi on. During a run it owns **only** the wireless
+     * half: a projection that arrives over the cable is not something this button is allowed to end,
+     * so "停止" parks the access point and the advertisement instead of closing the session.
+     */
     private fun toggle() {
-        if (running) {
-            stopReceiver()
-        } else if (missingPermissions().isNotEmpty()) {
-            permissions.launch(missingPermissions())
-        } else {
-            startReceiver()
+        if (!running) {
+            pendingWireless = true
+            if (missingPermissions().isNotEmpty()) {
+                permissions.launch(missingPermissions())
+            } else {
+                startReceiver(wireless = true)
+            }
+            return
         }
+        val next = !wirelessOn
+        wirelessOn = next
+        controller?.setWireless(next)
+        appendLog("button: wireless ${if (next) "on" else "off"}; the cable is not affected")
     }
 
     /**
@@ -1172,9 +1258,17 @@ class HiCarHostActivity : ComponentActivity() {
         }
     }
 
-    private fun startReceiver() {
+    /**
+     * Starts the receiver.
+     *
+     * [wireless] is false only when a cable woke the app: the Bluetooth records are opened either
+     * way, because that is where the phone authenticates, but no advertisement and no access point
+     * are offered until the driver turns the wireless half on.
+     */
+    private fun startReceiver(wireless: Boolean = true) {
         if (running) return
         running = true
+        wirelessOn = wireless
         // The screen starts empty for a new attempt, but the export keeps earlier attempts: a retry
         // usually follows a failure, and the failure is the part worth reporting.
         log.clear()
@@ -1188,7 +1282,7 @@ class HiCarHostActivity : ComponentActivity() {
         )
         // This ROM grants discoverability for 120 s per request, so starting in a not-discoverable
         // state wastes the whole window: the advertisement is on air but nothing can page the car.
-        if (runCatching { bluetoothAdapter?.scanMode }.getOrNull() !=
+        if (wireless && runCatching { bluetoothAdapter?.scanMode }.getOrNull() !=
             BluetoothAdapter.SCAN_MODE_CONNECTABLE_DISCOVERABLE
         ) {
             appendLog(
@@ -1239,7 +1333,7 @@ class HiCarHostActivity : ComponentActivity() {
                 "(panel ${screen[0]}×${screen[1]}, content ${content[0]}×${content[1]}, " +
                 "window ${window.widthPixels}×${window.heightPixels})",
         )
-        next.start()
+        next.start(wireless)
         // The view already exists on this screen; attach it so the first frame has somewhere to go.
         attachVideo()
     }
@@ -1911,6 +2005,7 @@ class HiCarHostActivity : ComponentActivity() {
         is HiCarStatus.Authenticated -> "认证通过，正在打开控制通道"
         is HiCarStatus.ControlChannelReady -> "控制通道已就绪，等待手机要画面"
         is HiCarStatus.Streaming -> "画面通道已连接，正在接收手机视频"
+        is HiCarStatus.Wired -> "数据线 ${status.address}，等待手机认证"
         is HiCarStatus.Blocked -> "受阻：${status.blocker.message}"
         is HiCarStatus.Failed -> "失败：${status.reason}"
         is HiCarStatus.Stopped -> "已停止"

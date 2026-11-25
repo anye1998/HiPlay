@@ -34,8 +34,7 @@ import kotlin.random.Random
  * phone dials the same TCP ports on the address this class gave it.
  *
  * **Not verified on a car.** The framing, the ARP rules and the tunnel plumbing each have unit tests,
- * but no part of this has run against a real phone over a real cable. It is off by default for that
- * reason; see `docs/HICAR_WIRED.md`.
+ * but no part of this has run against a real phone over a real cable. See `docs/HICAR_WIRED.md`.
  *
  * The reverse-engineering this is built on is OpenHC's (`CarInfoSender`, `NcmUsbLink`,
  * `WiredVpnService`), GPL-3.0-only.
@@ -51,6 +50,15 @@ internal class HiCarWiredLink(
     private val controlPort: Int,
     /** The address the phone will reach this side on, e.g. `192.168.66.137`. */
     val hostAddress: String = randomHostAddress(),
+    /**
+     * Called once the tunnel is carrying packets, with [hostAddress].
+     *
+     * That is the moment the cable becomes a usable HiCar transport, and the moment the wireless
+     * path has to give way — see [HiCarTransportArbiter]. It is called from a transport thread.
+     */
+    private val onLinkUp: (String) -> Unit = {},
+    /** Called when the cable or the tunnel goes away, with the reason. From a transport thread. */
+    private val onLinkDown: (String) -> Unit = {},
 ) : AutoCloseable {
 
     private val appContext = context.applicationContext
@@ -58,8 +66,12 @@ internal class HiCarWiredLink(
 
     @Volatile private var closed = false
     @Volatile private var busy = false
+    @Volatile private var up = false
     private var path: HiCarNcmDataPath? = null
     private var port: HiCarNcmUsb? = null
+
+    /** The phone's own address on the cable, once it has announced it. */
+    val phoneAddress: String? get() = path?.phoneAddress
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -106,10 +118,20 @@ internal class HiCarWiredLink(
             else "wired: this build cannot watch the USB port",
         )
         // A phone already plugged in when the receiver started is the normal case on a car that boots
-        // with the cable attached.
+        // with the cable attached — and the case a manifest receiver leaves behind when the launch of
+        // the activity is what started this run.
         val present = runCatching { manager?.deviceList?.values?.toList() }.getOrNull().orEmpty()
-        present.firstOrNull { inNcmLayout(it) }?.let {
-            onLog("wired: a phone is already in the NCM layout${describe(it)}")
+        val attached = present.firstOrNull { inNcmLayout(it) }
+        if (attached != null) {
+            onLog("wired: a phone is already in the NCM layout${describe(attached)}")
+            bring(attached)
+            return
+        }
+        // Still in its factory layout: the car-info block has not been sent yet. Without this branch
+        // a cable plugged in before the app existed would stay inert until it was unplugged and
+        // plugged again, because the attach broadcast was delivered before this receiver existed.
+        present.firstOrNull { it.vendorId == HUAWEI_VID }?.let {
+            onLog("wired: a phone is already on the port${describe(it)}; switching it to NCM")
             bring(it)
         }
     }
@@ -225,7 +247,9 @@ internal class HiCarWiredLink(
         )
         path = data
         data.start()
+        up = true
         onLog("wired: carrying packets at $hostAddress/24; the phone should dial $hostAddress:$controlPort")
+        onLinkUp(hostAddress)
         return true
     }
 
@@ -236,7 +260,12 @@ internal class HiCarWiredLink(
         port?.close()
         port = null
         HiCarWiredVpn.close(appContext)
+        val wasUp = up
+        up = false
         if (data != null) onLog("wired: stopped ($reason)")
+        // Only a link that was actually carrying packets is worth announcing: a failed setup would
+        // otherwise tell the receiver to resume wireless for a cable that never worked.
+        if (wasUp && !closed) onLinkDown(reason)
     }
 
     // ------------------------------------------------------------------ helpers
@@ -408,17 +437,34 @@ internal class HiCarWiredLink(
     }
 }
 
-/** Whether the driver turned the wired path on. Off by default: no part of it has run on a car. */
+/**
+ * Whether the cable is driven at all, and whether plugging one starts the receiver.
+ *
+ * [enabled] is on by default: the cable has priority over Wi-Fi, and a driver who plugs a cable
+ * expects it to be used without hunting for a switch. [autoStart] is what lets a cable wake the app
+ * from a cold start; turning it off keeps the cable working once the app is already up.
+ */
 object HiCarWiredSettings {
     private const val PREFERENCES = "hicar-wired"
     private const val KEY_ENABLED = "enabled"
+    private const val KEY_AUTOSTART = "autostart"
 
     fun enabled(context: Context): Boolean =
         context.applicationContext.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
-            .getBoolean(KEY_ENABLED, false)
+            .getBoolean(KEY_ENABLED, true)
 
     fun setEnabled(context: Context, enabled: Boolean) {
         context.applicationContext.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
             .edit().putBoolean(KEY_ENABLED, enabled).apply()
+    }
+
+    /** Whether an inserted cable may start the app by itself. */
+    fun autoStart(context: Context): Boolean =
+        context.applicationContext.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
+            .getBoolean(KEY_AUTOSTART, true)
+
+    fun setAutoStart(context: Context, enabled: Boolean) {
+        context.applicationContext.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
+            .edit().putBoolean(KEY_AUTOSTART, enabled).apply()
     }
 }

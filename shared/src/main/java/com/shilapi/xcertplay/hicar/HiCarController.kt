@@ -42,6 +42,9 @@ sealed class HiCarStatus {
     /** The phone's video port answered and the picture path is running. */
     data object Streaming : HiCarStatus()
 
+    /** The cable is carrying packets at [address]; nothing has been authenticated over it yet. */
+    data class Wired(val address: String) : HiCarStatus()
+
     /** The phone asked for HiChain, which this build cannot answer; see [blocker]. */
     data class Blocked(val blocker: HiCarAuthBlocker) : HiCarStatus()
     data class Failed(val reason: String) : HiCarStatus()
@@ -160,6 +163,19 @@ class HiCarController(
     private var reconnectPending = false
     private val reconnectLock = Any()
 
+    /** One restart at a time, whichever thread asked for it (phone, cable, driver). */
+    private val restartLock = Any()
+    @Volatile private var restarting = false
+
+    /**
+     * A restart was asked for while one was already running.
+     *
+     * The wireless flag can change during a restart — a cable arriving while the driver presses
+     * "停止无线" is exactly that — and dropping the second request would leave the radio doing
+     * something the screen no longer shows.
+     */
+    private var restartAgain = false
+
     /** How many RFCOMM connections arrived; the waiting heartbeat reports it. */
     private val connections = AtomicInteger(0)
 
@@ -238,6 +254,22 @@ class HiCarController(
 
     /** The wired session, when the driver has turned it on; the diagnostic probe otherwise. */
     private var wired: HiCarWiredLink? = null
+
+    /**
+     * Whether the wireless half of this run is wanted.
+     *
+     * The screen's start/stop button controls only this: a cable session is driven by the cable, and
+     * stopping "the wireless" must not stop a projection that runs over the cable. Off means no
+     * advertisement and no access point, which is the honest state for a run that only exists because
+     * a cable was plugged in.
+     */
+    @Volatile private var wirelessWanted = true
+
+    /** Wired-priority rule; see [HiCarTransportArbiter]. */
+    private val arbiter = HiCarTransportArbiter()
+
+    /** The DMSDP listeners bound to the tunnel's address, when the cable is carrying the session. */
+    private var wiredEndpoints: HiCarDmsdpEndpoints? = null
 
     /** Dials a known phone when its Bluetooth link comes up; owned by the run, not the round. */
     private var redial: HiCarAutoReconnect? = null
@@ -607,13 +639,14 @@ class HiCarController(
     /** Whether the microphone may be offered at all; checked again when the phone asks for it. */
     fun microphoneAllowed(): Boolean = config.withMicrophone && HiCarMicrophone.permitted(appContext)
 
-    fun start() {
+    fun start(wireless: Boolean = true) {
         // The channel opens on the HiSight thread and closes with it; the screen posts to its own.
         input.onReadyChanged = { notifyKeysReady() }
         if (!running.compareAndSet(false, true)) {
             onLog("HiCar receiver is already running")
             return
         }
+        wirelessWanted = wireless
         wifiWasOn = HiCarWifiRestore.snapshot(appContext)
         // Registered once per run: the filter is protected, so it can only be registered while we
         // are alive, and the cooldown lives with it.
@@ -623,7 +656,11 @@ class HiCarController(
             running = { running.get() },
             onSocket = ::adoptOutgoing,
         ).also { it.start() }
-        report(HiCarStatus.PreparingNetwork)
+        report(if (wireless) HiCarStatus.PreparingNetwork else HiCarStatus.WaitingForPhone)
+        onLog(
+            if (wireless) "receiver: wireless on; the cable is watched as well and wins when it carries"
+            else "receiver: wireless off for this run; only the cable can connect",
+        )
         if (HiCarWiredSettings.enabled(appContext)) {
             // The wired path drives the cable itself (NCM plus a TUN), so the diagnostic probe would
             // only fight it for the same device.
@@ -633,6 +670,8 @@ class HiCarController(
                 model = config.model,
                 bluetoothAddress = config.bluetoothAddress.ifEmpty { HiCarWiredLink.defaultBluetoothAddress() },
                 controlPort = config.controlPort,
+                onLinkUp = ::onCableUp,
+                onLinkDown = ::onCableDown,
             ).also { it.start() }
         } else {
             usb = HiCarUsbLink(
@@ -671,10 +710,13 @@ class HiCarController(
         if (!running.compareAndSet(true, false)) return
         runCatching { redial?.close() }
         redial = null
+        runCatching { wiredEndpoints?.close() }
+        wiredEndpoints = null
         runCatching { wired?.close() }
         wired = null
         runCatching { usb?.close() }
         usb = null
+        arbiter.reset()
         releaseChain(keepVideo = false)
         setup.shutdownNow()
         accept.shutdownNow()
@@ -785,6 +827,13 @@ class HiCarController(
      */
     private fun scheduleReconnect(reason: String) {
         if (!running.get()) return
+        if (arbiter.isWired()) {
+            // The picture and the sound are on the cable: tearing the round down here would close
+            // the RFCOMM records the phone is not using and wipe the session key the cable's DMSDP
+            // listeners check, for a failure that happened on a path this session does not use.
+            onLog("HiCar: $reason; the cable is carrying this session, so the round stays as it is")
+            return
+        }
         synchronized(reconnectLock) {
             if (reconnectPending) return
             reconnectPending = true
@@ -796,23 +845,152 @@ class HiCarController(
         Thread({
             try {
                 Thread.sleep(RECONNECT_DELAY_MILLIS)
-                if (!running.get()) return@Thread
-                releaseChain(keepVideo = true)
-                if (!running.get()) return@Thread
-                setup = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "hicar-setup") }
-                accept = Executors.newCachedThreadPool { runnable -> Thread(runnable, "hicar-accept") }
-                report(HiCarStatus.Advertising)
-                startChain()
+                restartRound()
                 if (running.get()) onLog("HiCar: listening again; the phone may reconnect on its own")
             } catch (interrupted: InterruptedException) {
                 Thread.currentThread().interrupt()
-            } catch (failure: Exception) {
-                report(HiCarStatus.Failed(failure.javaClass.simpleName))
-                onLog("HiCar restart failed: ${failure.javaClass.simpleName}")
             } finally {
                 synchronized(reconnectLock) { reconnectPending = false }
             }
         }, "hicar-reconnect").apply { isDaemon = true }.start()
+    }
+
+    /**
+     * Releases this round and starts a fresh one with the current wireless flag.
+     *
+     * The callers are the phone leaving, a cable appearing or going, and the driver turning the
+     * wireless half on or off. A restart rather than an in-place edit because the advertisement, the
+     * listeners and the generation counter are one unit: adding an advertiser to a round that was
+     * built without one is where stale accept loops come from.
+     */
+    private fun restartRound() {
+        if (!running.get()) return
+        synchronized(restartLock) {
+            if (restarting) {
+                restartAgain = true
+                return
+            }
+            restarting = true
+        }
+        try {
+            releaseChain(keepVideo = wirelessWanted)
+            if (!running.get()) return
+            setup = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "hicar-setup") }
+            accept = Executors.newCachedThreadPool { runnable -> Thread(runnable, "hicar-accept") }
+            report(HiCarStatus.Advertising)
+            startChain()
+        } catch (failure: Exception) {
+            report(HiCarStatus.Failed(failure.javaClass.simpleName))
+            onLog("HiCar restart failed: ${failure.javaClass.simpleName}")
+        } finally {
+            val again = synchronized(restartLock) {
+                restarting = false
+                restartAgain.also { restartAgain = false }
+            }
+            if (again && running.get()) {
+                Thread({ restartRound() }, "hicar-restart-again").apply { isDaemon = true }.start()
+            }
+        }
+    }
+
+    /**
+     * Turns the wireless half on or off, leaving the cable alone.
+     *
+     * The screen's start/stop button is this: "停止" means the Wi-Fi path stops being offered, not
+     * that a projection over the cable ends. While the cable is carrying the session the flag is
+     * only recorded — there is no round to rebuild, and rebuilding it would interrupt the picture.
+     */
+    fun setWireless(wanted: Boolean) {
+        if (wirelessWanted == wanted) return
+        wirelessWanted = wanted
+        if (!running.get()) {
+            onLog("wireless: ${if (wanted) "on" else "off"} for the next start")
+            return
+        }
+        if (arbiter.isWired()) {
+            onLog(
+                "wireless: ${if (wanted) "will be offered when the cable goes" else "parked"}; " +
+                    "the cable is carrying this session",
+            )
+            return
+        }
+        onLog("wireless: ${if (wanted) "on" else "off"}; the cable watcher is unaffected")
+        // Off the caller's thread: releasing a round closes sockets and restarts the decoder, and
+        // the caller here is the driver pressing a button.
+        Thread({ restartRound() }, "hicar-wireless").apply { isDaemon = true }.start()
+    }
+
+    // ------------------------------------------------------------------ the cable takes over
+
+    /**
+     * The cable is carrying packets: it wins.
+     *
+     * What gives way is the wireless *data* path — the access point, its DMSDP listeners, HiSight and
+     * the audio socket. The Bluetooth round stays: the phone authenticates over RFCOMM before it
+     * dials, whatever the network underneath turns out to be.
+     */
+    private fun onCableUp(address: String) {
+        if (!running.get()) return
+        onLog("wired: the cable has priority at $address")
+        report(HiCarStatus.Wired(address))
+        for (action in arbiter.wiredUp(address)) {
+            when (action) {
+                is HiCarTransportAction.DropWireless -> dropWirelessTransport(action.reason)
+                is HiCarTransportAction.StartWired -> startWiredTransport(action.address)
+                HiCarTransportAction.StopWired, HiCarTransportAction.ResumeWireless -> Unit
+            }
+        }
+    }
+
+    /** The cable is gone: close what was bound to it, and let the wireless path try again. */
+    private fun onCableDown(reason: String) {
+        if (arbiter.isWired()) onLog("wired: the link went down ($reason)")
+        val actions = arbiter.wiredDown()
+        if (actions.isEmpty()) return
+        for (action in actions) {
+            when (action) {
+                HiCarTransportAction.StopWired -> {
+                    runCatching { wiredEndpoints?.close() }
+                    wiredEndpoints = null
+                }
+                HiCarTransportAction.ResumeWireless -> {
+                    if (!running.get()) return
+                    if (wirelessWanted) {
+                        onLog("wired: the cable is gone; wireless takes over on the next round")
+                        Thread({ restartRound() }, "hicar-cable-down").apply { isDaemon = true }.start()
+                    } else {
+                        onLog("wired: the cable is gone and wireless is off; nothing will connect")
+                        report(HiCarStatus.WaitingForPhone)
+                    }
+                }
+                is HiCarTransportAction.DropWireless, is HiCarTransportAction.StartWired -> Unit
+            }
+        }
+    }
+
+    /**
+     * Closes everything that exists only because there is an access point.
+     *
+     * The session key is deliberately kept: the phone is about to dial the cable, and its DMSDP
+     * listeners check the same key. The RFCOMM records and the advertisement are kept too — they are
+     * how the next authentication arrives.
+     */
+    private fun dropWirelessTransport(reason: String) {
+        val hadSomething = hisight != null || dmsdp != null || hotspot != null
+        hisight?.close()
+        hisight = null
+        mediaBusy.set(false)
+        dmsdp?.close()
+        dmsdp = null
+        runCatching { hotspot?.close() }
+        hotspot = null
+        liveOffer = null
+        // The negotiator belongs to the access point; leaving it set would let a Wi-Fi frame be
+        // answered with credentials for a group that is already gone.
+        liveNetwork = null
+        networkStarted = false
+        synchronized(networkLock) { networkLock.notifyAll() }
+        if (hadSomething) onLog("wireless: gave way ($reason)")
     }
 
     private fun startChain() {
@@ -846,6 +1024,15 @@ class HiCarController(
         services = rfcomm
         onLog("HiCar records ready: business channel ${rfcomm.businessChannel}, control on 0xFE35")
 
+        if (!wirelessWanted) {
+            // A run that exists because a cable was plugged in still needs the Bluetooth records —
+            // the phone authenticates over RFCOMM before it dials — but it must not put an
+            // advertisement on the air or pretend a Wi-Fi session is coming.
+            report(HiCarStatus.WaitingForPhone)
+            onLog("wired: advertising is off for this run; the records are ready for the phone's dial")
+            startAcceptLoops(rfcomm, round)
+            return
+        }
         val beacon = HiCarBleAdvertiser(appContext, onLog)
         advertiser = beacon
         report(HiCarStatus.Advertising)
@@ -957,6 +1144,17 @@ class HiCarController(
      * waits in [awaitNetwork].
      */
     private fun requestNetwork() {
+        if (arbiter.isWired()) {
+            // The cable is the transport for this session. Opening a group as well would hold the
+            // radio for a path the phone is not using, and the phone must not be handed credentials
+            // for a network that belongs to a session that already has a working one.
+            onLog("HiCar: the cable is carrying this session; the access point stays closed")
+            return
+        }
+        if (!wirelessWanted) {
+            onLog("HiCar: wireless is off for this run; not opening an access point")
+            return
+        }
         synchronized(networkLock) {
             if (networkStarted) return
             networkStarted = true
@@ -1013,25 +1211,11 @@ class HiCarController(
      */
     private fun startDmsdpEndpoints(offer: HiCarNetworkOffer) {
         val network = liveNetwork ?: return
-        val business = HiCarDeviceBusiness(
-            deviceId = config.localIdentity,
-            model = config.model,
-            ownerAddress = offer.ownerAddress,
-            clientAddress = offer.clientAddress,
-            onLog = onLog,
-            // Each service is announced only when it can actually be served: a display that never
-            // produces a frame reads as "this car is broken", which is worse than a missing feature.
-            displayReady = { video?.ready == true },
-            speakerReady = { audioReady },
-            microphoneReady = { microphoneReady },
-            onMediaEndpoint = { port -> startHiSight(port) },
-            onNavFocus = { active -> routeNavigation(active) },
-        )
         val endpoints = HiCarDmsdpEndpoints(
             offer = offer,
             summary = config.localIdentity.toByteArray(Charsets.US_ASCII),
             network = network,
-            business = business,
+            business = deviceBusiness(offer),
             sessionKey = { liveKey },
             active = { running.get() },
             onLog = onLog,
@@ -1039,6 +1223,73 @@ class HiCarController(
         )
         dmsdp = endpoints
         endpoints.start()
+    }
+
+    /**
+     * The device/service description both paths answer with.
+     *
+     * The addresses are the only part that differs between Wi-Fi and the cable, so the services are
+     * built from whichever offer is current rather than duplicated per transport.
+     */
+    private fun deviceBusiness(offer: HiCarNetworkOffer): HiCarDeviceBusiness = HiCarDeviceBusiness(
+        deviceId = config.localIdentity,
+        model = config.model,
+        ownerAddress = offer.ownerAddress,
+        clientAddress = offer.clientAddress,
+        onLog = onLog,
+        // Each service is announced only when it can actually be served: a display that never
+        // produces a frame reads as "this car is broken", which is worse than a missing feature.
+        displayReady = { video?.ready == true },
+        speakerReady = { audioReady },
+        microphoneReady = { microphoneReady },
+        onMediaEndpoint = { port -> startHiSight(port) },
+        onNavFocus = { active -> routeNavigation(active) },
+    )
+
+    /**
+     * Binds the same three ports on the cable's address.
+     *
+     * The phone reaches this side at the address the car-info block named, which is the tunnel's own
+     * address — not the access point's. Peer checking is loosened to "any host on that /24" because
+     * the phone chooses its own address on this link and only ever announces it in ARP; the
+     * authentication gate ([sessionKey]) is unchanged, so an unauthenticated peer is still refused.
+     */
+    private fun startWiredTransport(address: String) {
+        runCatching { wiredEndpoints?.close() }
+        wiredEndpoints = null
+        val negotiator = HiCarNetworkNegotiator(
+            HiCarNetworkOffer.cable(address, config.controlPort, wired?.phoneAddress),
+            onLog = onLog,
+        ).also { it.authenticated = true }
+        val offer = HiCarNetworkOffer.cable(address, config.controlPort, wired?.phoneAddress)
+        liveOffer = offer
+        liveNetwork = negotiator
+        val endpoints = HiCarDmsdpEndpoints(
+            offer = offer,
+            summary = config.localIdentity.toByteArray(Charsets.US_ASCII),
+            network = negotiator,
+            business = deviceBusiness(offer),
+            sessionKey = { liveKey },
+            active = { running.get() },
+            onLog = onLog,
+            mediaFactory = { key ->
+                // The phone's address exists only after its first ARP, which is usually before this
+                // control connection — but not always. Re-reading it here keeps the audio socket and
+                // the HiSight dial pointed at where the phone really is.
+                val current = HiCarNetworkOffer.cable(address, config.controlPort, wired?.phoneAddress)
+                liveOffer = current
+                buildMedia(current, key)
+            },
+            bindAddress = address,
+            anyPeerOnSubnet = true,
+            servesWifiFollowUp = false,
+        )
+        wiredEndpoints = endpoints
+        endpoints.start()
+        onLog(
+            "wired: DMSDP bound to $address; phone address " +
+                (wired?.phoneAddress ?: "not announced yet"),
+        )
     }
 
     /** Creates the decoder now so the display service can be announced before the phone asks. */
@@ -1509,8 +1760,20 @@ class HiCarController(
                     val isNetwork = frame.kind == KIND_NETWORK || frame.kind == KIND_NETWORK_COMMAND
                     // The negotiation can beat the access point by a second or two. Waiting here
                     // rather than dropping the frame is the difference between "hotspot lazy start"
-                    // and "every connection fails just after it authenticated".
-                    val network = if (isNetwork) awaitNetwork() else liveNetwork
+                    // and "every connection fails just after it authenticated". On the cable there
+                    // is nothing to wait for: no access point is coming, so waiting would only
+                    // stall this thread for the full network timeout.
+                    val network = when {
+                        !isNetwork -> liveNetwork
+                        arbiter.isWired() || !wirelessWanted -> {
+                            onLog(
+                                "HiCar network frame kind=${frame.kind} while the cable carries the " +
+                                    "session; there is no access point to hand out",
+                            )
+                            null
+                        }
+                        else -> awaitNetwork()
+                    }
                     if (isNetwork && network != null && !network.authenticated) {
                         // The phone only runs this exchange after it has a session key. Arriving
                         // earlier means our key is not visible yet, and answering would leak the
@@ -1741,14 +2004,14 @@ class HiCarController(
 }
 
 /**
- * A TCP listener on the car's access point address.
+ * A TCP listener on one of the car's own addresses.
  *
- * Reserved for the media stage: the phone dials `controlPort`, `+1` (data) and `+2`. Nothing calls
- * this yet, because the chain cannot pass authentication in this build; it is kept next to the
- * controller so the next step does not have to rediscover the binding rules.
+ * The phone dials `controlPort`, `+1` (data) and `+2` on whichever address it was told: the access
+ * point's for a Wi-Fi session, the tunnel's for a cable session. Both are addresses of this device,
+ * so the bind is the same call with a different host.
  */
-internal fun openListener(offer: HiCarNetworkOffer, port: Int): ServerSocket =
+internal fun openListener(address: String, port: Int): ServerSocket =
     ServerSocket().apply {
         reuseAddress = true
-        bind(InetSocketAddress(offer.ownerAddress, port), 4)
+        bind(InetSocketAddress(address, port), 4)
     }

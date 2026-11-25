@@ -7,6 +7,9 @@
     <uses-permission android:name="${applicationId}.USB_PERMISSION_RESULT" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- The cable's fallback notification. A no-op before Android 13; on 13+ the driver may have to
+         allow notifications once, and the activity is still reachable from the launcher. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />

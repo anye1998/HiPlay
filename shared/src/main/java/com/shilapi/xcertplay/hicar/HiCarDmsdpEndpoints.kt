@@ -12,7 +12,8 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * The three TCP endpoints the phone dials on the car's access point after authentication.
+ * The three TCP endpoints the phone dials after authentication — on the access point, or on the
+ * address the cable's car-info block handed out.
  *
  * Until this existed the chain ended at `END_SUCCESS` with the phone closing both RFCOMM channels
  * about thirty seconds later: it had been told (`hicarApIp` in the credential string) which address
@@ -47,6 +48,29 @@ internal class HiCarDmsdpEndpoints(
      * Everything it returns is closed when the control connection ends.
      */
     private val mediaFactory: (ByteArray) -> Media? = { null },
+    /**
+     * Where the three ports are bound.
+     *
+     * Defaults to the access point's own address, which is what a Wi-Fi session needs: the phone was
+     * given that address and nothing else is listening on the block. A cable session binds to the
+     * tunnel's address instead, because that is the one its car-info block handed out.
+     */
+    private val bindAddress: String = offer.ownerAddress,
+    /**
+     * Accept any peer on the owner's /24 rather than one exact address.
+     *
+     * A phone on an access point is told which address it will get, so the exact match is a real
+     * check. On the cable the phone picks its own address and merely announces it in ARP, so the
+     * most that can be verified is that it is the only other host on the tunnel's subnet.
+     */
+    private val anyPeerOnSubnet: Boolean = false,
+    /**
+     * Whether to answer the Wi-Fi follow-up on `controlPort`.
+     *
+     * False for the cable: there is no access point, so the only honest answer to "which network do
+     * I join" is none. Leaving the port silent keeps a stale credential string from being handed out.
+     */
+    private val servesWifiFollowUp: Boolean = true,
 ) : Closeable {
 
     /** Audio and microphone live only as long as one control connection. */
@@ -67,8 +91,9 @@ internal class HiCarDmsdpEndpoints(
         listen(entryPort, "entry") { _, input, output -> serveEntry(input, output) }
         listen(offer.controlPort + 2, "control") { socket, input, output -> serveControl(socket, input, output) }
         onLog(
-            "DMSDP: listening on ${offer.ownerAddress} ports ${offer.controlPort}, $entryPort, " +
-                "${offer.controlPort + 2} (network, entry, control)",
+            "DMSDP: listening on $bindAddress ports ${offer.controlPort}, $entryPort, " +
+                "${offer.controlPort + 2} (network, entry, control)" +
+                if (anyPeerOnSubnet) "; peers accepted from the whole ${subnetOf(bindAddress)}/24" else "",
         )
     }
 
@@ -82,7 +107,7 @@ internal class HiCarDmsdpEndpoints(
 
     private fun listen(port: Int, name: String, handler: (Socket, InputStream, OutputStream) -> Unit) {
         val server = try {
-            openListener(offer, port)
+            openListener(bindAddress, port)
         } catch (failure: IOException) {
             onLog("DMSDP: cannot bind $name port $port (${failure.javaClass.simpleName}: ${failure.message})")
             return
@@ -110,8 +135,11 @@ internal class HiCarDmsdpEndpoints(
             runCatching { socket.close() }
             return
         }
-        if (peer != offer.clientAddress) {
-            onLog("DMSDP: $name connection from $peer, not the $${offer.clientAddress} this session gave out; refused")
+        if (!peerAllowed(peer)) {
+            onLog(
+                "DMSDP: $name connection from $peer, not the ${offer.clientAddress} this session gave " +
+                    "out; refused",
+            )
             runCatching { socket.close() }
             return
         }
@@ -141,6 +169,21 @@ internal class HiCarDmsdpEndpoints(
     }
 
     /**
+     * Whether a dialling address belongs to this session.
+     *
+     * Both answers come from the same rule set: the peer has to be on the car's own /24 and it can
+     * never be the car itself. The wireless path narrows that to the single address it handed out.
+     */
+    private fun peerAllowed(peer: String): Boolean {
+        if (!anyPeerOnSubnet) return peer == offer.clientAddress
+        val subnet = subnetOf(bindAddress)
+        return peer.startsWith("$subnet.") &&
+            peer != bindAddress &&
+            peer != offer.ownerAddress &&
+            peer.removePrefix("$subnet.").toIntOrNull() in 1..254
+    }
+
+    /**
      * Port `controlPort`: the Wi-Fi follow-up.
      *
      * The phone repeats the capability/credential exchange it started on 0xFE35. The reference serves
@@ -156,7 +199,19 @@ internal class HiCarDmsdpEndpoints(
             if (read < 0) return
             for (frame in decoder.feed(buffer, read)) {
                 val reply = when (frame.kind) {
-                    KIND_NETWORK, KIND_NETWORK_COMMAND -> network.respond(frame)
+                    KIND_NETWORK, KIND_NETWORK_COMMAND ->
+                        if (!servesWifiFollowUp) {
+                            // The cable has no access point to join. Answering would hand out
+                            // credentials for a group that does not exist; silence lets the phone
+                            // keep the transport it is already on.
+                            onLog(
+                                "DMSDP: network frame kind ${frame.kind} on the cable; there is no " +
+                                    "access point to hand out, so it is not answered",
+                            )
+                            null
+                        } else {
+                            network.respond(frame)
+                        }
                     // The business-channel announcement belongs to 0xFE35, which already answered it;
                     // a repeat here is tolerated and logged rather than treated as a protocol error.
                     else -> runCatching { negotiator.respond(frame) }
@@ -167,9 +222,11 @@ internal class HiCarDmsdpEndpoints(
                     output.write(reply)
                     output.flush()
                 }
-                for (queued in network.takePending()) {
-                    output.write(queued)
-                    output.flush()
+                if (servesWifiFollowUp) {
+                    for (queued in network.takePending()) {
+                        output.write(queued)
+                        output.flush()
+                    }
                 }
                 onLog("DMSDP: network frame kind ${frame.kind}, ${frame.payload.size} bytes, reply ${reply?.size ?: 0}")
             }
@@ -305,3 +362,7 @@ internal class HiCarDmsdpEndpoints(
         const val KIND_NETWORK_COMMAND = 33
     }
 }
+
+/** The first three octets of an IPv4 address; both paths here are /24s. */
+internal fun subnetOf(address: String): String =
+    address.split('.').take(3).joinToString(".")

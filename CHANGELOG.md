@@ -1,5 +1,22 @@
 # Unreleased — HiCar only
 
+- **Wired priority.** The cable is now the preferred transport whenever it carries packets: a
+  carrier coming up closes the access point, the wireless DMSDP listeners, HiSight and the audio
+  socket, and rebinds the same three ports on the tunnel's own address (`HiCarTransportArbiter`).
+  The Bluetooth round is deliberately left alone — the phone authenticates over 0xFE35 whatever the
+  network underneath is — and no Wi-Fi credentials are answered while the cable is in use. Pulling
+  the cable stops the wired endpoints and starts a fresh wireless round; nothing restarts the round
+  while the cable is carrying it. The setup page's button now owns only the wireless half
+  (开始 / 停止无线 / 开始无线), so it cannot end a projection that is running over the cable.
+
+- **A cable can start the app.** `HiCarUsbAttachReceiver` is declared in the manifest with a
+  Huawei-only device filter, so inserting a cable cold-starts the process, opens the receiver and
+  starts it with Wi-Fi off. A full-screen notification is posted first and cancelled by the
+  activity, because Android 10 may refuse a background activity launch without telling anyone; the
+  notification is the fallback the driver can still tap. `HiCarWiredSettings` gains `autoStart`
+  (default on) and wired driving is now on by default, both switchable in Settings → 连接.
+
+
 - One-press ADB authorization in Settings → 连接 → 车速总线（ADB 授权）. It runs the same handshake a
   PC does (`LocalAdb.connect(mayAsk = true)`), waits for the car's approval dialog when the adbd is
   secure, then proves the link with `shell id` and shows the user it came back as; on an adbd built

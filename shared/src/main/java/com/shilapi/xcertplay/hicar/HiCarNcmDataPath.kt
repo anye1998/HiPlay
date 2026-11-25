@@ -144,6 +144,17 @@ internal class HiCarNcmDataPath(
     val isRunning: Boolean get() = running.get()
 
     /** Starts both threads. Once only. */
+    /**
+     * The address the phone picked for itself on the cable, once it has spoken.
+     *
+     * There is no DHCP on this link: the phone announces itself in an ARP request or in the source
+     * address of its first packet, and that is the only place its address is ever visible. Everything
+     * above the cable needs it — the DMSDP peer check, the audio socket, the HiSight dial — so it is
+     * published here rather than kept inside the endpoint.
+     */
+    val phoneAddress: String?
+        get() = endpoint.phoneAddress?.let { HiCarIpv4.format(it) }
+
     fun start() {
         check(started.compareAndSet(false, true)) { "the data path starts once" }
         running.set(true)

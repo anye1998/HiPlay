@@ -6,6 +6,9 @@
     <!-- Optional: diagnostic reports in the visible Downloads folder on Android 9.
          Android 10+ needs no permission for this, so it is never requested there. -->
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
+    <!-- The fallback when a cable may not bring the screen up from the background: a notification
+         with a full-screen intent still gets the driver into the receiver with one tap. -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
 
     <application>
         <!-- Reports exported from the settings page: a report is shared as a content:// URI, and the
@@ -53,6 +56,21 @@
                 android:name="android.accessibilityservice"
                 android:resource="@xml/usb_accessibility" />
         </service>
+
+        <!-- The only entry the driver does not press: a cable going in. Declared with a device
+             filter so the process is cold-started for Huawei phones only. It starts the activity,
+             and posts a full-screen notification first because Android 10 may refuse a background
+             activity launch without telling anyone. -->
+        <receiver
+            android:name="com.shilapi.xcertplay.HiCarUsbAttachReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/usb_device_filter" />
+        </receiver>
 
         <!-- The launcher entry. The label is a literal to match the screen's own copy, which is
              Simplified Chinese on purpose and hardcoded so it reads the same on any ROM locale. -->

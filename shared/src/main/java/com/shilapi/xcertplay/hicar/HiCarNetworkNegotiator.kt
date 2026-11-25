@@ -57,6 +57,51 @@ class HiCarNetworkOffer(
         /** The 5 GHz channels the phone accepts in its frequency capability bitmap. */
         private val FREQUENCIES = intArrayOf(5180, 5200, 5220, 5240, 5745, 5765, 5785, 5805, 5825)
 
+        /**
+         * The shape a cable session needs, without an access point behind it.
+         *
+         * Everything above the network — DMSDP, HiSight, the audio socket — is addressed by
+         * [ownerAddress] and [clientAddress], and on the cable those two are simply the tunnel's
+         * address and whatever the phone picked for itself. The SSID, BSSID and passphrase are never
+         * used: the wired path does not open a group, and its endpoint does not answer the Wi-Fi
+         * follow-up. They still have to satisfy the class's invariants, which is why they are filled
+         * with values that are visibly not a real network.
+         */
+        fun cable(ownerAddress: String, controlPort: Int, phoneAddress: String? = null): HiCarNetworkOffer {
+            val owner = ipv4(ownerAddress)
+            // A phone that announced itself outside the car's /24 cannot be reached at all — the
+            // tunnel routes only that subnet — and letting it through would make the offer's own
+            // invariants throw, taking the wired transport down with it.
+            val client = phoneAddress?.let { runCatching { ipv4(it) }.getOrNull() }
+                ?.takeIf {
+                    it[0] == owner[0] && it[1] == owner[1] && it[2] == owner[2] &&
+                        it[3] in 1..254 && it[3] != owner[3]
+                }
+                ?: ipv4(neighbour(ownerAddress))
+            return HiCarNetworkOffer(
+                ssid = "HiCar-cable",
+                bssid = "",
+                passphrase = "hicar-cable-not-a-network",
+                ownerAddress = ownerAddress,
+                clientAddress = "${client[0]}.${client[1]}.${client[2]}.${client[3]}",
+                frequencyMhz = FREQUENCIES.first(),
+                controlPort = controlPort,
+            )
+        }
+
+        /** The next host on the same /24, the same guess the access point uses for its client. */
+        fun neighbour(address: String): String {
+            val octets = address.split(".")
+            require(octets.size == 4) { "HiCar AP IPv4" }
+            val last = octets[3].toInt()
+            val next = when {
+                last in 1..253 -> last + 1
+                last == 254 -> last - 1
+                else -> 2
+            }
+            return "${octets[0]}.${octets[1]}.${octets[2]}.$next"
+        }
+
         fun frequencyMask(frequencyMhz: Int): Int {
             val index = FREQUENCIES.indexOf(frequencyMhz)
             return if (index < 0) 0 else 1 shl index

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The phones this app can drive the cable for.
+
+  Only Huawei's vendor id is listed: the car-info block that switches a phone into NCM is theirs, and
+  a filter for every device would wake this receiver for every charger and stick that goes into the
+  port. A phone that is already connected still shows up through the receiver's own enumeration.
+-->
+<resources>
+    <usb-device vendor-id="4817" />
+</resources>
