@@ -85,21 +85,25 @@
             </intent-filter>
         </activity-alias>
 
-        <!-- The second launcher entry: opens the same activity with the settings page already up.
-             Not a separate activity, because a second activity would pause the receiver and a paused
-             surface is where the mirrored picture goes black. The activity recognises this alias in
-             its intent's component and sets `settingsOpen`. -->
-        <activity-alias
-            android:name="com.shilapi.xcertplay.HiCarSettingsAlias"
-            android:targetActivity="com.shilapi.xcertplay.HiCarHostActivity"
+        <!-- The second launcher entry: opens the receiver with the settings page already up.
+             A real activity, not an `activity-alias`: the alias resolved fine but the head unit's
+             launcher listed only the first entry, because both aliases target the same activity and
+             that launcher keys its icon list by package. This one is a doorway — NoDisplay, launches
+             the host and finishes in the first frame — so the receiver is never left behind a paused
+             surface. See HiCarSettingsLaunchActivity. -->
+        <activity
+            android:name="com.shilapi.xcertplay.HiCarSettingsLaunchActivity"
+            android:excludeFromRecents="true"
             android:exported="true"
             android:icon="@drawable/ic_hicar_settings"
-            android:label="HiCar 设置">
+            android:label="HiCar 设置"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.NoDisplay">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-        </activity-alias>
+        </activity>
     </application>
 
 </manifest>

@@ -123,18 +123,22 @@ Activity 里叠一层，解码器和会话都不受影响，改完设置直接�
 
 ## 七、桌面上的第二个入口：直接进设置
 
-车机桌面上有两个图标，都指向同一个 Activity：
+车机桌面上有两个图标：
 
-| 图标 | alias | 打开后 |
+| 图标 | 组件 | 打开后 |
 | --- | --- | --- |
-| `HiCar` | `HiCarLauncherAlias` | 连接页（或正在连接的会话页） |
-| `HiCar 设置`（滑块图标） | `HiCarSettingsAlias` | 同样的页面，设置层已展开 |
+| `HiCar` | `HiCarLauncherAlias`（alias → `HiCarHostActivity`） | 连接页（或正在连接的会话页） |
+| `HiCar 设置`（滑块图标） | `HiCarSettingsLaunchActivity` | 同一个页面，设置层已展开 |
 
-不是第二个 Activity：第二个 Activity 会把接收端 `pause`，`TextureView` 的 `SurfaceTexture`
-被覆盖后画面就黑了。alias 只是换了个启动入口，Activity 从 `intent.component.className` 认出
-`HiCarSettingsAlias` 并把 `settingsOpen` 置为 true；activity 是 `singleTask`，所以连接中再点这个
-图标走 `onNewIntent`，会话不中断，设置层直接盖在画面上。
+第二个入口原来是一个 `activity-alias`，现在是一个**只做转交的 Activity**（`Theme.NoDisplay`，
+launch 完立刻 `finish()`）。原因：alias 在 `cmd package query-activities` 里存在，但桌面会把同一个
+target 的两个 alias 当成一个应用、只留一个图标；真实 Activity 才是一条独立条目。它不画任何东西，
+所以不会留下黑帧；转交过去的是 `ACTION_SETTINGS`，`HiCarHostActivity`（`singleTask`）认这个 action
+并把 `settingsOpen` 置为 true，连接中再点会走 `onNewIntent`，会话不中断。
 
-模拟器验证（2026-11-22）：冷启动 alias 直接显示「设置」页；按返回回到连接页后再次 `am start`
-同一 alias，`onNewIntent` 生效，设置页重新出现；`cmd package query-activities` 确认桌面上两个
-入口的 label / icon 不同。
+**注意：覆盖安装会让桌面少掉其中一个图标。** 这是桌面自己的行为（模拟器 2026-11-25 复现：
+`adb install -r` 后桌面只剩一个入口，`adb uninstall` + 重新安装后两个都回来，`query-activities`
+始终返回两条）。更新后如果只看到一个图标，从应用列表里把另一个拖回桌面，或者卸载重装 / 重启桌面。
+
+模拟器验证：干净安装后桌面同时出现 `HiCar` 与 `HiCar 设置`；点后者落到 `HiCarHostActivity` 且
+设置页已展开；`cmd package query-activities` 两条都在。

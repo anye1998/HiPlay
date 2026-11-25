@@ -1,5 +1,15 @@
 # Unreleased — HiCar only
 
+- The `HiCar 设置` desktop entry is now a real, invisible activity (`HiCarSettingsLaunchActivity`,
+  `Theme.NoDisplay`, launches the host with `ACTION_SETTINGS` and finishes) instead of an
+  `activity-alias`. An alias resolves and runs, but every launcher tested lists only one entry for
+  two aliases that share a target; a real activity is an entry of its own. Its icon is redrawn bolder
+  so the two HiCar icons can be told apart at launcher size.
+  Known launcher behaviour, not fixable from the APK: updating the package in place can leave only
+  one of the two icons on the desktop (`adb install -r` reproduces it on the emulator; a clean
+  uninstall + install brings both back, and `query-activities` returns both the whole time).
+
+
 - **Wired priority.** The cable is now the preferred transport whenever it carries packets: a
   carrier coming up closes the access point, the wireless DMSDP listeners, HiSight and the audio
   socket, and rebinds the same three ports on the tunnel's own address (`HiCarTransportArbiter`).

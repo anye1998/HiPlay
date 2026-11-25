@@ -381,13 +381,17 @@ class HiCarHostActivity : ComponentActivity() {
     }
 
     /**
-     * Whether this launch came from the settings launcher icon.
+     * Whether this launch came from the `HiCar 设置` icon.
      *
-     * Android keeps the alias in the intent's component name, which is what tells the two launcher
-     * entries apart; the alias targets this activity, so the page itself is already the right place.
+     * That icon is a doorway activity ([HiCarSettingsLaunchActivity]) rather than an alias, so it
+     * arrives as an action. The action is consumed here: a configuration change reuses the same
+     * intent, and re-opening the settings page after the driver closed it would be a surprise.
      */
-    private fun openedFromSettingsShortcut(intent: Intent?): Boolean =
-        intent?.component?.className == SETTINGS_ALIAS
+    private fun openedFromSettingsShortcut(intent: Intent?): Boolean {
+        if (intent?.action != ACTION_SETTINGS) return false
+        intent.action = null
+        return true
+    }
 
     /**
      * Which layout the screen shows.
@@ -2026,14 +2030,6 @@ class HiCarHostActivity : ComponentActivity() {
 
         /** `adb logcat -s HiCar` on a head unit: short, and stable across sessions. */
         const val LOG_TAG = "HiCar"
-
-        /**
-         * The launcher alias that opens this activity straight into settings.
-         *
-         * Declared in the manifest next to the plain "HiCar" entry; see the manifest comment for why
-         * it is an alias of this activity rather than an activity of its own.
-         */
-        const val SETTINGS_ALIAS = "com.shilapi.xcertplay.HiCarSettingsAlias"
 
         /**
          * How long Stop gets to release the adapter and listeners before Start runs again.
