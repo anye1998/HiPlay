@@ -109,9 +109,27 @@ export JAVA_HOME=/path/to/jdk-21-or-newer
 ./gradlew :shared:testDebugUnitTest :common:compileDebugKotlin :mobile:assembleDebug
 ```
 
-`mobile` 是 APK，`samples/*` 是无关的演示应用。debug 包在
-`mobile/build/outputs/apk/debug/mobile-debug-unsigned.apk`，装之前用你自己的密钥签名。release
-构建只有旧的 CarPlay 身份需要 `DIPLAY_AUTH_ASSETS_DIR`，这个接收端不用它。
+`mobile` 是 APK，`samples/*` 是无关的演示应用。debug 产物是
+**`mobile/build/outputs/apk/debug/mobile-debug.apk`** —— 已经用本机的 debug 密钥签过名，可以直接装。
+（不需要再 `zipalign` / `apksigner`；如果产物叫 `…-unsigned.apk`，说明签名配置又丢了，见下。）
+
+签名身份要固定：HiChain 的配对密钥存在 `app_hicar-huks` 里，是用应用 UID 加密的，而 UID 跟签名
+绑定。换密钥重新签一次，车机上原有的配对就作废，手机下一次认证会失败。所以：
+
+- **只用一台电脑构建**，debug 密钥就是 `~/.android/debug.keystore`；换机器前把它一起拷走。
+- 有车载专用 keystore 时，用环境变量覆盖（四个都要给）：
+
+```bash
+export ANDROID_KEYSTORE_PATH=/path/to/car.jks
+export ANDROID_KEYSTORE_PASSWORD=…
+export ANDROID_KEY_ALIAS=…
+export ANDROID_KEY_PASSWORD=…
+./gradlew :mobile:assembleDebug
+```
+
+release 构建只有旧的 CarPlay 身份需要 `DIPLAY_AUTH_ASSETS_DIR`，这个接收端不用它。没给那四个
+变量时 `assembleRelease` 产出的是未签名包，**装不上**，这是刻意的：用一个临时密钥签 release
+只会让配对密钥在下次构建后失效。
 
 `automotive` 与地图示例是 CarPlay 时期的遗留，不属于接收端。
 

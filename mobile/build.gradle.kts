@@ -53,14 +53,21 @@ android {
             // against that UID: re-signing with a fresh debug key makes the stored pairing keys
             // unreadable (`ksf file flag is invalid`, rc=-1015), so the phone's next AUTHENTICATE
             // fails with HC_VERIFY_PROOF_FAILED and the car looks like a device it cannot prove
-            // itself to be. Falls back to the stock debug key when no keystore is supplied.
-            signingConfig = releaseSigning?.let { signingConfigs.getByName("release") }
+            // itself to be.
+            //
+            // A supplied car keystore wins; without one the build keeps AGP's own debug key. It must
+            // NOT be assigned `null` here: that removes the signing config rather than falling back,
+            // and `assembleDebug` then emits `mobile-debug-unsigned.apk`, which a car refuses to
+            // install ("no certificate").
+            releaseSigning?.let { signingConfig = signingConfigs.getByName("release") }
         }
         release {
             optimization {
                 enable = false
             }
-            signingConfig = releaseSigning?.let { signingConfigs.getByName("release") }
+            // Release stays deliberately unsigned without the four CI secrets: an APK signed with a
+            // throwaway key would look installable and then break the pairing keystore above.
+            releaseSigning?.let { signingConfig = signingConfigs.getByName("release") }
         }
     }
     compileOptions {

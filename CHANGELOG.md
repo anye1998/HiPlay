@@ -1,5 +1,15 @@
 # Unreleased — HiCar only
 
+- **`assembleDebug` produces an installable APK again.** The debug build type assigned
+  `signingConfig = releaseSigning?.let { … }`, and an explicit `null` there *removes* the signing
+  config instead of falling back to AGP's default, so the only output was
+  `mobile-debug-unsigned.apk` — which a car refuses with "no certificate". The car keystore is now
+  applied only when it exists; otherwise the build keeps `~/.android/debug.keystore`. Release stays
+  unsigned without the four CI secrets, on purpose: signing it with a throwaway key would invalidate
+  the HiChain pairing keystore on the next build. README says which file to install and why the
+  signing identity must not change.
+
+
 - The `HiCar 设置` desktop entry is now a real, invisible activity (`HiCarSettingsLaunchActivity`,
   `Theme.NoDisplay`, launches the host with `ACTION_SETTINGS` and finishes) instead of an
   `activity-alias`. An alias resolves and runs, but every launcher tested lists only one entry for
