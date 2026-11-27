@@ -1,5 +1,19 @@
 # Unreleased — HiCar only
 
+- **The car's own Bluetooth address can be read from the car.** Settings › 连接 gains
+  从系统读取本机蓝牙地址. No ordinary app may ask the platform for it (`BluetoothAdapter.getAddress`
+  answers the `02:00:00:00:00:00` placeholder since Android 6), so `HiCarBluetoothAddress` uses the
+  adb shell this app already holds: `settings get secure bluetooth_address` first, then the
+  Bluetooth service's own `address:` line out of `dumpsys bluetooth_manager`. The placeholder and
+  malformed values are refused rather than filled in, because either would derive an identity no
+  phone can match. The identity is deliberately not re-derived here: that is a pairing-level change,
+  so the driver keeps the second press. The result line distinguishes "no source answered", "address
+  is right but the identity is not derived from it", and "already consistent".
+- `identity()` was split into `storedIdentity()` + a live derivation. Comparing the live value made
+  an unsaved identity look applied (it is derived on the fly), which would have told the driver
+  there was nothing left to do while the old string was still in the preferences.
+
+
 - **`assembleDebug` produces an installable APK again.** The debug build type assigned
   `signingConfig = releaseSigning?.let { … }`, and an explicit `null` there *removes* the signing
   config instead of falling back to AGP's default, so the only output was

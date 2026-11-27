@@ -78,6 +78,7 @@ import com.shilapi.xcertplay.hicar.HiCarAdvertisementProbe
 import com.shilapi.xcertplay.hicar.HiCarController
 import com.shilapi.xcertplay.hicar.HiCarAudioSettings
 import com.shilapi.xcertplay.hicar.HiCarAudioSettingsStore
+import com.shilapi.xcertplay.hicar.HiCarBluetoothAddress
 import com.shilapi.xcertplay.hicar.HiCarDisplaySettings
 import com.shilapi.xcertplay.hicar.HiCarTouchPoint
 import com.shilapi.xcertplay.hicar.HiCarKeySettings
@@ -190,6 +191,17 @@ class HiCarHostActivity : ComponentActivity() {
 
     /** Whether the app has ever been told the adbd status in this run, so it is logged once. */
     private var adbLogged by mutableStateOf(false)
+
+    /**
+     * The address read off the car, in words, under the address field.
+     *
+     * Kept apart from [adbMessage]: the same adb channel answers both, but a driver reading one row
+     * must not see it overwritten by the other.
+     */
+    private var btReadMessage by mutableStateOf("")
+
+    /** True while the address is being read over adb; the two commands take a moment. */
+    private var btReading by mutableStateOf(false)
 
     /** Sharpness and frame rate: answered once per connection, so they apply to the next one. */
     private var videoSettings by mutableStateOf(HiCarVideoSettings())
@@ -708,6 +720,21 @@ class HiCarHostActivity : ComponentActivity() {
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                TextButton(onClick = ::readBluetoothAddress, enabled = !btReading) {
+                    Text(if (btReading) "正在读取…" else "从系统读取本机蓝牙地址")
+                }
+            }
+            if (btReadMessage.isNotEmpty()) {
+                Text(btReadMessage, style = MaterialTheme.typography.bodySmall)
+            }
+            Text(
+                "「从系统读取」走本应用自己的 adb 通道（要先在上面「获取 ADB 授权」）：" +
+                    "先读系统设置里存的地址，没有再问蓝牙服务。普通应用自己问不到——" +
+                    "Android 6 起只给 02:00:00:00:00:00 这个占位值，所以读不到时才需要手输。" +
+                    "地址一改，本机标识就跟着变，手机要重新配对一次。",
+                style = MaterialTheme.typography.bodySmall,
+            )
             Text(
                 "本机标识 = SHA-256(机型码 + 蓝牙地址) 的 64 位大写十六进制。" +
                     "手机按这个字符串索引存下的公钥：长度少一半，绑定照样能过，但每次重连都会被拒（错误码 17）。",
@@ -1072,6 +1099,51 @@ class HiCarHostActivity : ComponentActivity() {
         BydAdbAccess.State.NOT_APPROVED -> "未授权：点「获取 ADB 授权」，在车机弹窗里点允许"
         BydAdbAccess.State.ADB_OFF -> "连不上 127.0.0.1:5555：请确认车机的 adb 调试（无线 adb）已开启"
         BydAdbAccess.State.PAIRING_ONLY -> "该 adbd 只接受无线配对（TLS），本应用走 5555 明文通道"
+    }
+
+    /**
+     * Fills the address field from the car itself, over the same adb channel as 获取 ADB 授权.
+     *
+     * The platform will not answer `BluetoothAdapter.getAddress()` for an ordinary app, so the two
+     * sources a PC would read are used instead: the value stored in secure settings, then the
+     * Bluetooth service's own `dumpsys` line. The identity is *not* re-derived here: changing it is a
+     * pairing-level event (the phone keeps the old string), so the driver keeps that second press for
+     * themselves — this function only says what would follow.
+     */
+    private fun readBluetoothAddress() {
+        if (btReading) return
+        btReading = true
+        btReadMessage = "正在通过 adb 读取（先查系统设置，再问蓝牙服务）…"
+        appendLog("identity: reading the car's own Bluetooth address over adb")
+        Thread({
+            val reading = HiCarBluetoothAddress.read(this@HiCarHostActivity) { line ->
+                runOnUiThread { appendLog(line) }
+            }
+            runOnUiThread {
+                btReading = false
+                val address = reading.address
+                if (address == null) {
+                    btReadMessage = reading.detail
+                    return@runOnUiThread
+                }
+                val previous = btAddress
+                btAddress = address
+                rememberBluetoothAddress(address)
+                // Against what is *saved*, not against identity(): see storedIdentity().
+                val alreadyApplied = storedIdentity() == derivedIdentityFrom(model, address)
+                btReadMessage = when {
+                    alreadyApplied ->
+                        "读到的就是当前地址（${reading.source.label}）：$address，标识已经是它派生的值"
+                    previous.equals(address, ignoreCase = true) ->
+                        "地址本来就是 $address（${reading.source.label}），但标识不是按它派生的：" +
+                            "按下面「按蓝牙地址派生本机标识」应用它"
+                    else ->
+                        "已填入 $address（${reading.source.label}）" +
+                            (if (previous.isNotBlank()) "，替换了原先的 $previous" else "") +
+                            "。标识还没变：按下面「按蓝牙地址派生本机标识」，手机需要重新配对一次。"
+                }
+            }
+        }, "hicar-bt-address").start()
     }
 
     /**
@@ -1858,13 +1930,19 @@ class HiCarHostActivity : ComponentActivity() {
      * which is the only way to get back to a first-time bind when the phone's record is stale and
      * ours is gone. See 7.34 in `docs/HICAR_MIGRATION.md`.
      */
-    private fun identity(): String {
+    private fun identity(): String = storedIdentity() ?: derivedIdentity()
+
+    /**
+     * The identity this build has *written down*, or null when nothing is saved yet.
+     *
+     * Deliberately not [identity]: that one falls back to deriving on the fly, which looks identical
+     * on screen but is not what a phone was given last time. Comparing against a live derivation
+     * would call an unsaved identity "already applied" and leave the old string in the preferences.
+     */
+    private fun storedIdentity(): String? =
         getSharedPreferences(PREFERENCES, MODE_PRIVATE)
             .getString(KEY_IDENTITY, null)
             ?.takeIf { IDENTITY_PATTERN.matches(it) }
-            ?.let { return it }
-        return derivedIdentity()
-    }
 
     /**
      * The identity a phone will key its stored trust against.
