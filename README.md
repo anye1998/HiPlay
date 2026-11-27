@@ -147,6 +147,7 @@ release 构建只有旧的 CarPlay 身份需要 `DIPLAY_AUTH_ASSETS_DIR`，这�
 - [协议侦察与车机能力边界](docs/HICAR_RECON.md)
 - [迁移日志：每一次真实尝试，附日志行](docs/HICAR_MIGRATION.md)
 - [方向盘按键](docs/HICAR_KEYS.md) · [有线 HiCar](docs/HICAR_WIRED.md) · [车机 adb 判定清单](docs/HICAR_ADB.md)
+- [在电脑上能测到什么（以及测不到什么）](docs/HICAR_REMOTE.md) · 远程调试脚本 `scripts/hicar-live.sh`
 - [从 OpenHC 借鉴了什么、明确不做什么](docs/OPENHC_COMPARISON.md)
 - [CarPlay 删除：边界与进度](docs/CARPLAY_REMOVAL.md)
 - [变更日志](CHANGELOG.md) · [第三方声明](docs/THIRD_PARTY_NOTICES.md)

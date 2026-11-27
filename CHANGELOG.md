@@ -1,5 +1,13 @@
 # Unreleased — HiCar only
 
+- `scripts/hicar-live.sh`: watch the receiver where it runs instead of exporting a log and carrying it
+  back. `connect` re-dials itself after an adb server restart, and `log` / `shot` / `status` /
+  `start` / `stop` / `settings` / `install` / `pull-log` cover a debugging round. `docs/HICAR_REMOTE.md`
+  records the boundary in one place: the PC cannot host the receiver (BLE advertising, a 5 GHz access
+  point and a USB host role are all outside what an emulator or a VM supplies), what the virtual
+  Bluetooth in the official emulator actually is, and what a spare Android device can stand in for.
+
+
 - **A refused permission no longer looks like an authentication fault.** The 2026-11-27 car log
   showed the whole HiChain succeeding and then `Wi-Fi Direct failed (IOException)` /
   `local-only hotspot failed (SecurityException: UID … does not have Coarse/Fine Location
