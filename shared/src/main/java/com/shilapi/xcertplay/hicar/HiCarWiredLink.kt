@@ -80,7 +80,18 @@ internal class HiCarWiredLink(
                     val device = deviceOf(intent)
                     val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
                     onLog("USB: permission ${if (granted) "granted" else "denied"}${device?.let { " for ${it.deviceName}" } ?: ""}")
-                    if (granted && device != null) bring(device)
+                    if (granted && device != null) {
+                        bring(device)
+                    } else if (device != null) {
+                        // Every re-enumeration is a new device object, so the grant does not carry
+                        // over: a phone that switches mode asks again, and the driver may not be
+                        // looking. Say what to do instead of leaving a silent dead end.
+                        onLog(
+                            "wired: the cable needs its USB permission confirmed again after the phone " +
+                                "re-enumerates; enable 「USB 授权自动确认」 so the accessibility service " +
+                                "presses it, or plug the cable again and allow it",
+                        )
+                    }
                 }
 
                 UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
@@ -148,7 +159,7 @@ internal class HiCarWiredLink(
     /**
      * Asks the phone to switch, then drives the link once it re-appears.
      *
-     * Both are done on one background thread: the switch blocks for up to eight seconds and the
+     * Both are done on one background thread: the switch blocks for up to fifteen seconds and the
      * enumeration poll with it, and none of that belongs on a UI or Bluetooth thread.
      */
     private fun bring(device: UsbDevice) {
@@ -205,7 +216,10 @@ internal class HiCarWiredLink(
             }
             val match = awaitNcm(usb, serial, SWITCH_WAIT_MS)
             if (match == null) {
-                onLog("wired: the phone accepted the request but did not re-enumerate as NCM")
+                onLog(
+                    "wired: the phone accepted the request but did not re-enumerate as NCM; " +
+                        "the port now shows ${portLayouts(usb)}",
+                )
                 return false
             }
             onLog("wired: the phone switched to the NCM layout${describe(match)}")
@@ -290,13 +304,28 @@ internal class HiCarWiredLink(
             val devices = runCatching { usb.deviceList.values.toList() }.getOrNull().orEmpty()
             val match = devices.firstOrNull { device ->
                 device.vendorId == HUAWEI_VID &&
-                    (serial.isEmpty() || runCatching { device.serialNumber }.getOrNull() == serial) &&
+                    sameSerial(device, serial) &&
                     inNcmLayout(device)
             }
             if (match != null) return match
             Thread.sleep(250)
         }
         return null
+    }
+
+    /**
+     * Compares serials without letting an unreadable one rule a device out.
+     *
+     * A freshly enumerated device is not authorised yet, so `serialNumber` throws until the USB
+     * permission is granted again — and that is exactly the device this loop is waiting for. A strict
+     * compare therefore hides the switch behind a permission that only arrives afterwards: the phone
+     * does re-enumerate as NCM, the poll never sees it, and the log reads "did not re-enumerate as
+     * NCM" (seen on a Mate 80 Pro Max, 2026-11-27).
+     */
+    private fun sameSerial(device: UsbDevice, serial: String): Boolean {
+        if (serial.isEmpty()) return true
+        val other = runCatching { device.serialNumber }.getOrNull() ?: return true
+        return other == serial
     }
 
     /**
@@ -365,8 +394,52 @@ internal class HiCarWiredLink(
         return false
     }
 
-    private fun describe(device: UsbDevice): String =
-        " (${device.deviceName}, vid=0x${device.vendorId.toString(16)}, ${device.interfaceCount} interface(s))"
+    /**
+     * What the device's interface layout actually is, in the terms a reader of the log needs.
+     *
+     * NCM is the protocol this class drives. RNDIS is the other thing a phone may expose over the
+     * same cable, with different framing and no NCM descriptors — naming it stops the next reader
+     * from reading "the switch failed" when the phone did switch, just to something else.
+     */
+    private fun layoutKind(device: UsbDevice): String {
+        val interfaces = (0 until device.interfaceCount).map { device.getInterface(it) }
+        return when {
+            interfaces.any { it.interfaceClass == CLASS_COMM && it.interfaceSubclass == SUBCLASS_NCM } ->
+                "CDC-NCM"
+            interfaces.any { it.interfaceClass == CLASS_WIRELESS } ->
+                "RNDIS (wireless-controller class), which this driver cannot carry"
+            interfaces.any { it.interfaceClass == CLASS_COMM } ->
+                "CDC but not NCM (no subclass 0x0d interface)"
+            interfaces.any { it.interfaceClass == CLASS_CDC_DATA } ->
+                "CDC data only, no control interface"
+            else -> "vendor-specific"
+        }
+    }
+
+    /**
+     * Every Huawei device on the port, with its layout.
+     *
+     * Printed when the switch does not produce an NCM device: the count of interfaces alone cannot
+     * tell a phone that never switched from one that switched to a protocol this build does not
+     * speak, and those two need opposite fixes.
+     */
+    private fun portLayouts(usb: UsbManager): String {
+        val devices = runCatching { usb.deviceList.values.toList() }.getOrNull().orEmpty()
+            .filter { it.vendorId == HUAWEI_VID }
+        if (devices.isEmpty()) return "no Huawei device on the port"
+        return devices.joinToString("; ") { "${describe(it)} → ${layoutKind(it)}" }
+    }
+
+    private fun describe(device: UsbDevice): String {
+        val interfaces = (0 until device.interfaceCount).joinToString(", ") { index ->
+            val iface = device.getInterface(index)
+            "${hex(iface.interfaceClass)}/${hex(iface.interfaceSubclass)}/${hex(iface.interfaceProtocol)}"
+        }
+        return " (${device.deviceName}, vid=0x${device.vendorId.toString(16)}, " +
+            "${device.interfaceCount} interface(s) [class/subclass/protocol]: $interfaces)"
+    }
+
+    private fun hex(value: Int): String = (value and 0xFF).toString(16).padStart(2, '0')
 
     private fun deviceOf(intent: Intent): UsbDevice? {
         @Suppress("DEPRECATION")
@@ -428,9 +501,11 @@ internal class HiCarWiredLink(
         private const val REQUEST_CODE = 0x34
         private const val REQUEST_INDEX = 0xA0
         private const val CONTROL_TIMEOUT_MS = 2000
-        private const val SWITCH_WAIT_MS = 8_000L
+        private const val SWITCH_WAIT_MS = 15_000L
 
         private const val CLASS_COMM = 2
+        private const val CLASS_CDC_DATA = 10
+        private const val CLASS_WIRELESS = 0xE0
         private const val SUBCLASS_NCM = 13
 
         private val MODEL = Regex("^[0-9A-Fa-f]{8}$")

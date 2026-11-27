@@ -1,5 +1,31 @@
 # Unreleased — HiCar only
 
+- **A refused permission no longer looks like an authentication fault.** The 2026-11-27 car log
+  showed the whole HiChain succeeding and then `Wi-Fi Direct failed (IOException)` /
+  `local-only hotspot failed (SecurityException: UID … does not have Coarse/Fine Location
+  permission)`: the app had no Location grant (the applicationId change left it a new app with no
+  grants), so no access point was ever opened and the phone had nowhere to dial. Three changes:
+  `startReceiver()` now gates every path (button, cable wake, restored activity) — it asks for the
+  grant and opens no radio until it has it; the 开始无线 path, which used to bypass the check, now
+  asks too; and the setup page names the missing permissions and offers 打开应用权限, a deep link to
+  this app's system permission page. A hotspot failure whose cause is a missing grant now says so
+  in words instead of printing `失败：hotspot`.
+- `requiredPermissions()` adds `ACCESS_FINE_LOCATION` below API 33. On 12/12L the Bluetooth runtime
+  names do not cover the access point, and Wi-Fi Direct / LocalOnlyHotspot both gate on Location
+  there — asking only for the Bluetooth trio left the hotspot unopenable with no dialog for the
+  grant that was actually missing.
+- **Wired: the switch was recognised wrongly.** `awaitNcm` filtered candidates by `serialNumber`,
+  but a freshly enumerated device is not authorised yet, so reading its serial throws — and a strict
+  compare then hid exactly the device the loop was waiting for. The Mate 80 Pro Max did re-enumerate
+  (2 interfaces → 3) and the log still said "did not re-enumerate as NCM". `sameSerial` now treats an
+  unreadable serial as a match, the wait grew from 8 s to 15 s, and the log prints every interface
+  as class/subclass/protocol plus each Huawei device's layout (CDC-NCM / RNDIS / CDC but not NCM /
+  vendor-specific) when the switch does not produce one. A denied USB permission now explains that
+  each re-enumeration needs its own confirmation.
+- The cable wake line is logged once per session instead of once per re-enumeration, so six identical
+  lines no longer push the interesting ones out of a bounded log.
+
+
 - **The car's own Bluetooth address can be read from the car.** Settings › 连接 gains
   从系统读取本机蓝牙地址. No ordinary app may ask the platform for it (`BluetoothAdapter.getAddress`
   answers the `02:00:00:00:00:00` placeholder since Android 6), so `HiCarBluetoothAddress` uses the

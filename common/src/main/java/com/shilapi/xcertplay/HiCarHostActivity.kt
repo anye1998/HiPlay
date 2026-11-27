@@ -203,6 +203,9 @@ class HiCarHostActivity : ComponentActivity() {
     /** True while the address is being read over adb; the two commands take a moment. */
     private var btReading by mutableStateOf(false)
 
+    /** Whether the log already says the cable found a session running, so six re-enumerations say it once. */
+    private var cableNoted = false
+
     /** Sharpness and frame rate: answered once per connection, so they apply to the next one. */
     private var videoSettings by mutableStateOf(HiCarVideoSettings())
 
@@ -265,11 +268,25 @@ class HiCarHostActivity : ComponentActivity() {
     private val permissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { granted ->
         val refused = granted.filterValues { !it }.keys
         if (refused.isEmpty()) {
-            startReceiver(pendingWireless)
+            if (running) {
+                // The receiver was already up (a cable session, typically) and the driver asked for
+                // the wireless half: only that half changes.
+                wirelessOn = true
+                controller?.setWireless(true)
+                appendLog("button: wireless on; the cable is not affected")
+            } else {
+                startReceiver(pendingWireless)
+            }
         } else {
             // Name them: the access point needs Wi-Fi Direct, which fails without these, and a bare
             // "permissions were not granted" hides which step is about to fail.
             appendLog("Permissions refused: ${refused.joinToString()}")
+            if (refused.any { it == Manifest.permission.ACCESS_FINE_LOCATION }) {
+                appendLog(
+                    "the access point and the self-scan both need Location; until it is granted every " +
+                        "connection stops after authentication with no network to hand the phone",
+                )
+            }
         }
     }
 
@@ -380,7 +397,13 @@ class HiCarHostActivity : ComponentActivity() {
         intent.action = null
         appendLog("cable: the data line woke the receiver")
         if (running) {
-            appendLog("cable: a session is already running; the cable will take over by itself")
+            // A phone that switches USB mode re-enumerates several times, and each one re-delivers
+            // this intent. Repeating the line six times only pushes the interesting lines out of a
+            // bounded log; the state it describes has not changed.
+            if (!cableNoted) {
+                cableNoted = true
+                appendLog("cable: a session is already running; the cable will take over by itself")
+            }
             return
         }
         if (missingPermissions().isNotEmpty()) {
@@ -510,6 +533,20 @@ class HiCarHostActivity : ComponentActivity() {
                         },
                     )
                 }
+            }
+            val missingNow = missingPermissions()
+            if (missingNow.isNotEmpty()) {
+                // The one grant this build cannot work without, said plainly next to the button that
+                // needs it: without it the access point refuses and the phone is left after HiChain
+                // with nowhere to dial. Named as the platform names it, because the name changes with
+                // the Android version (Location below 13, Nearby devices from 13).
+                Text(
+                    "还差权限：${missingNow.joinToString { it.substringAfterLast('.') }}。" +
+                        "开热点和扫蓝牙都要它，没有它手机能连上但拿不到网络。" +
+                        "点上面的按钮会弹授权，选「允许」；如果已经点过拒绝，就点下面这个进系统设置打开。",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                TextButton(onClick = ::openAppPermissionSettings) { Text("打开应用权限") }
             }
             Text(
                 if (running) {
@@ -1012,6 +1049,22 @@ class HiCarHostActivity : ComponentActivity() {
     }
 
     /**
+     * The app's own permission page, for a grant that was refused before.
+     *
+     * `permissions.launch` stops showing a dialog once "don't ask again" is ticked — it answers
+     * refused immediately — so the only way left is the system screen. Deep-linking to this app's
+     * page avoids asking a driver to find it through three levels of settings while parked.
+     */
+    private fun openAppPermissionSettings() {
+        val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))
+        val opened = runCatching { startActivity(intent) }.isSuccess
+        appendLog(
+            if (opened) "settings: opened this app's permission screen"
+            else "settings: this ROM has no app permission screen",
+        )
+    }
+
+    /**
      * Reads the adbd state without offering the key.
      *
      * A check, not a request: `mayAsk = false` means the car's "allow debugging?" dialog can never
@@ -1292,14 +1345,30 @@ class HiCarHostActivity : ComponentActivity() {
     private fun toggle() {
         if (!running) {
             pendingWireless = true
-            if (missingPermissions().isNotEmpty()) {
-                permissions.launch(missingPermissions())
+            val missing = missingPermissions()
+            if (missing.isNotEmpty()) {
+                // Say it in the log too: the dialog can be dismissed or drawn behind the receiver, and
+                // then the only trace of "pressed Start, nothing happened" would be missing.
+                appendLog("start: asking for ${missing.joinToString()} before opening anything")
+                permissions.launch(missing)
             } else {
                 startReceiver(wireless = true)
             }
             return
         }
         val next = !wirelessOn
+        // Turning the wireless half back on has the same requirement as starting it: without the
+        // location grant the access point never opens, and the refusal only shows up after the phone
+        // has already finished HiChain. Ask here so the dialog appears before that wasted round.
+        if (next) {
+            val missing = missingPermissions()
+            if (missing.isNotEmpty()) {
+                pendingWireless = true
+                appendLog("button: wireless on needs ${missing.joinToString()}; asking for it first")
+                permissions.launch(missing)
+                return
+            }
+        }
         wirelessOn = next
         controller?.setWireless(next)
         appendLog("button: wireless ${if (next) "on" else "off"}; the cable is not affected")
@@ -1343,6 +1412,19 @@ class HiCarHostActivity : ComponentActivity() {
      */
     private fun startReceiver(wireless: Boolean = true) {
         if (running) return
+        // Last gate before anything opens a radio. Every caller is supposed to ask first, but this
+        // one path is what a cable broadcast and a restored activity also take, and a run without
+        // the location grant fails a whole HiChain later with nothing to hand the phone.
+        val missing = missingPermissions()
+        if (missing.isNotEmpty()) {
+            pendingWireless = wireless
+            appendLog(
+                "receiver: not starting; ${missing.joinToString()} is missing " +
+                    "(the access point and the self-scan both need it)",
+            )
+            permissions.launch(missing)
+            return
+        }
         running = true
         wirelessOn = wireless
         // The screen starts empty for a new attempt, but the export keeps earlier attempts: a retry
@@ -1607,6 +1689,7 @@ class HiCarHostActivity : ComponentActivity() {
         keysReady = false
         mediaFocus = false
         running = false
+        cableNoted = false
         controller?.close()
         controller = null
         status = HiCarStatus.Stopped
@@ -1843,7 +1926,13 @@ class HiCarHostActivity : ComponentActivity() {
         if (Build.VERSION.SDK_INT >= 33) {
             needed += Manifest.permission.NEARBY_WIFI_DEVICES
         }
-        return needed
+        // Up to Android 12L the access point is gated on Location, and on 12/12L the Bluetooth
+        // runtime names above do not include it — asking only for those leaves Wi-Fi Direct and
+        // LocalOnlyHotspot unopenable without a dialog ever being shown for the missing grant.
+        if (Build.VERSION.SDK_INT < 33) {
+            needed += Manifest.permission.ACCESS_FINE_LOCATION
+        }
+        return needed.distinct()
     }
 
     /**
@@ -2089,8 +2178,25 @@ class HiCarHostActivity : ComponentActivity() {
         is HiCarStatus.Streaming -> "画面通道已连接，正在接收手机视频"
         is HiCarStatus.Wired -> "数据线 ${status.address}，等待手机认证"
         is HiCarStatus.Blocked -> "受阻：${status.blocker.message}"
-        is HiCarStatus.Failed -> "失败：${status.reason}"
+        is HiCarStatus.Failed -> failureText(status.reason)
         is HiCarStatus.Stopped -> "已停止"
+    }
+
+    /**
+     * A failure the driver can act on, not a protocol token.
+     *
+     * "hotspot" is nearly always the location grant: Wi-Fi Direct and LocalOnlyHotspot both refuse
+     * without it, and the refusal only surfaces after the phone has finished HiChain — which reads
+     * like an authentication fault even though the handshake succeeded. Naming the permission here is
+     * the difference between a driver who fixes it in ten seconds and one who reports a protocol bug.
+     */
+    private fun failureText(reason: String): String = when {
+        reason.startsWith("hotspot") && missingPermissions().isNotEmpty() ->
+            "开不了热点：缺少 ${missingPermissions().joinToString { it.substringAfterLast('.') } }" +
+                " 权限（蓝牙扫描也用它）。点下面的「打开应用权限」授予后再点开始"
+        reason.startsWith("hotspot") ->
+            "开不了热点（$reason）。日志里 Wi-Fi P2P / LocalOnlyHotspot 那两行写着具体原因"
+        else -> "失败：$reason"
     }
 
     private companion object {
