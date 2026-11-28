@@ -669,6 +669,8 @@ class HiCarController(
                 onLog = onLog,
                 model = config.model,
                 bluetoothAddress = config.bluetoothAddress.ifEmpty { HiCarWiredLink.defaultBluetoothAddress() },
+                // Same value the handshake presents: the block's 32-byte device id must be this one.
+                localIdentity = config.localIdentity,
                 controlPort = config.controlPort,
                 onLinkUp = ::onCableUp,
                 onLinkDown = ::onCableDown,

@@ -1,5 +1,20 @@
 # Unreleased — HiCar only
 
+- **Wired, checked line by line against OpenHC.** The 2026-11-28 log never sent the car-info block at
+  all: the USB permission was requested and no answer ever arrived, so the phone stayed in a normal
+  layout (`06/01/01` PTP + `08/06/50` MTP) and nothing switched. Five differences were found and
+  fixed: the block is only sent for product ids 0x107d/0x107e/0x107f (0x5000 means USB debugging is on
+  and the phone ignores it, now said in the log); the 32-byte device id is the handshake identity, not
+  a hash of the raw fields (`HiCarCarInfo`, with tests — the old value described a car the phone had
+  never authenticated with); an insertion is spent once and needs a 5 s unplug before reuse; the
+  NCM poll skips devices that were already in that layout and no longer reads `serialNumber`, which
+  throws for an unauthorised device; and the permission wait polls `hasPermission` every 250 ms for
+  60 s instead of waiting for one broadcast that can be missed.
+- The setup page's QR code only appears once the wireless half is on air (`running && wirelessOn`).
+  An idle receiver, or a cable-only run, is not advertising, and a code then sends the phone to a car
+  that is not there — the failure reads as a bad code instead of a switched-off radio.
+
+
 - `scripts/hicar-live.sh`: watch the receiver where it runs instead of exporting a log and carrying it
   back. `connect` re-dials itself after an adb server restart, and `log` / `shot` / `status` /
   `start` / `stop` / `settings` / `install` / `pull-log` cover a debugging round. `docs/HICAR_REMOTE.md`

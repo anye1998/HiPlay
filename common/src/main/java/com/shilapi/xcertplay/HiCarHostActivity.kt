@@ -522,7 +522,10 @@ class HiCarHostActivity : ComponentActivity() {
                     "以这里显示的为准。",
                 style = MaterialTheme.typography.bodySmall,
             )
-            PairingCode()
+            // Only once the wireless half is actually on air: a QR code offered while the receiver is
+            // idle (or while a cable-only run is waiting) sends the phone to a car that is not
+            // advertising, and the failure looks like a bad code rather than a switched-off radio.
+            if (running && wirelessOn) PairingCode()
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Button(onClick = ::toggle, enabled = model.length == 8) {
                     Text(

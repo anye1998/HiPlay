@@ -33,8 +33,10 @@ import kotlin.random.Random
  * Everything above the cable — the nearby handshake, authentication, HiSight — is unchanged: the
  * phone dials the same TCP ports on the address this class gave it.
  *
- * **Not verified on a car.** The framing, the ARP rules and the tunnel plumbing each have unit tests,
- * but no part of this has run against a real phone over a real cable. See `docs/HICAR_WIRED.md`.
+ * **Partly verified on a car.** On 2026-11-27 the block was accepted (91 bytes) and the phone did
+ * re-enumerate, but the poll could not see it and a second insertion never got a permission answer.
+ * Both are fixed here (see [awaitNcm] and [handOver]); the link itself is still unproven. The
+ * framing, the ARP rules and the tunnel plumbing each have unit tests. See `docs/HICAR_WIRED.md`.
  *
  * The reverse-engineering this is built on is OpenHC's (`CarInfoSender`, `NcmUsbLink`,
  * `WiredVpnService`), GPL-3.0-only.
@@ -46,6 +48,15 @@ internal class HiCarWiredLink(
     private val model: String,
     /** The head unit's Bluetooth address as text; zeroes when unusable, with a line in the log. */
     private val bluetoothAddress: String,
+    /**
+     * The identity the Bluetooth side already answers with, 64 upper-case hex digits.
+     *
+     * The block carries the same value as a 32-byte field. It has to be the *same* value: the
+     * derivation is `SHA-256` over the upper-case hex text of model‖sub-model‖address, not over the
+     * raw bytes, and a block whose device id disagrees with the handshake is a car the phone cannot
+     * place — see [carInfo].
+     */
+    private val localIdentity: String = "",
     /** The port the phone should dial: the same control port the wireless path serves. */
     private val controlPort: Int,
     /** The address the phone will reach this side on, e.g. `192.168.66.137`. */
@@ -61,12 +72,34 @@ internal class HiCarWiredLink(
     private val onLinkDown: (String) -> Unit = {},
 ) : AutoCloseable {
 
+    /**
+     * What the phone's USB port is, from the wired path's point of view.
+     *
+     * The switch block only works in [NORMAL]; with USB debugging on the phone ignores it, and after
+     * the switch the same product id comes back with the two CDC interfaces.
+     */
+    private enum class PhoneMode { NOT_A_PHONE, NORMAL, USB_DEBUGGING, NCM, UNSUPPORTED }
+
     private val appContext = context.applicationContext
     private val manager = appContext.getSystemService(UsbManager::class.java)
 
     @Volatile private var closed = false
     @Volatile private var busy = false
     @Volatile private var up = false
+
+    /** What to do as soon as the system allows opening [phone], whichever answer arrives first. */
+    @Volatile private var afterPermission: ((UsbDevice) -> Unit)? = null
+
+    /**
+     * Whether this insertion has already been spent on a car-info block.
+     *
+     * The phone answers one block per insertion and then resets about 1.5 s later; a second block in
+     * the same insertion is ignored, and an immediate unplug-replug often is too (measured by OpenHC).
+     */
+    @Volatile private var usedThisPlug = false
+
+    /** When the cable was last pulled, so a re-plug inside the hold is not mistaken for a fresh one. */
+    @Volatile private var unpluggedAt = 0L
     private var path: HiCarNcmDataPath? = null
     private var port: HiCarNcmUsb? = null
 
@@ -78,33 +111,49 @@ internal class HiCarWiredLink(
             when (intent?.action) {
                 ACTION_PERMISSION -> {
                     val device = deviceOf(intent)
-                    val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
-                    onLog("USB: permission ${if (granted) "granted" else "denied"}${device?.let { " for ${it.deviceName}" } ?: ""}")
-                    if (granted && device != null) {
-                        bring(device)
-                    } else if (device != null) {
-                        // Every re-enumeration is a new device object, so the grant does not carry
-                        // over: a phone that switches mode asks again, and the driver may not be
-                        // looking. Say what to do instead of leaving a silent dead end.
-                        onLog(
-                            "wired: the cable needs its USB permission confirmed again after the phone " +
-                                "re-enumerates; enable 「USB 授权自动确认」 so the accessibility service " +
-                                "presses it, or plug the cable again and allow it",
+                    val claimed = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+                    // The extra alone is not evidence: before Android 13 this action is only ours by
+                    // name, so the system's own record decides.
+                    val allowed = device != null && manager?.hasPermission(device) == true
+                    onLog(
+                        "USB: permission ${if (allowed) "granted" else "denied"}" +
+                            (device?.let { " for ${it.deviceName}" } ?: ""),
+                    )
+                    when {
+                        allowed && device != null -> runAfterPermission(device)
+                        !claimed && device != null -> onLog(
+                            "wired: the USB permission was refused; the phone stays in its normal mode",
                         )
                     }
                 }
 
                 UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
                     val device = deviceOf(intent) ?: return
-                    onLog("USB: device attached${describe(device)}")
-                    // The phone may already be the NCM device from a previous run.
-                    if (inNcmLayout(device)) bring(device) else requestPermission(device)
+                    val mode = phoneMode(device)
+                    onLog("USB: device attached${describe(device)} — ${label(mode)}")
+                    when (mode) {
+                        PhoneMode.NCM -> bring(device)
+                        PhoneMode.NORMAL -> bring(device)
+                        // Said once per attach on purpose: this is the one state a driver can fix
+                        // without touching the car, and the symptom is otherwise a silent no-op.
+                        PhoneMode.USB_DEBUGGING -> onLog(
+                            "wired: the phone has USB debugging on (pid 0x5000) and ignores the switch " +
+                                "request in that state; turn USB debugging off on the phone, then plug in again",
+                        )
+                        PhoneMode.UNSUPPORTED -> onLog(
+                            "wired: this device is in a USB mode this build cannot switch " +
+                                "(pid 0x${device.productId.toString(16)}); nothing sent",
+                        )
+                        PhoneMode.NOT_A_PHONE -> Unit
+                    }
                 }
 
                 UsbManager.ACTION_USB_DEVICE_DETACHED -> {
                     val device = deviceOf(intent) ?: return
                     onLog("USB: device detached${describe(device)}")
                     teardown("the cable was unplugged")
+                    afterPermission = null
+                    if (usedThisPlug) unpluggedAt = System.currentTimeMillis()
                 }
             }
         }
@@ -132,18 +181,16 @@ internal class HiCarWiredLink(
         // with the cable attached — and the case a manifest receiver leaves behind when the launch of
         // the activity is what started this run.
         val present = runCatching { manager?.deviceList?.values?.toList() }.getOrNull().orEmpty()
-        val attached = present.firstOrNull { inNcmLayout(it) }
-        if (attached != null) {
-            onLog("wired: a phone is already in the NCM layout${describe(attached)}")
-            bring(attached)
-            return
-        }
-        // Still in its factory layout: the car-info block has not been sent yet. Without this branch
-        // a cable plugged in before the app existed would stay inert until it was unplugged and
-        // plugged again, because the attach broadcast was delivered before this receiver existed.
-        present.firstOrNull { it.vendorId == HUAWEI_VID }?.let {
-            onLog("wired: a phone is already on the port${describe(it)}; switching it to NCM")
-            bring(it)
+        present.forEach { onLog("wired: already on the port${describe(it)} — ${label(phoneMode(it))}") }
+        val candidate = present.firstOrNull { phoneMode(it) == PhoneMode.NCM }
+            ?: present.firstOrNull { phoneMode(it) == PhoneMode.NORMAL }
+        if (candidate != null) {
+            onLog("wired: starting with${describe(candidate)}")
+            bring(candidate)
+        } else if (present.any { phoneMode(it) == PhoneMode.USB_DEBUGGING }) {
+            onLog(
+                "wired: the phone has USB debugging on; it will not accept the switch until that is off",
+            )
         }
     }
 
@@ -163,13 +210,67 @@ internal class HiCarWiredLink(
      * enumeration poll with it, and none of that belongs on a UI or Bluetooth thread.
      */
     private fun bring(device: UsbDevice) {
+        when (phoneMode(device)) {
+            PhoneMode.NCM -> handOver(device) { allowed -> startOnWorker { openAndRun(allowed) } }
+            PhoneMode.NORMAL -> handOver(device) { allowed -> startOnWorker { switchToNcm(allowed) } }
+            PhoneMode.USB_DEBUGGING -> onLog(
+                "wired: not switching while USB debugging is on; the phone would ignore the block",
+            )
+            PhoneMode.UNSUPPORTED, PhoneMode.NOT_A_PHONE -> Unit
+        }
+    }
+
+    /** Runs the pending step once, whichever answer for the permission arrived first. */
+    private fun runAfterPermission(device: UsbDevice) {
+        val action = afterPermission ?: return
+        afterPermission = null
+        runCatching { action(device) }
+    }
+
+    /**
+     * Asks the system for [device] and runs [then] once it may be opened.
+     *
+     * Two sources answer, deliberately. The broadcast is the normal one, but it is delivered to a
+     * receiver this class registers itself and can be missed while the phone re-enumerates — the
+     * 2026-11-28 log asked for permission and never heard back at all, so nothing was ever sent. The
+     * poll also covers a device the system already trusts (the grant is per device instance, and the
+     * NCM device is a new one).
+     */
+    private fun handOver(device: UsbDevice, then: (UsbDevice) -> Unit) {
+        val usb = manager ?: return
+        if (usb.hasPermission(device)) {
+            then(device)
+            return
+        }
+        afterPermission = then
+        requestPermission(device)
+        Thread({
+            val deadline = System.currentTimeMillis() + PERMISSION_WAIT_MS
+            while (System.currentTimeMillis() < deadline && !closed) {
+                if (usb.hasPermission(device)) {
+                    runAfterPermission(device)
+                    return@Thread
+                }
+                Thread.sleep(PERMISSION_POLL_MILLIS)
+            }
+            if (!closed && afterPermission != null) {
+                afterPermission = null
+                onLog(
+                    "wired: no answer to the USB permission dialog for ${device.deviceName} within " +
+                        "${PERMISSION_WAIT_MS / 1000}s, so nothing was sent. Allow it on the head unit's " +
+                        "screen (or enable 「USB 授权自动确认」), then unplug and plug in again",
+                )
+            }
+        }, "hicar-usb-permission").apply { isDaemon = true }.start()
+    }
+
+    /** One carrier thread at a time: the switch blocks, the enumeration poll blocks with it. */
+    private fun startOnWorker(work: () -> Unit) {
         if (closed || busy) return
         busy = true
         Thread({
             try {
-                // A phone that is already in the layout is one that switched in a previous run and
-                // was never opened; switching it again would only reset a working device.
-                if (inNcmLayout(device)) openAndRun(device) else switchToNcm(device)
+                work()
             } catch (failure: Exception) {
                 onLog("wired: ${failure.javaClass.simpleName}: ${failure.message}")
                 teardown("setup failed")
@@ -188,41 +289,52 @@ internal class HiCarWiredLink(
      */
     private fun switchToNcm(device: UsbDevice): Boolean {
         val usb = manager ?: return false
-        if (!usb.hasPermission(device)) {
-            requestPermission(device)
-            return false
-        }
-        val serial = runCatching { device.serialNumber }.getOrNull().orEmpty()
-        val connection = runCatching { usb.openDevice(device) }.getOrNull()
-        if (connection == null) {
+        if (!maySpendThisPlug()) return false
+        val connection = runCatching { usb.openDevice(device) }.getOrNull() ?: run {
             onLog("wired: could not open ${device.deviceName}; another app may hold it")
             return false
         }
+        val packet = carInfo()
+        // Devices that were already in the NCM layout before this switch: the phone's new device must
+        // not be confused with one of those, or the poll returns instantly with the wrong object.
+        val stale = ncmDeviceNames(usb)
         try {
-            val packet = carInfo()
-            val sent = connection.controlTransfer(
-                REQUEST_OUT,
-                REQUEST_CODE,
-                0,
-                REQUEST_INDEX,
-                packet,
-                packet.size,
-                CONTROL_TIMEOUT_MS,
-            )
+            var sent = -1
+            for (attempt in 1..CAR_INFO_ATTEMPTS) {
+                sent = runCatching {
+                    connection.controlTransfer(
+                        REQUEST_OUT,
+                        REQUEST_CODE,
+                        0,
+                        REQUEST_INDEX,
+                        packet,
+                        packet.size,
+                        CONTROL_TIMEOUT_MS,
+                    )
+                }.getOrDefault(-1)
+                if (sent == packet.size) break
+                onLog("wired: car info attempt $attempt/$CAR_INFO_ATTEMPTS returned $sent")
+                if (attempt < CAR_INFO_ATTEMPTS) Thread.sleep(CAR_INFO_RETRY_MILLIS)
+            }
             onLog("wired: car info ${packet.size} bytes -> $sent (address $hostAddress:$controlPort)")
-            if (sent < 0) {
-                onLog("wired: the phone stalled the switch request")
+            if (sent != packet.size) {
+                onLog("wired: the phone did not take the switch request (expected ${packet.size} bytes)")
                 return false
             }
-            val match = awaitNcm(usb, serial, SWITCH_WAIT_MS)
+            usedThisPlug = true
+            onLog(
+                "wired: waiting for the phone to appear as CDC-NCM " +
+                    "(same product id, plus a class 2/13 control interface and a class 10 data one)",
+            )
+            val match = awaitNcm(usb, stale, SWITCH_WAIT_MS)
             if (match == null) {
                 onLog(
-                    "wired: the phone accepted the request but did not re-enumerate as NCM; " +
+                    "wired: the phone did not re-enumerate as NCM within ${SWITCH_WAIT_MS / 1000}s; " +
                         "the port now shows ${portLayouts(usb)}",
                 )
                 return false
             }
-            onLog("wired: the phone switched to the NCM layout${describe(match)}")
+            onLog("wired: the phone switched to the NCM layout${describe(match)} — ${label(phoneMode(match))}")
             port?.close()
             port = null
             return openAndRun(match)
@@ -230,6 +342,31 @@ internal class HiCarWiredLink(
             runCatching { connection.close() }
         }
     }
+
+    /**
+     * Whether this insertion may still be used.
+     *
+     * One block per insertion: after it the phone resets itself, and a second block in the same
+     * insertion — or an immediate unplug-replug — is ignored. Spending it would only waste the next
+     * insertion, so the hold is reported instead of being silently consumed.
+     */
+    private fun maySpendThisPlug(): Boolean {
+        if (!usedThisPlug) return true
+        if (unpluggedAt > 0 && System.currentTimeMillis() - unpluggedAt >= REPLUG_HOLD_MS) {
+            usedThisPlug = false
+            unpluggedAt = 0
+            return true
+        }
+        onLog(
+            "wired: this insertion already sent car info and the phone answers once per insertion; " +
+                "unplug the cable, wait ${REPLUG_HOLD_MS / 1000}s and plug it back in",
+        )
+        return false
+    }
+
+    private fun ncmDeviceNames(usb: UsbManager): Set<String> = runCatching {
+        usb.deviceList.values.filter { phoneMode(it) == PhoneMode.NCM }.map { it.deviceName }.toSet()
+    }.getOrDefault(emptySet())
 
     /** After the switch the device object is new, so this opens it straight away. */
     private fun openAndRun(device: UsbDevice): Boolean {
@@ -297,35 +434,21 @@ internal class HiCarWiredLink(
         runCatching { usb.requestPermission(device, pending) }
     }
 
-    /** Polls for the device that came back in the NCM layout; the serial keeps a hub honest. */
-    private fun awaitNcm(usb: UsbManager, serial: String, waitMillis: Long): UsbDevice? {
+    /**
+     * Polls for the device that came back in the NCM layout.
+     *
+     * A device that was already in that layout before the switch is skipped ([stale]): the phone's
+     * new object has a new name, so name is enough, and it avoids reading `serialNumber` — which
+     * throws for a device that is not authorised yet, and that is exactly the device being waited for.
+     */
+    private fun awaitNcm(usb: UsbManager, stale: Set<String>, waitMillis: Long): UsbDevice? {
         val deadline = System.currentTimeMillis() + waitMillis
         while (System.currentTimeMillis() < deadline && !closed) {
             val devices = runCatching { usb.deviceList.values.toList() }.getOrNull().orEmpty()
-            val match = devices.firstOrNull { device ->
-                device.vendorId == HUAWEI_VID &&
-                    sameSerial(device, serial) &&
-                    inNcmLayout(device)
-            }
-            if (match != null) return match
+            devices.firstOrNull { it.deviceName !in stale && phoneMode(it) == PhoneMode.NCM }?.let { return it }
             Thread.sleep(250)
         }
         return null
-    }
-
-    /**
-     * Compares serials without letting an unreadable one rule a device out.
-     *
-     * A freshly enumerated device is not authorised yet, so `serialNumber` throws until the USB
-     * permission is granted again — and that is exactly the device this loop is waiting for. A strict
-     * compare therefore hides the switch behind a permission that only arrives afterwards: the phone
-     * does re-enumerate as NCM, the poll never sees it, and the log reads "did not re-enumerate as
-     * NCM" (seen on a Mate 80 Pro Max, 2026-11-27).
-     */
-    private fun sameSerial(device: UsbDevice, serial: String): Boolean {
-        if (serial.isEmpty()) return true
-        val other = runCatching { device.serialNumber }.getOrNull() ?: return true
-        return other == serial
     }
 
     /**
@@ -350,12 +473,7 @@ internal class HiCarWiredLink(
             onLog("wired: no usable Bluetooth address ('$bluetoothAddress'); sending zeros")
             ByteArray(6)
         }
-        val deviceId = MessageDigest.getInstance("SHA-256").run {
-            update(modelBytes)
-            update(subModel)
-            update(bt)
-            digest()
-        }
+        val deviceId = HiCarCarInfo.deviceId(modelBytes, subModel, bt, localIdentity)
         val buffer = ByteBuffer.allocate(PACKET_SIZE).order(ByteOrder.LITTLE_ENDIAN)
         buffer.put(MAGIC.toByteArray(Charsets.US_ASCII))
         buffer.putShort(PACKET_SIZE.toShort())
@@ -386,12 +504,40 @@ internal class HiCarWiredLink(
         return buffer.array()
     }
 
+    /**
+     * The phone's layout after the switch: a CDC-NCM control interface *and* a CDC data interface.
+     *
+     * Both are required, not just the control one. A device that grows only a control interface is
+     * something else, and [HiCarNcmUsb.open] would fail a step later with a much less useful message.
+     */
     private fun inNcmLayout(device: UsbDevice): Boolean {
+        var control = false
+        var data = false
         for (index in 0 until device.interfaceCount) {
             val iface = device.getInterface(index)
-            if (iface.interfaceClass == CLASS_COMM && iface.interfaceSubclass == SUBCLASS_NCM) return true
+            if (iface.interfaceClass == CLASS_COMM && iface.interfaceSubclass == SUBCLASS_NCM) control = true
+            if (iface.interfaceClass == CLASS_CDC_DATA) data = true
         }
-        return false
+        return control && data
+    }
+
+    /** What the port looks like, in the one word the log needs. */
+    private fun phoneMode(device: UsbDevice): PhoneMode {
+        if (device.vendorId != HUAWEI_VID && device.vendorId != HONOR_VID) return PhoneMode.NOT_A_PHONE
+        if (inNcmLayout(device)) return PhoneMode.NCM
+        return when (device.productId) {
+            PID_NORMAL_A, PID_NORMAL_B, PID_NORMAL_C -> PhoneMode.NORMAL
+            PID_USB_DEBUGGING -> PhoneMode.USB_DEBUGGING
+            else -> PhoneMode.UNSUPPORTED
+        }
+    }
+
+    private fun label(mode: PhoneMode): String = when (mode) {
+        PhoneMode.NOT_A_PHONE -> "not a Huawei/Honor phone"
+        PhoneMode.NORMAL -> "normal mode, answers the switch block"
+        PhoneMode.USB_DEBUGGING -> "USB debugging on, refuses the switch block"
+        PhoneMode.NCM -> "already CDC-NCM"
+        PhoneMode.UNSUPPORTED -> "a product id this build does not switch"
     }
 
     /**
@@ -436,6 +582,7 @@ internal class HiCarWiredLink(
             "${hex(iface.interfaceClass)}/${hex(iface.interfaceSubclass)}/${hex(iface.interfaceProtocol)}"
         }
         return " (${device.deviceName}, vid=0x${device.vendorId.toString(16)}, " +
+            "pid=0x${device.productId.toString(16)}, " +
             "${device.interfaceCount} interface(s) [class/subclass/protocol]: $interfaces)"
     }
 
@@ -482,6 +629,27 @@ internal class HiCarWiredLink(
 
         private const val ACTION_PERMISSION = "com.shilapi.xcertplay.hicar.USB_PERMISSION"
         private const val HUAWEI_VID = 0x12D1
+        private const val HONOR_VID = 0x339B
+
+        /**
+         * The product ids a phone answers the switch block in, and the one it refuses it in.
+         *
+         * Measured, not guessed (`HuaweiPhone` in OpenHC): the normal states are 0x107d/0x107e/0x107f,
+         * 0x5000 means "USB debugging on" and the phone ignores the block there, and the same id is
+         * kept after the switch — only the interfaces change.
+         */
+        private const val PID_NORMAL_A = 0x107D
+        private const val PID_NORMAL_B = 0x107E
+        private const val PID_NORMAL_C = 0x107F
+        private const val PID_USB_DEBUGGING = 0x5000
+
+        private const val CAR_INFO_ATTEMPTS = 3
+        private const val CAR_INFO_RETRY_MILLIS = 300L
+        private const val PERMISSION_WAIT_MS = 60_000L
+        private const val PERMISSION_POLL_MILLIS = 250L
+        private const val REPLUG_HOLD_MS = 5_000L
+
+        private val IDENTITY = Regex("^[0-9A-Fa-f]{64}$")
 
         private const val MAGIC = "hwnearby"
         private const val PACKET_SIZE = 91
