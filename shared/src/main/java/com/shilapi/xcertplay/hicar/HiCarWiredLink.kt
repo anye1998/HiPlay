@@ -121,9 +121,17 @@ internal class HiCarWiredLink(
     /** Whether the VPN dialog has already been raised this session, so it is not raised in a loop. */
     @Volatile private var vpnAsked = false
 
+    /** When the wait for the system's own USB grant ends; the poll asks after that, not before. */
+    @Volatile private var graceUntil = 0L
+
     /** Serialises [startOnWorker]: one carrier thread, plus at most one queued step. */
     private val workerLock = Any()
     private var queuedWork: (() -> Unit)? = null
+
+    /** Devices this receiver already started on, so the port poll does not re-ask them every second. */
+    private val tried: MutableSet<String> = java.util.Collections.newSetFromMap(
+        java.util.concurrent.ConcurrentHashMap<String, Boolean>(),
+    )
 
     /** What to do as soon as the system allows opening [phone], whichever answer arrives first. */
     @Volatile private var afterPermission: ((UsbDevice) -> Unit)? = null
@@ -215,8 +223,36 @@ internal class HiCarWiredLink(
         val phones = present.filter { phoneMode(it) != PhoneMode.NOT_A_PHONE }
         val candidate = phones.firstOrNull { phoneMode(it) == PhoneMode.NCM } ?: phones.firstOrNull()
         if (candidate != null) {
+            tried.add(candidate.deviceName)
             onLog("wired: starting with${describe(candidate)}")
             bring(candidate)
+        }
+        // Keep the alias in step with the wired switch: it is what lets the system grant the cable's
+        // permission without a dialog, and what stops it being offered when the cable is off.
+        HiCarWiredAttach.setEnabled(appContext, HiCarWiredSettings.enabled(appContext))
+        Thread({ pollPort() }, "hicar-usb-poll").apply { isDaemon = true }.start()
+    }
+
+    /**
+     * Looks at the port once a second.
+     *
+     * Not every head unit delivers the attach broadcast — and one delivered while this process was
+     * still starting is simply gone. The scan is what makes the cable work anyway. Devices already
+     * handled are remembered until they disappear, so a phone that refused permission is not
+     * re-asked every second.
+     */
+    private fun pollPort() {
+        while (!closed) {
+            Thread.sleep(PORT_POLL_MILLIS)
+            if (closed) return
+            val devices = runCatching { manager?.deviceList?.values?.toList() }.getOrNull().orEmpty()
+            tried.retainAll(devices.map { it.deviceName }.toSet())
+            if (afterPermission != null || path != null || port != null) continue
+            val next = devices.firstOrNull { phoneMode(it) != PhoneMode.NOT_A_PHONE && it.deviceName !in tried }
+                ?: continue
+            tried.add(next.deviceName)
+            onLog("wired: the port has a phone the attach broadcast did not report; starting with${describe(next)}")
+            bring(next)
         }
     }
 
@@ -236,6 +272,21 @@ internal class HiCarWiredLink(
      * enumeration poll with it, and none of that belongs on a UI or Bluetooth thread.
      */
     private fun bring(device: UsbDevice) {
+        // Consent first, before anything is sent: a phone answers one car-info block per insertion,
+        // and spending it on a session that cannot build a tunnel leaves the cable dead until the
+        // driver unplugs (OpenHC checks this at the same point, for the same reason).
+        if (!HiCarWiredVpn.consented(appContext)) {
+            pendingDevice = device
+            onLog(
+                "wired: no VPN consent for the cable yet, so this insertion is not spent; asking the " +
+                    "driver first",
+            )
+            if (!vpnAsked) {
+                vpnAsked = true
+                HiCarWiredVpn.consentIntent(appContext)?.let { requestVpnConsent(it) }
+            }
+            return
+        }
         if (phoneMode(device) == PhoneMode.NCM) {
             handOver(device) { allowed -> startOnWorker { openAndRun(allowed) } }
             return
@@ -281,6 +332,8 @@ internal class HiCarWiredLink(
             runAfterPermission(device)
             return
         }
+        // Still inside the window where the system may grant by itself: the poll will ask after it.
+        if (System.currentTimeMillis() < graceUntil) return
         askOnce(device, force = true)
     }
 
@@ -314,7 +367,17 @@ internal class HiCarWiredLink(
         pendingDevice = device
         askedAt = 0L
         askCount = 0
-        if (hostVisible) {
+        // With the USB-attach alias enabled the system grants by itself a few tens of milliseconds
+        // after the attach; asking inside that window pops a dialog the driver does not need.
+        val graceUntil = System.currentTimeMillis() + HiCarWiredAttach.graceMillis(appContext)
+        this.graceUntil = graceUntil
+        val waitFirst = graceUntil - System.currentTimeMillis()
+        if (waitFirst > 0 && hostVisible) {
+            onLog(
+                "wired: waiting ${waitFirst}ms for the system's own grant before asking " +
+                    "(the USB-attach alias is enabled)",
+            )
+        } else if (hostVisible) {
             askOnce(device)
         } else {
             onLog(
@@ -329,7 +392,9 @@ internal class HiCarWiredLink(
                     runAfterPermission(device)
                     return@Thread
                 }
-                if (hostVisible && afterPermission != null) askOnce(device)
+                if (hostVisible && afterPermission != null && System.currentTimeMillis() >= graceUntil) {
+                    askOnce(device)
+                }
                 Thread.sleep(PERMISSION_POLL_MILLIS)
             }
             if (!closed && afterPermission != null) {
@@ -520,14 +585,22 @@ internal class HiCarWiredLink(
      * back here instead of making the driver unplug and start over.
      */
     private fun beginCarrying(ncm: HiCarNcmUsb): Boolean {
-        val tunnel = HiCarWiredVpn.open(appContext, hostAddress, onLog) ?: run {
+        val tunnel = HiCarWiredVpn.open(
+            context = appContext,
+            address = hostAddress,
+            onLog = onLog,
+            onRevoked = {
+                onLog("wired: the system revoked the tunnel")
+                Thread({ teardown("the tunnel was revoked") }, "hicar-wired").apply { isDaemon = true }.start()
+            },
+        ) ?: run {
+            // Consent is checked before an insertion is spent, so reaching this means something else
+            // refused the tunnel. The log line from the VPN layer says which; the port is kept when a
+            // dialog can still fix it.
             val consent = HiCarWiredVpn.consentIntent(appContext)
             if (consent != null && !vpnAsked) {
                 vpnAsked = true
-                onLog(
-                    "wired: the cable can carry packets only through a VPN tunnel, and Android needs " +
-                        "the driver to allow one; raising that dialog now",
-                )
+                onLog("wired: consent was missing after all; raising the dialog and keeping the open port")
                 requestVpnConsent(consent)
                 return false
             }
@@ -536,7 +609,6 @@ internal class HiCarWiredLink(
             port = null
             return false
         }
-        onLog("wired: tunnel up at $hostAddress/$VPN_PREFIX; only that subnet is routed into it")
         val address = ipv4(hostAddress) ?: return false
         val data = HiCarNcmDataPath(
             port = ncm,
@@ -574,13 +646,20 @@ internal class HiCarWiredLink(
             teardown("the VPN prompt was declined")
             return
         }
-        val ncm = port ?: run {
-            // The dialog was raised ahead of the phone, so there is nothing to continue yet.
-            onLog("wired: VPN allowed; the cable can be driven now")
+        // Granted: carry on with what was waiting — an open port if the phone had already switched,
+        // otherwise the device whose insertion was deliberately not spent.
+        port?.let { open ->
+            onLog("wired: VPN allowed; continuing with the open port")
+            startOnWorker { beginCarrying(open) }
             return
         }
-        onLog("wired: VPN allowed; continuing with the open port")
-        startOnWorker { beginCarrying(ncm) }
+        val device = pendingDevice
+        if (device != null) {
+            onLog("wired: VPN allowed; continuing with the phone that was already waiting")
+            startOnWorker { bring(device) }
+            return
+        }
+        onLog("wired: VPN allowed; the cable can be driven now")
     }
 
     private fun teardown(reason: String) {
@@ -833,6 +912,7 @@ internal class HiCarWiredLink(
         private const val PERMISSION_POLL_MILLIS = 250L
         private const val PERMISSION_REASK_MILLIS = 4_000L
         private const val PERMISSION_ASK_LIMIT = 3
+        private const val PORT_POLL_MILLIS = 1_000L
         private const val REPLUG_HOLD_MS = 5_000L
         private const val VPN_PREFIX = 24
 
@@ -886,6 +966,9 @@ object HiCarWiredSettings {
     fun setEnabled(context: Context, enabled: Boolean) {
         context.applicationContext.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
             .edit().putBoolean(KEY_ENABLED, enabled).apply()
+        // The USB-attach alias belongs to the same switch: with the cable off there is no reason for
+        // the system to offer this app when a phone is plugged in.
+        HiCarWiredAttach.setEnabled(context, enabled)
     }
 
     /** Whether an inserted cable may start the app by itself. */

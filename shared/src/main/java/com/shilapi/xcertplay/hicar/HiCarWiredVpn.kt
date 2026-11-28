@@ -1,8 +1,12 @@
 package com.shilapi.xcertplay.hicar
 
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.ServiceConnection
 import android.net.VpnService
+import android.os.Binder
+import android.os.IBinder
 import android.os.ParcelFileDescriptor
 import android.system.ErrnoException
 import android.system.Os
@@ -14,6 +18,7 @@ import java.io.IOException
 import java.io.InterruptedIOException
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * The TUN descriptor a `VpnService` establishes, read and written one IP packet at a time.
@@ -144,68 +149,66 @@ internal class HiCarTunInterface(private val descriptor: ParcelFileDescriptor) :
 /**
  * The `VpnService` that owns the TUN for a wired session.
  *
- * It exists because `establish()` may only be called by a `VpnService`, and Android refuses to create
- * one without the user's consent: [HiCarWiredVpn.open] returns null when consent is still missing, and
- * the caller is expected to send the driver to the system dialog
- * ([HiCarWiredVpn.consentIntent]) rather than pretend the cable failed.
+ * What is needed here is not a VPN but a network interface whose address this app chooses: a normal
+ * app may not configure a system interface, and a TUN is the only supported way to get one.
  *
- * Only the car's own subnet is routed into the tunnel. A full-tunnel VPN would take the head unit's
- * own traffic — its maps, its updater — and send it to a phone that has no idea what to do with it.
+ * Ported from `WiredVpnService` in GGBondLab/OpenHC (GPL-3.0-only), including the three builder
+ * arguments that matter on a head unit: only this app's traffic enters the tunnel
+ * (`addAllowedApplication`), so the car's own maps and updater never see it; IPv6 is left on its
+ * normal path (`allowFamily`), because an IPv4-only VPN otherwise blocks it; and only the phone's
+ * subnet is routed, never a default route.
+ *
+ * The service is **bound**, not started: since Android 8 a background app may not `startService`, and
+ * a car head unit is in the background most of the time. Binding is not restricted, and the service
+ * dies with the binding, so it never lingers.
  */
 class HiCarWiredVpnService : VpnService() {
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val address = intent?.getStringExtra(EXTRA_ADDRESS)
-        if (address != null && tunnel == null) {
-            tunnel = try {
-                establish(address)
-            } catch (failure: Exception) {
-                log("VPN: could not establish the tunnel (${failure.javaClass.simpleName}: ${failure.message})")
-                null
-            }
-            ready.countDown()
-        }
-        return START_NOT_STICKY
+    private val localBinder = LocalBinder()
+
+    /** Called on the main thread when the system revokes the tunnel (another VPN took over). */
+    @Volatile internal var revokeListener: (() -> Unit)? = null
+
+    internal inner class LocalBinder : Binder() {
+        val service: HiCarWiredVpnService get() = this@HiCarWiredVpnService
     }
+
+    override fun onBind(intent: Intent?): IBinder? =
+        if (intent?.action == ACTION_LOCAL_BIND) localBinder else super.onBind(intent)
 
     /** The system revoked the tunnel: another VPN took over, or the driver turned it off. */
     override fun onRevoke() {
         log("VPN: the system revoked the tunnel; the wired link is gone")
-        tunnel?.wakeup()
+        revokeListener?.invoke()
         super.onRevoke()
     }
 
-    private fun establish(address: String): HiCarTunInterface {
+    /** Builds the TUN. Null when the app has no consent; a rejected spec throws. */
+    internal fun establish(address: String): ParcelFileDescriptor? {
+        val octets = address.split('.')
+        val network = if (octets.size == 4) {
+            "${octets[0]}.${octets[1]}.${octets[2]}.0"
+        } else {
+            address
+        }
         val builder = Builder()
             .setSession("HiCar cable")
             .setMtu(MTU)
             .addAddress(address, PREFIX)
-            .addRoute(address, PREFIX)
+            .addRoute(network, PREFIX)
+            // Only this app's traffic: the head unit's own network must not be routed to a phone.
+            .addAllowedApplication(packageName)
+            .allowFamily(OsConstants.AF_INET6)
             // The reader polls; a blocking descriptor would make that poll pointless.
             .setBlocking(false)
-        val descriptor = builder.establish() ?: throw IOException("establish returned null")
-        log("VPN: tunnel at $address/$PREFIX, mtu $MTU; only that subnet is routed into it")
-        return HiCarTunInterface(descriptor)
+        return builder.establish()
     }
 
     companion object {
-        private const val EXTRA_ADDRESS = "com.shilapi.xcertplay.hicar.WIRED_ADDRESS"
+        internal const val ACTION_LOCAL_BIND = "com.shilapi.xcertplay.hicar.BIND_WIRED_VPN"
         private const val MTU = 1500
         private const val PREFIX = 24
         private const val TAG = "HiCarWired"
-
-        /**
-         * The tunnel of the current session.
-         *
-         * Static because a `VpnService` is created by the system and the side that needs the tunnel is
-         * the data path, not the service. One wired session at a time, which is also what the USB
-         * side enforces.
-         */
-        @Volatile internal var tunnel: HiCarTunInterface? = null
-            private set
-
-        /** Counted down once `onStartCommand` has tried to establish (successfully or not). */
-        @Volatile private var ready = CountDownLatch(1)
 
         /**
          * Where the service's own lines go.
@@ -216,52 +219,6 @@ class HiCarWiredVpnService : VpnService() {
          */
         @Volatile internal var logSink: ((String) -> Unit)? = null
 
-        /** What the driver has to accept before any tunnel can exist, or null when it already is. */
-        internal fun consentIntent(context: Context): Intent? = prepare(context)
-
-        /**
-         * Starts the service and waits for the tunnel.
-         *
-         * Returns null when consent is missing (the caller should show [consentIntent]) or when the
-         * service could not start; the log says which.
-         */
-        internal fun open(
-            context: Context,
-            address: String,
-            timeoutMillis: Long = 5_000L,
-            onLog: (String) -> Unit = {},
-        ): HiCarTunInterface? {
-            val app = context.applicationContext
-            if (prepare(app) != null) {
-                // The caller shows the system dialog; this line is what makes that visible in the
-                // exported report, where `android.util.Log` never appears.
-                onLog("VPN: the system still wants the driver to allow a VPN connection")
-                return null
-            }
-            ready = CountDownLatch(1)
-            logSink = onLog
-            val intent = Intent(app, HiCarWiredVpnService::class.java).putExtra(EXTRA_ADDRESS, address)
-            val started = runCatching { app.startService(intent) }.isSuccess
-            if (!started) {
-                onLog(
-                    "VPN: the service would not start; on Android 8+ it has to be started from the " +
-                        "foreground",
-                )
-                return null
-            }
-            if (!ready.await(timeoutMillis, TimeUnit.MILLISECONDS)) {
-                onLog("VPN: the tunnel did not come up within $timeoutMillis ms")
-                return null
-            }
-            return tunnel
-        }
-
-        internal fun close(context: Context) {
-            tunnel?.wakeup()
-            tunnel = null
-            runCatching { context.applicationContext.stopService(Intent(context, HiCarWiredVpnService::class.java)) }
-        }
-
         private fun log(message: String) {
             android.util.Log.i(TAG, message)
             runCatching { logSink?.invoke(message) }
@@ -270,21 +227,119 @@ class HiCarWiredVpnService : VpnService() {
 }
 
 /**
- * The wired tunnel, as the session sees it.
+ * The wired tunnel, as the session sees it: a bound [HiCarWiredVpnService] and the TUN it built.
  *
- * A thin facade over [HiCarWiredVpnService]: the service is created by the system, and everything that
- * needs the tunnel is in this package, so the two are kept apart only so the service can stay a plain
- * `VpnService` with no logic of its own.
+ * One wired session at a time (the USB side enforces that too), so the binding lives here rather than
+ * in a handle passed through five layers.
  */
 internal object HiCarWiredVpn {
-    /** The system's consent dialog, or null when it has already been accepted. */
-    fun consentIntent(context: Context): Intent? = HiCarWiredVpnService.consentIntent(context)
 
+    private var binding: ServiceConnection? = null
+    private var tunnel: HiCarTunInterface? = null
+
+    /** The system's consent dialog, or null when it has already been accepted. */
+    fun consentIntent(context: Context): Intent? =
+        runCatching { VpnService.prepare(context.applicationContext) }.getOrNull()
+
+    /** True when the app already holds the consent, i.e. a tunnel can be built without a dialog. */
+    fun consented(context: Context): Boolean = consentIntent(context) == null
+
+    /**
+     * Binds the service and builds the TUN. Blocking: call it off the main thread.
+     *
+     * Returns null with a line in the log saying which step failed — no consent, binding refused,
+     * service never connected, or `establish` refused the spec.
+     */
     fun open(
         context: Context,
         address: String,
         onLog: (String) -> Unit = {},
-    ): HiCarTunInterface? = HiCarWiredVpnService.open(context, address, onLog = onLog)
+        onRevoked: () -> Unit = {},
+    ): HiCarTunInterface? {
+        tunnel?.let { return it }
+        val app = context.applicationContext
+        HiCarWiredVpnService.logSink = onLog
+        if (consentIntent(app) != null) {
+            onLog("VPN: the system still wants the driver to allow a VPN connection")
+            return null
+        }
+        val connected = CountDownLatch(1)
+        val serviceRef = AtomicReference<HiCarWiredVpnService?>()
+        val connection = object : ServiceConnection {
+            override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+                serviceRef.set((binder as? HiCarWiredVpnService.LocalBinder)?.service)
+                connected.countDown()
+            }
 
-    fun close(context: Context) = HiCarWiredVpnService.close(context)
+            override fun onServiceDisconnected(name: ComponentName?) {
+                // The system killed the service; the tunnel is gone with it and the data path ends.
+            }
+        }
+        val intent = Intent(app, HiCarWiredVpnService::class.java)
+            .setAction(HiCarWiredVpnService.ACTION_LOCAL_BIND)
+        val bound = runCatching { app.bindService(intent, connection, Context.BIND_AUTO_CREATE) }
+            .getOrDefault(false)
+        if (!bound) {
+            onLog("VPN: could not bind the tunnel service (is it still declared in the manifest?)")
+            return null
+        }
+        if (!connected.await(BIND_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+            onLog("VPN: the tunnel service did not connect within $BIND_TIMEOUT_MS ms")
+            unbind(app, connection)
+            return null
+        }
+        val service = serviceRef.get() ?: run {
+            onLog("VPN: the binder was not this module's tunnel service")
+            unbind(app, connection)
+            return null
+        }
+        val descriptor = try {
+            service.establish(address)
+        } catch (failure: RuntimeException) {
+            // Address or route refused, another VPN holding the lock, or a device policy blocking VPNs.
+            onLog(
+                "VPN: the system refused the tunnel (${failure.javaClass.simpleName}: ${failure.message})",
+            )
+            unbind(app, connection)
+            return null
+        } ?: run {
+            onLog("VPN: no tunnel — consent missing, or another VPN app has taken it over")
+            unbind(app, connection)
+            return null
+        }
+        val tun = try {
+            HiCarTunInterface(descriptor)
+        } catch (failure: IOException) {
+            runCatching { descriptor.close() }
+            onLog("VPN: the tunnel descriptor could not be read (${failure.message})")
+            unbind(app, connection)
+            return null
+        }
+        service.revokeListener = {
+            onLog("VPN: the driver or the system revoked the tunnel")
+            onRevoked()
+        }
+        binding = connection
+        tunnel = tun
+        onLog("VPN: tunnel at $address/24, mtu 1500; only this app and only that subnet")
+        return tun
+    }
+
+    /** Stops the tunnel and drops the binding. Call after the transport threads are stopped. */
+    fun close(context: Context) {
+        tunnel?.let {
+            it.wakeup()
+            it.close()
+        }
+        tunnel = null
+        binding?.let { unbind(context.applicationContext, it) }
+        binding = null
+        HiCarWiredVpnService.logSink = null
+    }
+
+    private fun unbind(context: Context, connection: ServiceConnection) {
+        runCatching { context.unbindService(connection) }
+    }
+
+    private const val BIND_TIMEOUT_MS = 5_000L
 }

@@ -1,5 +1,18 @@
 # Unreleased — HiCar only
 
+- **Wired: the whole cable path is now a port of OpenHC, not a patch per log.** Nine real differences were
+  ported together: the VpnService is **bound** rather than started (Android 8+ refuses a background
+  `startService`, and a head unit is in the background most of the time) and its TUN is limited to this
+  app (`addAllowedApplication`), leaves IPv6 alone and routes only the phone's subnet; VPN consent is
+  checked **before** car-info, so an insertion is never spent on a session that cannot build a tunnel;
+  the tunnel is built while the NCM permission dialog is up; the NCM open order now matches (claim the
+  control and data interfaces, read the NTB parameters, select the idle setting, send
+  `SET_NTB_INPUT_SIZE` **while idle**, then the endpoint setting, then drain one connection
+  notification); `bulkTransfer` distinguishes a timeout from a dead device by elapsed time; the port is
+  scanned once a second for head units that do not deliver attach broadcasts; and the device filter is
+  also declared on an **activity alias**, which is what gives the system's 「默认使用」 and removes the
+  two permission prompts per insertion. While that alias is enabled the cable waits 800 ms for the
+  system's own grant before it shows a prompt.
 - **Wired: the phone switches, and the two things that stopped it afterwards.** The 19:21 log shows
   the cable path working as designed up to the switch — permission prompt answered, `car info 91 -> 91`
   accepted, the phone re-enumerated with a CDC-NCM control interface and two data ones — and then

@@ -72,6 +72,25 @@
                 android:resource="@xml/usb_device_filter" />
         </receiver>
 
+        <!-- The same device filter on an *activity alias*, which is what makes the system grant the
+             cable's permission without a dialog. The system records a USB grant per device instance,
+             and the phone re-enumerates as a new one when it switches to NCM — so a receiver alone
+             always costs two prompts per insertion. With this alias the system offers 「默认使用」;
+             tick it once and the grant arrives with the attach, before the receiver runs. The
+             component is enabled by HiCarWiredAttach with the wired switch. -->
+        <activity-alias
+            android:name="com.shilapi.xcertplay.HiCarUsbAttachAlias"
+            android:enabled="true"
+            android:exported="true"
+            android:targetActivity="com.shilapi.xcertplay.HiCarHostActivity">
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/usb_device_filter" />
+        </activity-alias>
+
         <!-- The launcher entry. The label is a literal to match the screen's own copy, which is
              Simplified Chinese on purpose and hardcoded so it reads the same on any ROM locale. -->
         <activity-alias

@@ -168,6 +168,31 @@ wired: no tunnel, so the cable carries nothing
 **仍是未验证**：TUN 起来之后，手机是否按 car-info 里的地址拨 TCP、ARP 是否被正确自答。
 这份日志里 `connections=0`（手机完全没拨），符合「网卡没通所以 HiCar 不发起」。
 
+### 四点七、不再按日志打补丁：把 OpenHC 的有线链路整条搬过来
+
+前三份日志暴露的问题，都是「我按现象修、参考项目按整套流程跑」的差距。这一轮改为逐文件对照
+`platform/.../usb/*` 与 `platform/.../net/*`，只补真实的差异，不再推测。清单如下（左＝OpenHC 实测通过的
+做法，右＝这次改成的样子）：
+
+| # | OpenHC | 我们原来的 | 现在 |
+| --- | --- | --- | --- |
+| 1 | `bindService`（`BIND_AUTO_CREATE`）起 VpnService：**安卓 8 起后台 `startService` 会被拒** | `startService` | 改成绑定；`HiCarWiredVpn.open()` 等 binder、建 TUN、失败逐句说明 |
+| 2 | TUN 只放本应用（`addAllowedApplication`）、IPv6 走原网络（`allowFamily`）、只路由手机网段 | 无 allowed application | 三条都照写 |
+| 3 | **先确认 VPN 授权，再发 car-info**（每次插入只响应一次，不能浪费） | 先发 car-info，发现没授权已经用掉一次插入 | `bring()` 第一步查授权，缺则弹框并**保留这次插入** |
+| 4 | NCM 就绪时，授权框一出现就**同时建 TUN** | 拿到授权后才建 | 先申请授权，接着建 TUN；授权结果回来直接收发 |
+| 5 | NCM 口打开顺序：抢占控制口+数据口 → 读 NTB 参数 → 切备用 0 → **在备用 0 下发 SET_NTB_INPUT_SIZE** → 切到带端点的备用设置 → 读掉一条连接通知 | 先切备用设置再发 SET_NTB_INPUT_SIZE，且不读通知 | 顺序照搬；新增中断端点读 16 字节通知 |
+| 6 | `bulkTransfer` 用耗时区分「超时」和「设备没了」 | 一律当超时返回 0 | 超时 0、错误 -1 |
+| 7 | 每秒扫一次设备列表（有的车机不发插入广播） | 只靠广播 | `pollPort()`：1 s 扫一次，只处理没试过的设备 |
+| 8 | 清单里给 `USB_DEVICE_ATTACHED` 挂 **activity-alias**，系统才给「默认使用」，勾一次以后**免授权框** | 只有 receiver，永远没有「默认使用」 | 新增 `HiCarUsbAttachAlias`（`usb_device_filter.xml`）+ `HiCarWiredAttach` 随有线开关启停 |
+| 9 | 系统自动授权比插入广播晚几十～150 ms，先等 800 ms 再弹框 | 立刻弹框，多一个框 | `HiCarWiredAttach.graceMillis()`：开着别名时先等 800 ms |
+
+第 8 条是「插线免点击」的关键：授权按设备实例记，手机切成 NCM 是另一个实例，所以没有别名时每次插入
+必然弹两遍框。装上这一版后第一次插线，系统会问「要用 HiCar 打开吗」，**勾上「默认使用」**，之后不再问。
+
+`HiCarWiredLink` 里那条「窗口不可见就排队」的逻辑保留（11-28 那份日志的授权请求确实是在 onCreate 里
+发出去、被系统丢掉的）；`startOnWorker()` 的排队也保留，但**不再有任何以 pid 判定「手机开没开调试」的闸门**。
+
+
 
 ## 五、与无线的关系：有线优先
 

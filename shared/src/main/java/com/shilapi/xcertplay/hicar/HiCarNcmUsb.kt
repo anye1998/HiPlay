@@ -53,8 +53,16 @@ internal class HiCarNcmUsb private constructor(
 
     override fun receive(buffer: ByteArray, timeoutMs: Int): Int {
         if (closed) return -1
-        val read = runCatching { connection.bulkTransfer(bulkIn, buffer, buffer.size, timeoutMs) }.getOrDefault(-1)
-        return if (read < 0) 0 else read
+        val startedAt = android.os.SystemClock.elapsedRealtime()
+        val read = runCatching {
+            connection.bulkTransfer(bulkIn, buffer, minOf(receiveSize, buffer.size), timeoutMs)
+        }.getOrDefault(-1)
+        if (read >= 0) return read
+        // bulkTransfer reports a timeout and a dead device the same way. Only the elapsed time tells
+        // them apart: a timeout waits, an unplugged device returns at once. Treating an error as a
+        // timeout spins until the next stage gives up instead of closing the link.
+        val elapsed = android.os.SystemClock.elapsedRealtime() - startedAt
+        return if (elapsed >= timeoutMs / 2) 0 else -1
     }
 
     override fun send(buffer: ByteArray, length: Int, timeoutMs: Int): Boolean {
@@ -93,6 +101,8 @@ internal class HiCarNcmUsb private constructor(
         private const val CLASS_CDC_DATA = 10
 
         private const val CONTROL_TIMEOUT_MS = 1000
+        private const val NOTIFICATION_BYTES = 16
+        private const val NOTIFICATION_TIMEOUT_MS = 300
 
         /**
          * Opens the device and prepares the NCM interfaces, or returns null with a reason logged.
@@ -126,27 +136,38 @@ internal class HiCarNcmUsb private constructor(
                 onLog("USB NCM: the data interface has no usable bulk pair")
                 return null
             }
+            // The control interface's interrupt IN endpoint: the phone posts its link state there.
+            val notification = (0 until control.endpointCount)
+                .map { control.getEndpoint(it) }
+                .firstOrNull {
+                    it.type == UsbConstants.USB_ENDPOINT_XFER_INT &&
+                        it.direction == UsbConstants.USB_DIR_IN
+                }
             val connection = runCatching { manager.openDevice(device) }.getOrNull()
             if (connection == null) {
                 onLog("USB NCM: could not open ${device.deviceName}; another app may hold it")
                 return null
             }
             try {
-                if (!connection.claimInterface(control, true)) {
-                    throw IllegalStateException("control interface refused")
+                // 1. Claim only the two interfaces the packets use, and force the claim: the head
+                //    unit's kernel driver binds the NCM layout the moment the phone switches, and a
+                //    forced claim kicks it out (measured by OpenHC; a normal app may do it).
+                if (!connection.claimInterface(control, true) ||
+                    !connection.claimInterface(dataActive, true)
+                ) {
+                    throw IllegalStateException("the NCM interfaces could not be claimed")
                 }
-                if (dataIdle != null && !connection.claimInterface(dataIdle, true)) {
-                    throw IllegalStateException("idle data interface refused")
-                }
-                if (!connection.claimInterface(dataActive, true)) {
-                    throw IllegalStateException("data interface refused")
-                }
-                // Reset the NCM function, then select the setting that carries the endpoints.
-                dataIdle?.let { runCatching { connection.setInterface(it) } }
-                if (!connection.setInterface(dataActive)) {
-                    throw IllegalStateException("data alternate setting refused")
-                }
+                // 2. The block sizes come from the phone.
                 val parameters = readParameters(connection, control, onLog)
+                // 3. Select the idle alternate setting: that cycle is what resets the NCM function,
+                //    and a data interface opened for the first time otherwise reads nothing.
+                dataIdle?.let {
+                    if (!connection.setInterface(it)) {
+                        onLog("USB NCM: could not select the idle setting; continuing")
+                    }
+                }
+                // 4. Cap the phone's input size *while the data interface is still idle* — the spec
+                //    only allows this request in that state, and OpenHC sends it here for that reason.
                 val plan = HiCarCdcNcm.receivePlan(parameters?.ntbInMaxSize, Build.VERSION.SDK_INT)
                 plan.setInputSize?.let { size ->
                     val payload = HiCarCdcNcm.encodeNtbInputSize(size)
@@ -159,7 +180,26 @@ internal class HiCarNcmUsb private constructor(
                         payload.size,
                         CONTROL_TIMEOUT_MS,
                     )
-                    onLog("USB NCM: asked the phone to keep blocks at $size bytes (result $sent)")
+                    onLog(
+                        if (sent == payload.size) {
+                            "USB NCM: the phone keeps blocks at $size bytes"
+                        } else {
+                            "USB NCM: could not cap blocks at $size bytes (result $sent); larger " +
+                                "blocks will be dropped"
+                        },
+                    )
+                }
+                // 5. Only now the setting that carries the endpoints.
+                if (!connection.setInterface(dataActive)) {
+                    throw IllegalStateException("the data alternate setting was refused")
+                }
+                // 6. Read one connection notification off the control interface: the phone posts its
+                //    link state there once the function is up, and draining it is what the
+                //    measured-good flow does. A failure here is not fatal.
+                notification?.let {
+                    runCatching {
+                        connection.bulkTransfer(it, ByteArray(NOTIFICATION_BYTES), NOTIFICATION_BYTES, NOTIFICATION_TIMEOUT_MS)
+                    }
                 }
                 if (parameters != null && !parameters.supportsNtb16) {
                     onLog("USB NCM: the phone does not list NTB16 support; the framing will probably be refused")

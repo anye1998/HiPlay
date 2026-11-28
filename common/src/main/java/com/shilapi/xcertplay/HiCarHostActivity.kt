@@ -424,7 +424,10 @@ class HiCarHostActivity : ComponentActivity() {
      * system refused the background launch, this never runs and the notification stays tappable.
      */
     private fun handleCableIntent(intent: Intent?) {
-        if (intent?.action != ACTION_CABLE) return
+        // Two ways in: the receiver's own action, and the USB-attach alias, which the system starts
+        // with the attach intent itself when the driver has ticked 「默认使用」 for this phone.
+        val action = intent?.action
+        if (action != ACTION_CABLE && action != android.hardware.usb.UsbManager.ACTION_USB_DEVICE_ATTACHED) return
         HiCarUsbAttachNotifier.cancel(this)
         // Consumed: a configuration change reuses this intent, and it must not start a second run.
         intent.action = null
