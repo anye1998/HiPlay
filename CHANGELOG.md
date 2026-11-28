@@ -1,5 +1,15 @@
 # Unreleased — HiCar only
 
+- **Wired: the phone switches, and the two things that stopped it afterwards.** The 19:21 log shows
+  the cable path working as designed up to the switch — permission prompt answered, `car info 91 -> 91`
+  accepted, the phone re-enumerated with a CDC-NCM control interface and two data ones — and then
+  failing twice: the new device instance had no USB grant yet (reported as "another app may hold it"),
+  and the VPN tunnel needed a consent the app had never asked for, with that reason going only to
+  `android.util.Log` so the report showed just "no tunnel". Now the NCM device is asked for its own
+  grant before it is opened, the VPN consent is raised from `onResume` ahead of the phone and the open
+  port continues once it is granted, and the service's own lines reach the exported report.
+  `startOnWorker()` also queues a step instead of dropping it when the carrier is busy — a grant that
+  arrived one moment after a failed switch used to be swallowed.
 - **Wired: the permission prompt, and one guess removed.** The 2026-11-28 log never sent the car-info
   block at all: the USB permission was requested twice and no answer ever arrived, so the phone stayed
   in its ordinary file-transfer layout (`06/01/01` PTP + `08/06/50` MTP) and nothing switched. Both

@@ -207,6 +207,15 @@ class HiCarWiredVpnService : VpnService() {
         /** Counted down once `onStartCommand` has tried to establish (successfully or not). */
         @Volatile private var ready = CountDownLatch(1)
 
+        /**
+         * Where the service's own lines go.
+         *
+         * A `VpnService` is created by the system and has no reference to the session, but its
+         * failures — "establish returned null" above all — are exactly what the exported report
+         * needs. Without this they only reached `android.util.Log`, which the report never carries.
+         */
+        @Volatile internal var logSink: ((String) -> Unit)? = null
+
         /** What the driver has to accept before any tunnel can exist, or null when it already is. */
         internal fun consentIntent(context: Context): Intent? = prepare(context)
 
@@ -216,21 +225,32 @@ class HiCarWiredVpnService : VpnService() {
          * Returns null when consent is missing (the caller should show [consentIntent]) or when the
          * service could not start; the log says which.
          */
-        internal fun open(context: Context, address: String, timeoutMillis: Long = 5_000L): HiCarTunInterface? {
+        internal fun open(
+            context: Context,
+            address: String,
+            timeoutMillis: Long = 5_000L,
+            onLog: (String) -> Unit = {},
+        ): HiCarTunInterface? {
             val app = context.applicationContext
             if (prepare(app) != null) {
-                log("VPN: the system still wants the driver to accept a VPN connection")
+                // The caller shows the system dialog; this line is what makes that visible in the
+                // exported report, where `android.util.Log` never appears.
+                onLog("VPN: the system still wants the driver to allow a VPN connection")
                 return null
             }
             ready = CountDownLatch(1)
+            logSink = onLog
             val intent = Intent(app, HiCarWiredVpnService::class.java).putExtra(EXTRA_ADDRESS, address)
             val started = runCatching { app.startService(intent) }.isSuccess
             if (!started) {
-                log("VPN: the service would not start; on Android 8+ it has to be started from the foreground")
+                onLog(
+                    "VPN: the service would not start; on Android 8+ it has to be started from the " +
+                        "foreground",
+                )
                 return null
             }
             if (!ready.await(timeoutMillis, TimeUnit.MILLISECONDS)) {
-                log("VPN: the tunnel did not come up within $timeoutMillis ms")
+                onLog("VPN: the tunnel did not come up within $timeoutMillis ms")
                 return null
             }
             return tunnel
@@ -244,6 +264,7 @@ class HiCarWiredVpnService : VpnService() {
 
         private fun log(message: String) {
             android.util.Log.i(TAG, message)
+            runCatching { logSink?.invoke(message) }
         }
     }
 }
@@ -259,7 +280,11 @@ internal object HiCarWiredVpn {
     /** The system's consent dialog, or null when it has already been accepted. */
     fun consentIntent(context: Context): Intent? = HiCarWiredVpnService.consentIntent(context)
 
-    fun open(context: Context, address: String): HiCarTunInterface? = HiCarWiredVpnService.open(context, address)
+    fun open(
+        context: Context,
+        address: String,
+        onLog: (String) -> Unit = {},
+    ): HiCarTunInterface? = HiCarWiredVpnService.open(context, address, onLog = onLog)
 
     fun close(context: Context) = HiCarWiredVpnService.close(context)
 }

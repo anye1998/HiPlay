@@ -35,8 +35,11 @@ class HiCarExportUiTest {
         ReflectionHelpers.callInstanceMethod<Unit>(activity, "exportLog")
 
         val reports = File(context.getExternalFilesDir(null)!!, "diagnostic-reports")
+        // Wait for a *new* file: a previous run leaves reports behind in the same sandbox, and
+        // "there is a file" then stops the wait before `exportLog` has written anything.
+        val before = reports.listFiles().orEmpty().map { it.name }.toSet()
         val deadline = System.nanoTime() + 5_000_000_000L
-        while ((reports.listFiles().orEmpty().isEmpty()) && System.nanoTime() < deadline) {
+        while (reports.listFiles().orEmpty().none { it.name !in before } && System.nanoTime() < deadline) {
             Thread.sleep(20)
             shadowOf(Looper.getMainLooper()).idle()
         }

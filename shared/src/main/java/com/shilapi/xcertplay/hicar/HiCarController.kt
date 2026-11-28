@@ -2,6 +2,7 @@ package com.shilapi.xcertplay.hicar
 
 import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import com.shilapi.xcertplay.hicarauth.HiChainNative
@@ -122,6 +123,14 @@ class HiCarController(
      * a value the controller is constructed with rather than one it can change mid-session.
      */
     videoSettings: HiCarVideoSettings = HiCarVideoSettings(),
+    /**
+     * Raises the system's VPN consent dialog for the cable.
+     *
+     * The tunnel is what makes the phone's IP packets reach this receiver, and Android only allows
+     * one after the driver answers. The activity owns the launcher; the answer comes back through
+     * [onVpnConsentResult].
+     */
+    private val onVpnConsent: (Intent) -> Unit = {},
 ) : Closeable {
     private val appContext = context.applicationContext
 
@@ -674,6 +683,7 @@ class HiCarController(
                 controlPort = config.controlPort,
                 onLinkUp = ::onCableUp,
                 onLinkDown = ::onCableDown,
+                requestVpnConsent = onVpnConsent,
             ).also { it.start() }
         } else {
             usb = HiCarUsbLink(
@@ -1443,6 +1453,17 @@ class HiCarController(
      */
     fun setHostVisible(visible: Boolean) {
         runCatching { wired?.setHostVisible(visible) }
+    }
+
+    /**
+     * The driver's answer to the VPN prompt the cable raised.
+     *
+     * A grant carries on with the port that is already open — the phone has switched and its grant
+     * is spent, so making it start over would cost another insertion.
+     */
+    fun onVpnConsentResult(granted: Boolean) {
+        onLog("VPN: the driver ${if (granted) "allowed" else "declined"} the tunnel")
+        runCatching { wired?.resumeAfterVpnConsent(granted) }
     }
 
     /**

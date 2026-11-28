@@ -127,6 +127,48 @@ strict 比较于是把「正在等的那个设备」排除掉，循环空转到�
 系统弹「要用 OpenHC 打开吗」时带「默认使用」勾选，勾一次以后系统当场授权。我们目前只有 receiver，
 那条链走不通，所以每次插入仍要在车机屏幕上点一次「允许」。这是下一轮要做的。
 
+### 四点六、19:21 那份日志：手机确实切成 NCM 了，卡在 TUN
+
+第三份日志（`hicar-log-20261128-192117`）把上一节的两个猜想都终结了：
+
+```
+wired: already on the port (... pid=0x107e, 2 iface: 06/01/01, 08/06/50) — a product id OpenHC measured as answering the block
+wired: asking the system for permission ... (ask 1/3, window visible)
+USB: permission granted
+wired: car info 91 bytes -> 91 (address 192.168.66.155:4005)
+USB: device attached (001/017, pid=0x107e, 3 iface: 02/0d/00, 0a/00/01, 0a/00/01) — already CDC-NCM
+wired: the phone switched to the NCM layout
+```
+
+- **pid 是 0x107e**，不是 0x5000：「是不是开着 USB 调试」这个问题到此为止；
+- 窗口可见后授权框正常弹出、`91 -> 91` 被接受、手机重新枚举出 **CDC-NCM 控制口 + 两个数据口**；
+- 也就是说，权限时机、car-info、枚举识别这三段现在都通了。
+
+卡住的是接着的两行：
+
+```
+USB NCM: could not open /dev/bus/usb/001/017; another app may hold it
+wired: no tunnel, so the cable carries nothing
+```
+
+两件事：
+
+1. **NCM 是新的设备实例，授权不继承。** 切换后立刻 `openDevice`，而 017 这个实例的授权还没到，
+   于是报成「另一个应用占着」——误导。现在 `openAndRun()` 先查 `hasPermission`，缺就走 `handOver()`
+   申请，不再把「没授权」说成「被占用」。
+2. **VPN 授权还没给过。** `VpnService.prepare()` 仍返回授意 Intent，`HiCarWiredVpn.open()` 直接返回
+   null，而那句原因只写进 `android.util.Log`（导出的报告里看不到），所以报告里只剩「no tunnel」。现在：
+   - 授权框在 `onResume` 时**提前**弹出（赶在手机切换之前），答案经 `onVpnConsentResult()` 回到链路；
+   - 已经打开的 NCM 口**保留**，授权通过后从 `beginCarrying()` 继续，不必拔插；
+   - `VpnService` 自己的日志经 `logSink` 进会话日志（`VPN: tunnel at ...` / `establish returned null`）。
+
+顺带修掉一个竞态：`startOnWorker()` 原来在忙时**直接丢弃**新步骤，于是「切换失败那一秒恰好到的
+授权回调」会被吞掉。现在改为排队（最多一项，新的覆盖旧的）。
+
+**仍是未验证**：TUN 起来之后，手机是否按 car-info 里的地址拨 TCP、ARP 是否被正确自答。
+这份日志里 `connections=0`（手机完全没拨），符合「网卡没通所以 HiCar 不发起」。
+
+
 ## 五、与无线的关系：有线优先
 
 有线与无线共用同一条上层链路：控制/业务 TCP 端口、DMSDP、HiChain、HiSight 都不变。有线只是把

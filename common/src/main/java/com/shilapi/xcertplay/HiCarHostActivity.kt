@@ -321,6 +321,17 @@ class HiCarHostActivity : ComponentActivity() {
         appendLog("Discoverable request $verdict; press Start to advertise")
     }
 
+    /**
+     * The system's "allow a VPN connection?" prompt, raised by the cable.
+     *
+     * The wired path moves the phone's IP packets through a TUN, and Android only hands one out after
+     * the driver answers. The answer goes straight back to the cable, which continues with the port
+     * that is already open — the phone has switched by then, so restarting would cost an insertion.
+     */
+    private val vpnConsent = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        controller?.onVpnConsentResult(result.resultCode == android.app.Activity.RESULT_OK)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         installCrashRecorder()
@@ -1491,6 +1502,7 @@ class HiCarHostActivity : ComponentActivity() {
                 onLog = { line -> runOnUiThread { appendLog(line) } },
                 onSpeedStatus = { next -> runOnUiThread { speedStatus = next } },
                 videoSettings = videoSettings,
+                onVpnConsent = { consent -> runOnUiThread { vpnConsent.launch(consent) } },
             )
         } catch (failure: RuntimeException) {
             // A constructor that refuses its configuration is a bug, not a device failure; say which
