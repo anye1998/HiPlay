@@ -96,20 +96,32 @@ strict 比较于是把「正在等的那个设备」排除掉，循环空转到�
 ## 四点五、2026-11-28：与 OpenHC 逐项对照后改了什么
 
 第二份实车日志（`hicar-log-20261128-175523`）里 car-info **根本没发出去**：请求了 USB 授权，
-之后再没有任何授权结果，手机始终停在 `pid` 未知的普通布局（接口 `06/01/01` PTP + `08/06/50` MTP）。
-拿 OpenHC 的 `HuaweiPhone` / `CarInfoSender` / `WiredSession` / `DeviceId` 逐条对，差的是五处：
+之后再没有任何授权结果，手机始终停在普通布局（接口 `06/01/01` PTP + `08/06/50` MTP，日志里没记 pid）。
+拿 OpenHC 的 `HuaweiPhone` / `CarInfoSender` / `WiredSession` / `DeviceId` 逐条对：
 
-| # | OpenHC 的做法 | 我们原来的做法 | 后果 |
+| # | OpenHC 的做法 | 我们原来的做法 | 结论 |
 | --- | --- | --- | --- |
-| 1 | 只在产品号 **0x107D / 0x107E / 0x107F** 时发 car-info；0x5000（开着 USB 调试）不发并提示关掉 | 任何华为设备都发 | 在调试模式下发，手机不理，白费一次插入 |
-| 2 | block 里的 device id 是 `SHA-256(大写十六进制文本)` | 对 10 个原始字节做 SHA-256 | **device id 与蓝牙握手不是同一个值**，手机读到的是「不认识的车」 |
-| 3 | 每次插入只发一次；发过后要拔线等 5 秒 | 每次 attach 广播都重试 | 同一次插入里反复发，手机全部忽略 |
-| 4 | 等 NCM 时排除切换前就存在的旧 NCM 设备 | 只按 serial 匹配 | 新设备未授权时读不到 serial，候选被自己排除（11-27 的「没切成 NCM」） |
-| 5 | 授权等待有超时，且用 `hasPermission` 复核广播内容 | 只等广播 | 广播丢了就永远不动（11-28 的直接原因） |
+| 1 | 只在产品号 **0x107D / 0x107E / 0x107F** 时发 car-info；0x5000（开着 USB 调试）不发并提示关掉 | 任何华为设备都发 | **改成「照样发」**：拒绝发送是拿别人的实测当这台手机的状态，日志里既没 pid 也没有 ADB 接口（FF/42/01），手机根本没开调试。现在的做法是任何非 NCM 的华为/荣耀设备都发，pid 与返回值原样记进日志——发错只是被手机忽略，不发则无从诊断 |
+| 2 | block 里的 device id 是 `SHA-256(大写十六进制文本)` | 对 10 个原始字节做 SHA-256 | **真差异**：device id 与蓝牙握手不是同一个值，手机读到的是「不认识的车」 |
+| 3 | 每次插入只发一次；发过后要拔线等 5 秒 | 每次 attach 广播都重试 | **真差异**：同一次插入里反复发，手机全部忽略 |
+| 4 | 等 NCM 时排除切换前就存在的旧 NCM 设备 | 只按 serial 匹配 | **真差异**：新设备未授权时读不到 serial，候选被自己排除（11-27 的「没切成 NCM」） |
+| 5 | 授权等待有超时，且用 `hasPermission` 复核广播内容 | 只等广播 | **真差异**：广播丢了就永远不动（11-28 的直接原因） |
 
-现在的实现：`PhoneMode` 分类（含 PID 与接口判定）、`HiCarCarInfo` 统一派生 device id（有单测）、
-`maySpendThisPlug()` 一次性门控、`awaitNcm(stale)` 按设备名排除旧设备、`handOver()` 广播 + 每 250 ms
-轮询 + 60 秒超时。car-info 发送重试 3 次、间隔 300 ms，返回字节数必须等于 91。
+### 授权对话框为什么一次都没回
+
+`hicar-log-20261128-175523` 第 84、95 行两次 `asking the system for permission`，全文再无
+`USB: permission granted/denied`，也没有任何 `car info` 行。两次请求都发生在 `onCreate` 里
+（`receiver started 17:51:34` 之后紧接着就去要设备），此时本应用的窗口还没显示。USB 授权框是
+一个系统 Activity，Android 10 的后台启动限制会把这种请求静默丢掉——既没有对话框，也没有回调。
+
+现在的处理：`HiCarWiredLink.setHostVisible()`，由 `HiCarHostActivity.onResume/onPause` 驱动。
+窗口不可见时请求排队并记一行日志；可见后立刻发第一次，之后每 4 秒最多补一次，共 3 次；
+每次请求都记 `ask N/3, window visible|hidden`，超时行会带上总共问了几次。
+
+现在的实现：`PhoneMode`（pid 与接口，只作描述）、`HiCarCarInfo` 统一派生 device id（有单测）、
+`maySpendThisPlug()` 一次性门控、`awaitNcm(stale)` 按设备名排除旧设备、`handOver()` 广播 +
+每 250 ms 轮询 + 60 秒超时 + 窗口可见才提问。car-info 发送重试 3 次、间隔 300 ms，返回字节数
+必须等于 91。
 
 **还没对上的**：OpenHC 的「插线时不再弹窗」靠的是**清单里给 USB 过滤器挂一个 activity 别名**，
 系统弹「要用 OpenHC 打开吗」时带「默认使用」勾选，勾一次以后系统当场授权。我们目前只有 receiver，

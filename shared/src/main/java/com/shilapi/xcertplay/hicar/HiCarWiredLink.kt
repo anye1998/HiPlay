@@ -34,9 +34,11 @@ import kotlin.random.Random
  * phone dials the same TCP ports on the address this class gave it.
  *
  * **Partly verified on a car.** On 2026-11-27 the block was accepted (91 bytes) and the phone did
- * re-enumerate, but the poll could not see it and a second insertion never got a permission answer.
- * Both are fixed here (see [awaitNcm] and [handOver]); the link itself is still unproven. The
- * framing, the ARP rules and the tunnel plumbing each have unit tests. See `docs/HICAR_WIRED.md`.
+ * re-enumerate, but the poll could not see it. On 2026-11-28 nothing was ever sent: the permission
+ * was asked twice from `onCreate` and never answered, which on this car means the system dropped the
+ * request because no window was visible yet (see [handOver] and [setHostVisible]). The link itself
+ * is still unproven; the framing, the ARP rules and the tunnel plumbing have unit tests. See
+ * `docs/HICAR_WIRED.md`.
  *
  * The reverse-engineering this is built on is OpenHC's (`CarInfoSender`, `NcmUsbLink`,
  * `WiredVpnService`), GPL-3.0-only.
@@ -73,12 +75,17 @@ internal class HiCarWiredLink(
 ) : AutoCloseable {
 
     /**
-     * What the phone's USB port is, from the wired path's point of view.
+     * What the phone's USB port looks like, in the terms the log needs.
      *
-     * The switch block only works in [NORMAL]; with USB debugging on the phone ignores it, and after
-     * the switch the same product id comes back with the two CDC interfaces.
+     * This is a **description, never a gate**. OpenHC measured that a phone answers the block in
+     * 0x107d/0x107e/0x107f and ignores it in 0x5000, but a product id we have not measured is not
+     * evidence that the phone refuses: on 2026-11-28 the port carried a Huawei device whose layout
+     * was the normal file-transfer one, and the build that produced the log did not even record the
+     * id. Refusing to send on an unrecognised id therefore dead-ends a phone that would have
+     * switched — sending to one that will not costs one ignored control transfer and leaves a line
+     * in the log saying so.
      */
-    private enum class PhoneMode { NOT_A_PHONE, NORMAL, USB_DEBUGGING, NCM, UNSUPPORTED }
+    private enum class PhoneMode { NOT_A_PHONE, KNOWN_NORMAL, DEBUGGING_PID, NCM, OTHER_PID }
 
     private val appContext = context.applicationContext
     private val manager = appContext.getSystemService(UsbManager::class.java)
@@ -86,6 +93,22 @@ internal class HiCarWiredLink(
     @Volatile private var closed = false
     @Volatile private var busy = false
     @Volatile private var up = false
+
+    /**
+     * Whether the receiver's window is actually on screen.
+     *
+     * The USB permission prompt is a system activity. On this car (Android 10) a request made while
+     * the caller has no visible window is dropped without a dialog and without a callback — the
+     * 2026-11-28 log asked twice, from `onCreate`, and heard nothing either time. So the request
+     * waits for the screen: [setHostVisible] is what turns "asked" into "actually asked".
+     */
+    @Volatile private var hostVisible = false
+
+    /** The device whose permission is being waited for, so a later ask can be made for it. */
+    @Volatile private var pendingDevice: UsbDevice? = null
+
+    @Volatile private var askedAt = 0L
+    @Volatile private var askCount = 0
 
     /** What to do as soon as the system allows opening [phone], whichever answer arrives first. */
     @Volatile private var afterPermission: ((UsbDevice) -> Unit)? = null
@@ -129,23 +152,10 @@ internal class HiCarWiredLink(
 
                 UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
                     val device = deviceOf(intent) ?: return
-                    val mode = phoneMode(device)
-                    onLog("USB: device attached${describe(device)} — ${label(mode)}")
-                    when (mode) {
-                        PhoneMode.NCM -> bring(device)
-                        PhoneMode.NORMAL -> bring(device)
-                        // Said once per attach on purpose: this is the one state a driver can fix
-                        // without touching the car, and the symptom is otherwise a silent no-op.
-                        PhoneMode.USB_DEBUGGING -> onLog(
-                            "wired: the phone has USB debugging on (pid 0x5000) and ignores the switch " +
-                                "request in that state; turn USB debugging off on the phone, then plug in again",
-                        )
-                        PhoneMode.UNSUPPORTED -> onLog(
-                            "wired: this device is in a USB mode this build cannot switch " +
-                                "(pid 0x${device.productId.toString(16)}); nothing sent",
-                        )
-                        PhoneMode.NOT_A_PHONE -> Unit
-                    }
+                    onLog("USB: device attached${describe(device)} — ${label(phoneMode(device))}")
+                    // Anything that is a Huawei/Honor phone gets the block, whatever its product id
+                    // says: the id is a description, not a verdict (see [PhoneMode]).
+                    if (phoneMode(device) != PhoneMode.NOT_A_PHONE) bring(device)
                 }
 
                 UsbManager.ACTION_USB_DEVICE_DETACHED -> {
@@ -153,6 +163,9 @@ internal class HiCarWiredLink(
                     onLog("USB: device detached${describe(device)}")
                     teardown("the cable was unplugged")
                     afterPermission = null
+                    pendingDevice = null
+                    askedAt = 0L
+                    askCount = 0
                     if (usedThisPlug) unpluggedAt = System.currentTimeMillis()
                 }
             }
@@ -182,15 +195,13 @@ internal class HiCarWiredLink(
         // the activity is what started this run.
         val present = runCatching { manager?.deviceList?.values?.toList() }.getOrNull().orEmpty()
         present.forEach { onLog("wired: already on the port${describe(it)} — ${label(phoneMode(it))}") }
-        val candidate = present.firstOrNull { phoneMode(it) == PhoneMode.NCM }
-            ?: present.firstOrNull { phoneMode(it) == PhoneMode.NORMAL }
+        // A device already in the NCM layout is the one to drive; otherwise take any Huawei phone on
+        // the port and try, rather than deciding from its product id that it is not worth asking.
+        val phones = present.filter { phoneMode(it) != PhoneMode.NOT_A_PHONE }
+        val candidate = phones.firstOrNull { phoneMode(it) == PhoneMode.NCM } ?: phones.firstOrNull()
         if (candidate != null) {
             onLog("wired: starting with${describe(candidate)}")
             bring(candidate)
-        } else if (present.any { phoneMode(it) == PhoneMode.USB_DEBUGGING }) {
-            onLog(
-                "wired: the phone has USB debugging on; it will not accept the switch until that is off",
-            )
         }
     }
 
@@ -210,31 +221,59 @@ internal class HiCarWiredLink(
      * enumeration poll with it, and none of that belongs on a UI or Bluetooth thread.
      */
     private fun bring(device: UsbDevice) {
-        when (phoneMode(device)) {
-            PhoneMode.NCM -> handOver(device) { allowed -> startOnWorker { openAndRun(allowed) } }
-            PhoneMode.NORMAL -> handOver(device) { allowed -> startOnWorker { switchToNcm(allowed) } }
-            PhoneMode.USB_DEBUGGING -> onLog(
-                "wired: not switching while USB debugging is on; the phone would ignore the block",
-            )
-            PhoneMode.UNSUPPORTED, PhoneMode.NOT_A_PHONE -> Unit
+        if (phoneMode(device) == PhoneMode.NCM) {
+            handOver(device) { allowed -> startOnWorker { openAndRun(allowed) } }
+            return
         }
+        // Said as a fact, not as a diagnosis: the id is one OpenHC measured while USB debugging was
+        // on, and the block is still sent because the phone may simply ignore it.
+        if (phoneMode(device) == PhoneMode.DEBUGGING_PID) {
+            onLog(
+                "wired: pid 0x5000 — the id OpenHC sees while USB debugging is on; sending the block " +
+                    "anyway (a block that is ignored is harmless, one that is never sent cannot be diagnosed)",
+            )
+        }
+        handOver(device) { allowed -> startOnWorker { switchToNcm(allowed) } }
+    }
+
+    /**
+     * Tells the cable whether the receiver's window is on screen.
+     *
+     * Called from the host activity's `onResume`/`onPause`. A permission request made while nothing
+     * is visible produces no dialog on this car and no callback, so the request is held until this
+     * says yes — and repeated here in case the first one was dropped while the screen was coming up.
+     */
+    fun setHostVisible(visible: Boolean) {
+        hostVisible = visible
+        if (!visible) return
+        val device = pendingDevice ?: return
+        val usb = manager ?: return
+        if (usb.hasPermission(device)) {
+            runAfterPermission(device)
+            return
+        }
+        askOnce(device, force = true)
     }
 
     /** Runs the pending step once, whichever answer for the permission arrived first. */
     private fun runAfterPermission(device: UsbDevice) {
         val action = afterPermission ?: return
         afterPermission = null
+        pendingDevice = null
         runCatching { action(device) }
     }
 
     /**
      * Asks the system for [device] and runs [then] once it may be opened.
      *
-     * Two sources answer, deliberately. The broadcast is the normal one, but it is delivered to a
-     * receiver this class registers itself and can be missed while the phone re-enumerates — the
-     * 2026-11-28 log asked for permission and never heard back at all, so nothing was ever sent. The
-     * poll also covers a device the system already trusts (the grant is per device instance, and the
-     * NCM device is a new one).
+     * Three things answer, deliberately:
+     * - the broadcast, which is the normal one but can be missed while the phone re-enumerates;
+     * - a poll of [UsbManager.hasPermission], because on 2026-11-28 the broadcast never came at all;
+     * - the host activity's `onResume`, because a request made before the window exists is dropped
+     *   on this car without a dialog and without a callback — that is what the log shows, twice.
+     *
+     * [askedAt] and [askCount] keep the re-asks bounded: three prompts at most, one every
+     * [PERMISSION_REASK_MILLIS], so a driver who is not looking is not buried in dialogs.
      */
     private fun handOver(device: UsbDevice, then: (UsbDevice) -> Unit) {
         val usb = manager ?: return
@@ -243,7 +282,17 @@ internal class HiCarWiredLink(
             return
         }
         afterPermission = then
-        requestPermission(device)
+        pendingDevice = device
+        askedAt = 0L
+        askCount = 0
+        if (hostVisible) {
+            askOnce(device)
+        } else {
+            onLog(
+                "wired: the window is not on screen yet, so the USB permission dialog is held back " +
+                    "until it is — asking now would be dropped silently on this car",
+            )
+        }
         Thread({
             val deadline = System.currentTimeMillis() + PERMISSION_WAIT_MS
             while (System.currentTimeMillis() < deadline && !closed) {
@@ -251,17 +300,31 @@ internal class HiCarWiredLink(
                     runAfterPermission(device)
                     return@Thread
                 }
+                if (hostVisible && afterPermission != null) askOnce(device)
                 Thread.sleep(PERMISSION_POLL_MILLIS)
             }
             if (!closed && afterPermission != null) {
                 afterPermission = null
+                pendingDevice = null
                 onLog(
                     "wired: no answer to the USB permission dialog for ${device.deviceName} within " +
-                        "${PERMISSION_WAIT_MS / 1000}s, so nothing was sent. Allow it on the head unit's " +
-                        "screen (or enable 「USB 授权自动确认」), then unplug and plug in again",
+                        "${PERMISSION_WAIT_MS / 1000}s after $askCount ask(s), so nothing was sent. " +
+                        "Allow it on the head unit's screen (or enable 「USB 授权自动确认」), then plug in again",
                 )
             }
         }, "hicar-usb-permission").apply { isDaemon = true }.start()
+    }
+
+    /** One prompt at a time, spaced out; the caller may force the first one after the screen appears. */
+    @Synchronized
+    private fun askOnce(device: UsbDevice, force: Boolean = false) {
+        if (closed) return
+        val now = System.currentTimeMillis()
+        if (!force && now - askedAt < PERMISSION_REASK_MILLIS) return
+        if (askCount >= PERMISSION_ASK_LIMIT) return
+        askedAt = now
+        askCount++
+        requestPermission(device, askCount)
     }
 
     /** One carrier thread at a time: the switch blocks, the enumeration poll blocks with it. */
@@ -421,7 +484,7 @@ internal class HiCarWiredLink(
 
     // ------------------------------------------------------------------ helpers
 
-    private fun requestPermission(device: UsbDevice) {
+    private fun requestPermission(device: UsbDevice, attempt: Int) {
         val usb = manager ?: return
         val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             PendingIntent.FLAG_MUTABLE
@@ -430,7 +493,10 @@ internal class HiCarWiredLink(
         }
         val intent = Intent(ACTION_PERMISSION).setPackage(appContext.packageName)
         val pending = PendingIntent.getBroadcast(appContext, 0, intent, flags)
-        onLog("wired: asking the system for permission to open ${device.deviceName}")
+        onLog(
+            "wired: asking the system for permission to open ${device.deviceName} " +
+                "(ask $attempt/$PERMISSION_ASK_LIMIT, window ${if (hostVisible) "visible" else "hidden"})",
+        )
         runCatching { usb.requestPermission(device, pending) }
     }
 
@@ -521,23 +587,23 @@ internal class HiCarWiredLink(
         return control && data
     }
 
-    /** What the port looks like, in the one word the log needs. */
+    /** What the port looks like, in the one word the log needs. A description, never a verdict. */
     private fun phoneMode(device: UsbDevice): PhoneMode {
         if (device.vendorId != HUAWEI_VID && device.vendorId != HONOR_VID) return PhoneMode.NOT_A_PHONE
         if (inNcmLayout(device)) return PhoneMode.NCM
         return when (device.productId) {
-            PID_NORMAL_A, PID_NORMAL_B, PID_NORMAL_C -> PhoneMode.NORMAL
-            PID_USB_DEBUGGING -> PhoneMode.USB_DEBUGGING
-            else -> PhoneMode.UNSUPPORTED
+            PID_NORMAL_A, PID_NORMAL_B, PID_NORMAL_C -> PhoneMode.KNOWN_NORMAL
+            PID_USB_DEBUGGING -> PhoneMode.DEBUGGING_PID
+            else -> PhoneMode.OTHER_PID
         }
     }
 
     private fun label(mode: PhoneMode): String = when (mode) {
-        PhoneMode.NOT_A_PHONE -> "not a Huawei/Honor phone"
-        PhoneMode.NORMAL -> "normal mode, answers the switch block"
-        PhoneMode.USB_DEBUGGING -> "USB debugging on, refuses the switch block"
+        PhoneMode.NOT_A_PHONE -> "not a Huawei/Honor phone, left alone"
+        PhoneMode.KNOWN_NORMAL -> "a product id OpenHC measured as answering the block"
+        PhoneMode.DEBUGGING_PID -> "pid 0x5000, the id OpenHC measured with USB debugging on; block still sent"
         PhoneMode.NCM -> "already CDC-NCM"
-        PhoneMode.UNSUPPORTED -> "a product id this build does not switch"
+        PhoneMode.OTHER_PID -> "an id this build has not measured; block still sent"
     }
 
     /**
@@ -632,11 +698,12 @@ internal class HiCarWiredLink(
         private const val HONOR_VID = 0x339B
 
         /**
-         * The product ids a phone answers the switch block in, and the one it refuses it in.
+         * Product ids, kept for the log line only (`HuaweiPhone` in OpenHC measured them).
          *
-         * Measured, not guessed (`HuaweiPhone` in OpenHC): the normal states are 0x107d/0x107e/0x107f,
-         * 0x5000 means "USB debugging on" and the phone ignores the block there, and the same id is
-         * kept after the switch — only the interfaces change.
+         * They are **not** used to decide whether to send: the normal states are 0x107d/0x107e/0x107f,
+         * 0x5000 was measured while USB debugging was on, and an id not in this list is simply
+         * unmeasured — refusing on it would have blocked the 2026-11-28 phone, whose layout was the
+         * ordinary file-transfer one.
          */
         private const val PID_NORMAL_A = 0x107D
         private const val PID_NORMAL_B = 0x107E
@@ -647,6 +714,8 @@ internal class HiCarWiredLink(
         private const val CAR_INFO_RETRY_MILLIS = 300L
         private const val PERMISSION_WAIT_MS = 60_000L
         private const val PERMISSION_POLL_MILLIS = 250L
+        private const val PERMISSION_REASK_MILLIS = 4_000L
+        private const val PERMISSION_ASK_LIMIT = 3
         private const val REPLUG_HOLD_MS = 5_000L
 
         private val IDENTITY = Regex("^[0-9A-Fa-f]{64}$")

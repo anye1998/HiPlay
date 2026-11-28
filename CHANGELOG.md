@@ -1,15 +1,24 @@
 # Unreleased — HiCar only
 
-- **Wired, checked line by line against OpenHC.** The 2026-11-28 log never sent the car-info block at
-  all: the USB permission was requested and no answer ever arrived, so the phone stayed in a normal
-  layout (`06/01/01` PTP + `08/06/50` MTP) and nothing switched. Five differences were found and
-  fixed: the block is only sent for product ids 0x107d/0x107e/0x107f (0x5000 means USB debugging is on
-  and the phone ignores it, now said in the log); the 32-byte device id is the handshake identity, not
-  a hash of the raw fields (`HiCarCarInfo`, with tests — the old value described a car the phone had
-  never authenticated with); an insertion is spent once and needs a 5 s unplug before reuse; the
-  NCM poll skips devices that were already in that layout and no longer reads `serialNumber`, which
-  throws for an unauthorised device; and the permission wait polls `hasPermission` every 250 ms for
-  60 s instead of waiting for one broadcast that can be missed.
+- **Wired: the permission prompt, and one guess removed.** The 2026-11-28 log never sent the car-info
+  block at all: the USB permission was requested twice and no answer ever arrived, so the phone stayed
+  in its ordinary file-transfer layout (`06/01/01` PTP + `08/06/50` MTP) and nothing switched. Both
+  requests were made from `onCreate`; the prompt is a system activity, so on this car a request with
+  no visible window is dropped without a dialog and without a callback. The request now waits for
+  `onResume` (`setHostVisible`) and is repeated at most three times, 4 s apart, logging each ask.
+- **The product-id check is no longer a gate.** The previous build refused to send on any id it did
+  not recognise and told the driver to turn USB debugging off — that was OpenHC's measured rule
+  applied as if it were this phone's state, and neither the log nor the phone supported it (the port
+  showed the ordinary layout and the build did not even record the id). Every Huawei/Honor device
+  that is not already NCM now gets the block; the id and the transfer's return value are logged as
+  facts. A block that is ignored costs one control transfer; a block that is never sent cannot be
+  diagnosed.
+- Also fixed, from the same comparison: the 32-byte device id is the handshake identity, not a hash
+  of the raw fields (`HiCarCarInfo`, with tests — the old value described a car the phone had never
+  authenticated with); an insertion is spent once and needs a 5 s unplug before reuse; the NCM poll
+  skips devices that were already in that layout and no longer reads `serialNumber`, which throws for
+  an unauthorised device; and the permission wait polls `hasPermission` every 250 ms for 60 s instead
+  of waiting for one broadcast that can be missed.
 - The setup page's QR code only appears once the wireless half is on air (`running && wirelessOn`).
   An idle receiver, or a cable-only run, is not advertising, and a code then sends the phone to a car
   that is not there — the failure reads as a bad code instead of a switched-off radio.

@@ -1435,6 +1435,17 @@ class HiCarController(
     }
 
     /**
+     * Tells the cable whether the receiver's window is on screen.
+     *
+     * The USB permission prompt is a system activity, and this car's Android 10 drops a request made
+     * while the caller has nothing visible — no dialog, no callback. The host activity reports
+     * `onResume`/`onPause` here so the cable asks at the one moment the prompt can actually appear.
+     */
+    fun setHostVisible(visible: Boolean) {
+        runCatching { wired?.setHostVisible(visible) }
+    }
+
+    /**
      * Applies the saved speed-volume settings to the audio path that is running right now.
      *
      * The settings page is reachable while the phone is connected — that is why it exists — so a

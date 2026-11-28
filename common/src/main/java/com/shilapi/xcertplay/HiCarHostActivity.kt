@@ -146,6 +146,12 @@ class HiCarHostActivity : ComponentActivity() {
     private val log = mutableStateListOf<String>()
     private var controller: HiCarController? = null
 
+    /**
+     * Whether this window is on screen, tracked here because a receiver started from the button is
+     * built *after* the last `onResume` — the controller has to be told the state it missed.
+     */
+    private var windowVisible = false
+
     /** A scan that only listens, used to read a real head unit's beacon. See [sniff]. */
     private var sniffer: HiCarAdvertisementProbe? = null
 
@@ -358,6 +364,22 @@ class HiCarHostActivity : ComponentActivity() {
         }
         // After the content, so the status and the log it writes have somewhere to land.
         handleCableIntent(intent)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        windowVisible = true
+        // The cable's USB permission prompt is a system activity: asking while this window is not
+        // visible is dropped on this car without a dialog and without a callback. This is the
+        // "now you may ask" signal, and it also re-asks if the first prompt was lost while the
+        // window was still coming up.
+        controller?.setHostVisible(true)
+    }
+
+    override fun onPause() {
+        windowVisible = false
+        controller?.setHostVisible(false)
+        super.onPause()
     }
 
     override fun onDestroy() {
@@ -1495,6 +1517,9 @@ class HiCarHostActivity : ComponentActivity() {
                 "window ${window.widthPixels}×${window.heightPixels})",
         )
         next.start(wireless)
+        // A run started from the button begins while this window is already up; the cable is told so
+        // once, because a USB permission prompt needs a visible caller on this car.
+        next.setHostVisible(windowVisible)
         // The view already exists on this screen; attach it so the first frame has somewhere to go.
         attachVideo()
     }
